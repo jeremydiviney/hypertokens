@@ -1,282 +1,157 @@
-import torch
+from datasets import load_dataset
 import torch.nn as nn
 import torch.optim as optim
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-import string
-import random
-from datasets import load_dataset
+from torch.utils.data import Dataset, DataLoader
+import torch
 
-###########################################
-# Configuration
-###########################################
-L_MAX = 20               # Maximum chunk length
-LATENT_DIM = 256         # Dimension of the latent vector
-EMB_DIM = 128            # Embedding dimension
-NUM_ENCODER_LAYERS = 2   # Number of Transformer encoder layers
-HIDDEN_DIM = 256         # Hidden dimension in feedforward layers
-NHEAD = 4                # Number of attention heads
-SEQ_LEN = 50             # Length of input character sequence
-BATCH_SIZE = 16          # Batch size
-EPOCHS = 10              # Number of training epochs
-LR = 1e-3                # Learning rate
-
-###########################################
-# Load and Prepare Tiny Shakespeare Data
-###########################################
-def load_tiny_shakespeare():
-    """
-    Loads the Tiny Shakespeare dataset from Hugging Face's datasets library.
-    
-    Returns:
-        str: Concatenated text from the dataset.
-    """
-    print("Loading Tiny Shakespeare dataset...")
-    dataset = load_dataset("tiny_shakespeare", split="train")
-    text_data = dataset["text"]
-    # Concatenate all text into one string
-    text_data = "\n".join(text_data)
-    print(f"Total characters before filtering: {len(text_data)}")
-    
-    # Define allowed characters: lowercase letters, space, and basic punctuation
-    allowed_chars = string.ascii_lowercase + " ,.!?;:'\"-\n"
-    
-    # Filter and clean text
-    print("Filtering and cleaning text...")
-    filtered_text = ''.join(c.lower() if c.lower() in allowed_chars else ' ' for c in text_data)
-    filtered_text = ' '.join(filtered_text.split())  # Collapse multiple spaces
-    print(f"Total characters after filtering: {len(filtered_text)}")
-    
-    return filtered_text
-
-# Load the data
-filtered_text = load_tiny_shakespeare()
-
-###########################################
-# Create Character Mappings
-###########################################
-def create_char_mappings(text):
-    """
-    Creates mappings from characters to indices and vice versa.
-    
-    Args:
-        text (str): The text to create mappings from.
-    
-    Returns:
-        dict, dict, int: char_to_idx, idx_to_char, vocabulary size.
-    """
-    unique_chars = sorted(list(set(text)))
-    char_to_idx = {c: i+1 for i, c in enumerate(unique_chars)}  # 1-based indexing
-    idx_to_char = {i+1: c for c, i in char_to_idx.items()}
-    vocab_size = len(char_to_idx) + 1  # Include padding (0)
-    print(f"Vocabulary size (including padding): {vocab_size}")
-    return char_to_idx, idx_to_char, vocab_size
-
-char_to_idx, idx_to_char, V = create_char_mappings(filtered_text)
-
-###########################################
-# Encode the Corpus
-###########################################
-def encode_corpus(text, char_to_idx):
-    """
-    Encodes the text into a list of integer indices.
-    
-    Args:
-        text (str): The text to encode.
-        char_to_idx (dict): Mapping from characters to indices.
-    
-    Returns:
-        list: Encoded text as a list of integers.
-    """
-    return [char_to_idx.get(c, 1) for c in text]  # Unknowns map to 1
-
-encoded_corpus = encode_corpus(filtered_text, char_to_idx)
-print(f"Encoded corpus length: {len(encoded_corpus)}")
-
-###########################################
-# Generate Training Examples
-###########################################
-def get_random_example(seq_len=SEQ_LEN, l_max=L_MAX):
-    """
-    Generates a random training example from the encoded corpus.
-    
-    Args:
-        seq_len (int): Length of the input sequence.
-        l_max (int): Maximum length of the next chunk.
-    
-    Returns:
-        torch.Tensor, torch.Tensor, int: input sequence, next chunk (padded), true length.
-    """
-    if len(encoded_corpus) < seq_len + l_max:
-        raise ValueError("Corpus not long enough for given seq_len and l_max.")
-    start = random.randint(0, len(encoded_corpus) - seq_len - l_max)
-    input_seq = encoded_corpus[start:start + seq_len]
-    true_len = random.randint(1, l_max)
-    next_chunk = encoded_corpus[start + seq_len:start + seq_len + true_len]
-    padded_chunk = next_chunk + [0] * (l_max - true_len)  # Pad with 0s
-    return torch.tensor(input_seq, dtype=torch.long), torch.tensor(padded_chunk, dtype=torch.long), true_len
-
-def get_batch(batch_size=BATCH_SIZE):
-    """
-    Generates a batch of training examples.
-    
-    Args:
-        batch_size (int): Number of examples in the batch.
-    
-    Returns:
-        torch.Tensor, torch.Tensor, torch.Tensor: input sequences, next chunks, lengths.
-    """
-    inputs = []
-    targets = []
-    lengths = []
-    for _ in range(batch_size):
-        inp, tgt, l = get_random_example()
-        inputs.append(inp)
-        targets.append(tgt)
-        lengths.append(l)
-    return torch.stack(inputs), torch.stack(targets), torch.tensor(lengths, dtype=torch.long)
-
-###########################################
-# Model Definitions
-###########################################
-class EncoderModel(nn.Module):
-    def __init__(self, vocab_size, emb_dim, latent_dim, nhead, hidden_dim, num_layers, max_len):
-        super(EncoderModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
-        encoder_layer = TransformerEncoderLayer(d_model=emb_dim, nhead=nhead, dim_feedforward=hidden_dim)
-        self.encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pool = nn.AdaptiveAvgPool1d(1)  # Average pooling over sequence length
-        self.latent_proj = nn.Linear(emb_dim, latent_dim)
-        self.size_predictor = nn.Linear(latent_dim, max_len)  # Predict chunk length
-    
-    def forward(self, x):
-        """
-        Forward pass of the encoder.
+# --------------------------------------------------
+# 1. Data Preparation
+# --------------------------------------------------
+class TinyShakespeareDataset(Dataset):
+    def __init__(self, seq_len: int = 128):
+        # Load TinyShakespeare from Hugging Face
+        dataset = load_dataset("tiny_shakespeare")
+        text = dataset['train']['text'][0]  # Get the text content
         
-        Args:
-            x (torch.Tensor): Input tensor of shape [batch, seq_len].
+        # Build vocabulary
+        chars = sorted(list(set(text)))
+        self.char2idx = {ch: i for i, ch in enumerate(chars)}
+        self.idx2char = {i: ch for ch, i in self.char2idx.items()}
         
-        Returns:
-            torch.Tensor, torch.Tensor: Latent vector [batch, latent_dim], size logits [batch, L_MAX].
-        """
-        emb = self.embedding(x)            # [batch, seq_len, emb_dim]
-        emb = emb.permute(1, 0, 2)         # [seq_len, batch, emb_dim]
-        enc_out = self.encoder(emb)        # [seq_len, batch, emb_dim]
-        enc_out = enc_out.permute(1, 2, 0) # [batch, emb_dim, seq_len]
-        pooled = self.pool(enc_out).squeeze(-1)  # [batch, emb_dim]
-        z = self.latent_proj(pooled)       # [batch, latent_dim]
-        size_logits = self.size_predictor(z)  # [batch, L_MAX]
-        return z, size_logits
+        # Add padding token
+        self.pad_token = len(chars)
+        self.char2idx['<PAD>'] = self.pad_token
+        self.idx2char[self.pad_token] = '<PAD>'
+        
+        # Convert text to indices
+        self.data = torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
+        self.seq_len = seq_len
+        
+    def __len__(self) -> int:
+        return len(self.data) - 101  # Ensure we have at least one char after position 100
 
-class DecoderModel(nn.Module):
-    def __init__(self, vocab_size, latent_dim, emb_dim, hidden_dim, L_max):
-        super(DecoderModel, self).__init__()
-        self.latent_to_emb = nn.Linear(latent_dim, emb_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, L_max * vocab_size)
-        )
-        self.vocab_size = vocab_size
-        self.L_max = L_max
-    
-    def forward(self, z):
-        """
-        Forward pass of the decoder.
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # Calculate random sequence length between 1 and seq_len
+        rand_len = torch.randint(1, min(self.seq_len + 1, len(self.data) - idx), (1,)).item()
         
-        Args:
-            z (torch.Tensor): Latent vector [batch, latent_dim].
+        # Create padded sequence of max length
+        x = torch.full((self.seq_len,), self.pad_token, dtype=torch.long)
         
-        Returns:
-            torch.Tensor: Decoder output [batch, L_max, vocab_size].
-        """
-        h = self.latent_to_emb(z)         # [batch, emb_dim]
-        out = self.decoder(h)             # [batch, L_max * vocab_size]
-        out = out.view(-1, self.L_max, self.vocab_size)  # [batch, L_max, vocab_size]
-        return out
+        sequence = self.data[idx:idx + rand_len]
 
-###########################################
-# Initialize Models and Optimizer
-###########################################
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-model_encoder = EncoderModel(V, EMB_DIM, LATENT_DIM, NHEAD, HIDDEN_DIM, NUM_ENCODER_LAYERS, L_MAX).to(device)
-model_decoder = DecoderModel(V, LATENT_DIM, EMB_DIM, HIDDEN_DIM, L_MAX).to(device)
-
-# Combine parameters of both models
-params = list(model_encoder.parameters()) + list(model_decoder.parameters())
-optimizer = optim.Adam(params, lr=LR)
-
-# Define loss functions
-ce_loss = nn.CrossEntropyLoss(ignore_index=0, reduction='none')  # Ignore padding
-length_ce = nn.CrossEntropyLoss()  # For size prediction
-
-###########################################
-# Training Loop
-###########################################
-for epoch in range(EPOCHS):
-    model_encoder.train()
-    model_decoder.train()
-    
-    total_losses = []
-    reconstruction_losses = []
-    size_losses = []
-    incentive_losses = []
-    
-    for step in range(1, 1 + 1000):  # Adjust number of steps per epoch as needed
-        # Generate a batch
-        input_seq, next_token, next_token_len = get_batch(BATCH_SIZE)
-        input_seq = input_seq.to(device)            # [batch, seq_len]
-        next_token = next_token.to(device)          # [batch, L_MAX]
-        next_token_len = next_token_len.to(device)  # [batch]
-        
-        optimizer.zero_grad()
-        
-        # Forward pass through encoder and decoder
-        z, size_logits = model_encoder(input_seq)    # z: [batch, latent_dim], size_logits: [batch, L_MAX]
-        dec_out = model_decoder(z)                   # [batch, L_max, V]
-        
-        # Compute Reconstruction Loss
-        recon_loss = 0.0
-        for i in range(BATCH_SIZE):
-            L = next_token_len[i].item()
-            if L > 0:
-                # Decoder output for the first L characters
-                pred_chars = dec_out[i, :L, :]     # [L, V]
-                gold_chars = next_token[i, :L]     # [L]
-                # Compute loss for each character
-                loss_i = ce_loss(pred_chars, gold_chars)  # [L]
-                recon_loss += loss_i.sum()
-        
-        # Average reconstruction loss over the batch
-        recon_loss = recon_loss / BATCH_SIZE
-        
-        # Compute Size Prediction Loss
-        # size_logits: [batch, L_MAX], target_length: [batch]
-        # Targets should be in [0, L_MAX-1] representing lengths [1, L_MAX]
-        size_targets = next_token_len - 1
-        size_loss = length_ce(size_logits, size_targets)
-        
-        # Compute Length Incentive Loss
-        # Encourage larger chunks if reconstruction is successful
-        # Penalize choosing larger L if reconstruction fails
-        # Here, we approximate 'successful' by having low reconstruction loss
-        threshold = 0.1
-        avg_L = next_token_len.float().mean()
-        if recon_loss.item() < threshold:
-            length_incentive = -0.001 * avg_L
+        # Place sequence in padded tensor
+        if len(sequence) > 28:
+            overflow = len(sequence) - 28
+            x[100-overflow:100+len(sequence)-overflow] = sequence
         else:
-            length_incentive = 0.001 * recon_loss * avg_L
+            x[100:100 + len(sequence)] = sequence
+        y = x.clone()
         
-        # Total Loss
-        total_loss = recon_loss + size_loss + length_incentive
+        return x, y
+
+# --------------------------------------------------
+# 2. Model Definition
+# --------------------------------------------------
+class TransformerModel(nn.Module):
+    def __init__(self, vocab_size=28, embed_dim=16, seq_len=128, n_heads=2, n_layers=2):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim)
         
-        # Backpropagation
-        total_loss.backward()
-        optimizer.step()
+        # Basic positional encoding
+        self.pos_embed = nn.Embedding(seq_len, embed_dim)
         
-        # Accumulate losses for reporting
-        total_losses.append(total_loss.item())
-        reconstruction_losses.append(recon_loss.item())
-        size_losses.append(size_loss.item())
-        incen
+        # Transformer: N layers, multi-head self-attention
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, 
+                                                   nhead=n_heads, 
+                                                   dim_feedforward=64,
+                                                   batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # Final linear projection to vocab
+        self.fc_out = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len]
+        batch_size, seq_len = x.size()
+        positions = torch.arange(0, seq_len, device=x.device).unsqueeze(0)  # [1, seq_len]
+        
+        # Sum char embedding + positional embedding
+        x_emb = self.embed(x) + self.pos_embed(positions)
+        
+        # Transformer forward
+        out = self.transformer(x_emb)  # [batch_size, seq_len, embed_dim]
+        
+        # Only take the last 28 positions for prediction
+        out = out[:, -28:, :]  # [batch_size, 28, embed_dim]
+        logits = self.fc_out(out)  # [batch_size, 28, vocab_size]
+        return logits
+
+# --------------------------------------------------
+# 3. Training Loop
+# --------------------------------------------------
+def train_model(epochs=3, batch_size=1024, lr=1e-2):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    dataset = TinyShakespeareDataset(seq_len=128)
+    vocab_size = len(dataset.char2idx)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    model = TransformerModel(vocab_size=vocab_size).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    
+    current_lr = lr
+
+    for epoch in range(epochs):
+    
+        optimizer.param_groups[0]['lr'] = current_lr
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            
+            # Forward
+            logits = model(x)
+            
+            # Convert input tensor to text
+            input_indexes = x[0] 
+            preBoundary = ''.join([dataset.idx2char[idx.item()] for idx in input_indexes[:100]])
+            postBoundary = ''.join([dataset.idx2char[idx.item()] for idx in input_indexes[100:]])
+
+            
+            # Get model predictions and convert to text
+            predictions = torch.argmax(logits[0], dim=-1)
+            output_text = ''.join([dataset.idx2char[idx.item()] for idx in predictions])
+            
+            print("\nInput text:")
+            print(preBoundary + "<|>" + postBoundary)
+            print("\nModel output:")
+            print( output_text)
+            print("-" * 80)
+             
+            loss_per_pos = criterion(
+                logits.reshape(-1, vocab_size),
+                 y[:, -28:].reshape(-1)
+            )
+
+            loss = loss_per_pos.mean()
+
+            print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - LR: {current_lr:.6f}")
+
+            # Backprop
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - LR: {current_lr:.6f}")
+        current_lr = current_lr * .1
+    return model
+
+if __name__ == "__main__":
+    # Example usage
+    trained_model = train_model()
+    
+    # Inference example (greedy sampling for demonstration)
+    test_input = "that didn't really seem to "
+    # Convert to indices
+    # ... etc. (omitted to keep script concise)
+    print("Training complete.")
