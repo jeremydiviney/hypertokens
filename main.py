@@ -53,7 +53,7 @@ class TinyShakespeareDataset(Dataset):
 # 2. Model Definition
 # --------------------------------------------------
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=28, embed_dim=16, seq_len=128, n_heads=2, n_layers=2):
+    def __init__(self, vocab_size, embed_dim=16, seq_len=128, n_heads=2, n_layers=2):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
         
@@ -61,35 +61,56 @@ class TransformerModel(nn.Module):
         self.pos_embed = nn.Embedding(seq_len, embed_dim)
         
         # Transformer: N layers, multi-head self-attention
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, 
-                                                   nhead=n_heads, 
-                                                   dim_feedforward=64,
-                                                   batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, 
+            nhead=n_heads, 
+            dim_feedforward=64,
+            batch_first=True,
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # Final linear projection to vocab
-        self.fc_out = nn.Linear(embed_dim, vocab_size)
+        # Additional layers to reshape transformer output to [batch_size, 28, vocab_size]
+        self.fc1 = nn.Linear(embed_dim, 64)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(64, vocab_size)
+        
+        # To map the sequence length from 128 to 28, use Adaptive Average Pooling
+        self.pool = nn.AdaptiveAvgPool1d(28)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch_size, seq_len]
         batch_size, seq_len = x.size()
         positions = torch.arange(0, seq_len, device=x.device).unsqueeze(0)  # [1, seq_len]
         
         # Sum char embedding + positional embedding
-        x_emb = self.embed(x) + self.pos_embed(positions)
+        x_emb = self.embed(x) + self.pos_embed(positions)  # [batch_size, seq_len, embed_dim]
         
         # Transformer forward
-        out = self.transformer(x_emb)  # [batch_size, seq_len, embed_dim]
+        transformer_out = self.transformer(x_emb)  # [batch_size, seq_len, embed_dim]
         
-        # Only take the last 28 positions for prediction
-        out = out[:, -28:, :]  # [batch_size, 28, embed_dim]
-        logits = self.fc_out(out)  # [batch_size, 28, vocab_size]
+        residual = x_emb
+        transformer_out = transformer_out + residual
+        
+        # Permute for pooling: [batch_size, embed_dim, seq_len]
+        out = transformer_out.permute(0, 2, 1)
+        
+        # Pool to reduce sequence length from 128 to 28
+        out = self.pool(out)  # [batch_size, embed_dim, 28]
+        
+        # Permute back to [batch_size, 28, embed_dim]
+        out = out.permute(0, 2, 1)
+        
+        # Apply additional linear layers
+        out = self.fc1(out)     # [batch_size, 28, 64]
+        out =  self.relu(out)    # [batch_size, 28, 64]
+        logits = self.fc2(out)  # [batch_size, 28, vocab_size]
+        
         return logits
 
 # --------------------------------------------------
 # 3. Training Loop
 # --------------------------------------------------
-def train_model(epochs=3, batch_size=1024, lr=1e-2):
+def train_model(epochs=3, batch_size=128, lr=1e-2):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     dataset = TinyShakespeareDataset(seq_len=128)
