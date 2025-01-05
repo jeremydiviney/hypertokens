@@ -90,3 +90,6 @@ data/
 .Trashes
 ehthumbs.db
 Thumbs.db 
+
+# Wandb
+wandb/
