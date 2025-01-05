@@ -118,12 +118,18 @@ class TransformerAutoencoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # --- Smaller Compress (embed_dim -> hypertoken_size) ---
-        self.fc_compress = nn.Linear(embed_dim, hypertoken_size)
+        # --- Multiscale Convolutions ---
+        # Parallel convolutions with different kernel sizes
+        self.conv_k3 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
         
-        # --- Decoder Positional Encoding ---
-        self.pos_embed_dec = nn.Embedding(self.decoder_seq_len, embed_dim)
-
+        # Optional second stage of strided convolution
+        # (comment out if you don’t need extra downsampling)
+        self.conv_down = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
+        
+        # --- Linear compression to hypertoken ---
+        # After 2 stride=2 ops, sequence length ~ seq_len / 4
+        self.fc_compress = nn.Linear(embed_dim * (seq_len // 4), hypertoken_size)
+        
         # --- Smaller Expand (hypertoken_size -> decoder_seq_len * embed_dim) ---
         self.fc_expand = nn.Linear(hypertoken_size, self.decoder_seq_len * embed_dim)
         
@@ -131,7 +137,7 @@ class TransformerAutoencoder(nn.Module):
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, 
             nhead=n_heads, 
-            dim_feedforward=embed_dim * 4,
+            dim_feedforward=64,
             batch_first=True
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=n_layers)
@@ -153,19 +159,40 @@ class TransformerAutoencoder(nn.Module):
         x_enc = self.embed_enc(x) + self.pos_embed_enc(positions_enc)        # [batch_size, seq_len, embed_dim]
         enc_out = self.encoder(x_enc)                                        # [batch_size, seq_len, embed_dim]
         
-       # --- Pool + Compress ---
-        pooled = enc_out.mean(dim=1)             # (batch, embed_dim)
-        hypertoken = self.fc_compress(pooled)       # (batch, hypertoken_size)
-        
-        # --- Expand + Decoder Input ---
-        dec_in = self.fc_expand(hypertoken)      # (batch, decoder_seq_len * embed_dim)
-        dec_in = dec_in.view(-1, self.decoder_seq_len, self.embed_dim)
-         
-        # --- Decode & Project ---
-        dec_out = self.decoder(dec_in)        # (batch, decoder_seq_len, embed_dim)
-        logits = self.fc_out(dec_out)            # (batch, decoder_seq_len, vocab_size)                                 # [batch_size, encode_last_n_length, vocab_size]
-        
-        return logits
+        # Prepare for conv: (bsz, channels=embed_dim, seq_len)
+        enc_out = enc_out.permute(0, 2, 1)
+
+        try:
+
+            #xmean = torch.mean(x_enc.flatten(1),dim=1)
+
+            # --- Multiscale Convolutions (parallel) ---
+            conv_out = self.conv_k3(enc_out)
+
+            # Optional second downsampling
+            downsampled = self.conv_down(conv_out)  # (bsz, embed_dim, seq_len/4)
+
+            # Flatten for linear compression
+            downsampled = downsampled.view(batch_size, -1)   # (bsz, embed_dim * seq_len/4)
+            
+            # --- Compress to hypertoken ---
+            hypertoken = self.fc_compress(downsampled) 
+            
+
+            #hypertoken_mean = torch.mean(hypertoken,dim=1)
+
+            # --- Expand + Decoder Input ---
+            dec_in = self.fc_expand(hypertoken) #+ hypertoken_mean.unsqueeze(1)    # (batch, decoder_seq_len * embed_dim)
+            dec_in = dec_in.view(-1, self.decoder_seq_len, self.embed_dim)
+            
+            # --- Decode & Project ---
+            dec_out = self.decoder(dec_in) #+ hypertoken_mean.unsqueeze(1).unsqueeze(2)      # (batch, decoder_seq_len, embed_dim)
+            logits = self.fc_out(dec_out)  #+ hypertoken_mean.unsqueeze(1).unsqueeze(2)        # (batch, decoder_seq_len, vocab_size)                              
+            
+            return logits
+        except Exception as e:
+            print(e)
+            return None
 
 
 
@@ -291,7 +318,7 @@ if __name__ == "__main__":
             "n_layers": layers,
             "embed_dim": 128
         }
-        for layers in [1, 2, 3, 4, 5, 6]  # Varying n_heads
+        for layers in [1, 2, 3, 4]  # Varying n_heads
     ]
   
   
