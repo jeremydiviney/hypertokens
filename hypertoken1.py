@@ -122,14 +122,15 @@ class TransformerAutoencoder(nn.Module):
         # Compression pathway
         self.compression_dims = [
             (embed_dim * 8, embed_dim * 4),
-            (embed_dim * 4, embed_dim * 2)
+            (embed_dim * 4, embed_dim * 2),
+            (embed_dim * 2, embed_dim ),
         ]
         
         self.compress_pathway = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(in_dim, out_dim),
-                nn.GELU(),
-                nn.LayerNorm(out_dim)
+                #nn.LeakyReLU(),
+                #nn.LayerNorm(out_dim)
             ) for in_dim, out_dim in self.compression_dims
         ])
         
@@ -139,30 +140,20 @@ class TransformerAutoencoder(nn.Module):
         self.expand_pathway = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(in_dim, out_dim),
-                nn.GELU(),
-                nn.LayerNorm(out_dim)
+                #nn.GELU(),
+                #nn.LayerNorm(out_dim)
             ) for in_dim, out_dim in self.expansion_dims
         ])
-        
-        # Hypertoken compression and expansion
-        compressed_size = (seq_len//8) * (embed_dim * 2)
-        self.final_compress = nn.Sequential(
-            nn.Linear(compressed_size, hypertoken_size),
-            nn.GELU(),
-            nn.LayerNorm(hypertoken_size)
-        )
-        
-        self.initial_expand = nn.Sequential(
-            nn.Linear(hypertoken_size, compressed_size),
-            nn.GELU(),
-            nn.LayerNorm(compressed_size)
-        )
+ 
+        self.final_compress = nn.Linear(self.embed_dim * seq_len // 8, hypertoken_size)
+        self.initial_expand = nn.Linear(hypertoken_size, self.embed_dim * (seq_len // 8))
+
         
         # Decoder components
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, 
             nhead=n_heads, 
-            dim_feedforward=64,
+            dim_feedforward=embed_dim * 4,
             batch_first=True
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=n_layers)
@@ -176,43 +167,35 @@ class TransformerAutoencoder(nn.Module):
         x_enc = self.embed_enc(x) + self.pos_embed_enc(positions_enc)
         enc_out = self.encoder(x_enc)
         
-        x_enc_mean = enc_out.flatten(1).mean(dim=1)
-
-        noise = torch.rand_like(x_enc_mean) * 0.1
-        x_enc_mean += noise
+        #x_enc_mean = enc_out.flatten(1).mean(dim=1)
 
         # Reshape for compression pathway
-        current_features = enc_out.reshape(batch_size, seq_len//8, self.embed_dim * 8)
+        compressed = enc_out.reshape(batch_size, seq_len//8, self.embed_dim * 8)
         
-        for i, compress_layer in enumerate(self.compress_pathway):
+        for compress_layer in self.compress_pathway:
             # Apply compression and add residual mean
-            compressed = compress_layer(current_features)
-            noise = torch.rand_like(x_enc_mean) * 0.1
-            x_enc_mean += noise
-            current_features = compressed + x_enc_mean.unsqueeze(1).unsqueeze(1)
+            compressed = compress_layer(compressed)
         
         # Compress to hypertoken
-        flattened = current_features.reshape(batch_size, -1)
+        flattened = compressed.reshape(batch_size, -1)
          
         # Add residual connection
-        combined_features = flattened + x_enc_mean.unsqueeze(1)
-        hypertoken = self.final_compress(combined_features)
+        hypertoken = self.final_compress(flattened)
        
-        hypertoken_mean = hypertoken.mean(dim=1)
-        noise = torch.rand_like(hypertoken_mean) * 0.1
-        hypertoken_mean += noise
+        #hypertoken_mean = hypertoken.mean(dim=1)
 
         # Initial expansion from hypertoken
-        current_features = self.initial_expand(hypertoken) + hypertoken_mean.unsqueeze(1)
-        current_features = current_features.reshape(batch_size, seq_len // 8, self.embed_dim * 2)
-        
+        expanded = self.initial_expand(hypertoken)
+        expanded = expanded.reshape(batch_size, seq_len // 8, self.embed_dim)
+
         # Progressive expansion
-        for i, expand_layer in enumerate(self.expand_pathway):
-            current_features = expand_layer(current_features) + hypertoken_mean.unsqueeze(1).unsqueeze(1)
+        for expand_layer in self.expand_pathway:
+            expanded = expand_layer(expanded) #+ hypertoken_mean.unsqueeze(1).unsqueeze(1)
+            
 
         
         # Reshape for decoder
-        dec_in = current_features.reshape(batch_size, self.decoder_seq_len, self.embed_dim)
+        dec_in = expanded.reshape(batch_size, self.decoder_seq_len, self.embed_dim) #+ hypertoken_mean.unsqueeze(1).unsqueeze(1)
         
         # Decode and project
         dec_out = self.decoder(dec_in)
@@ -344,7 +327,7 @@ if __name__ == "__main__":
             "n_layers": layers,
             "embed_dim": 128
         }
-        for layers in [1, 2, 3, 4]  # Varying n_heads
+        for layers in [1, 2, 3]  # Varying n_heads
     ]
   
   
