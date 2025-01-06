@@ -88,6 +88,7 @@ class TinyShakespeareDataset(Dataset):
 # --------------------------------------------------
 # 2. Model Definition
 # --------------------------------------------------
+
 class TransformerAutoencoder(nn.Module):
     def __init__(
         self, 
@@ -95,21 +96,21 @@ class TransformerAutoencoder(nn.Module):
         encode_last_n_length,
         embed_dim=16,
         seq_len=128,
-        
         n_heads=2,
         n_layers=2,
         hypertoken_size=32
     ):
         super().__init__()
         self.seq_len = seq_len
-        self.decoder_seq_len = encode_last_n_length  # Fixed sequence length for decoder output
+        self.decoder_seq_len = encode_last_n_length
         self.embed_dim = embed_dim
+        self.hypertoken_size = hypertoken_size
         
-        # --- Embedding + Positional Encoding ---
+        # Embeddings
         self.embed_enc = nn.Embedding(vocab_size, embed_dim)
         self.pos_embed_enc = nn.Embedding(seq_len, embed_dim)
-
-        # --- Encoder Transformer ---
+        
+        # Encoder transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, 
             nhead=n_heads, 
@@ -118,22 +119,46 @@ class TransformerAutoencoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # --- Multiscale Convolutions ---
-        # Parallel convolutions with different kernel sizes
-        self.conv_k3 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
+        # Compression pathway
+        self.compression_dims = [
+            (embed_dim * 8, embed_dim * 4),
+            (embed_dim * 4, embed_dim * 2)
+        ]
         
-        # Optional second stage of strided convolution
-        # (comment out if you don’t need extra downsampling)
-        self.conv_down = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
+        self.compress_pathway = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.GELU(),
+                nn.LayerNorm(out_dim)
+            ) for in_dim, out_dim in self.compression_dims
+        ])
         
-        # --- Linear compression to hypertoken ---
-        # After 2 stride=2 ops, sequence length ~ seq_len / 4
-        self.fc_compress = nn.Linear(embed_dim * (seq_len // 4), hypertoken_size)
+        # Expansion pathway (reverse of compression)
+        self.expansion_dims = [(dim_out, dim_in) for dim_in, dim_out in reversed(self.compression_dims)]
         
-        # --- Smaller Expand (hypertoken_size -> decoder_seq_len * embed_dim) ---
-        self.fc_expand = nn.Linear(hypertoken_size, self.decoder_seq_len * embed_dim)
+        self.expand_pathway = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.GELU(),
+                nn.LayerNorm(out_dim)
+            ) for in_dim, out_dim in self.expansion_dims
+        ])
         
-        # --- Decoder Transformer ---
+        # Hypertoken compression and expansion
+        compressed_size = (seq_len//8) * (embed_dim * 2)
+        self.final_compress = nn.Sequential(
+            nn.Linear(compressed_size, hypertoken_size),
+            nn.GELU(),
+            nn.LayerNorm(hypertoken_size)
+        )
+        
+        self.initial_expand = nn.Sequential(
+            nn.Linear(hypertoken_size, compressed_size),
+            nn.GELU(),
+            nn.LayerNorm(compressed_size)
+        )
+        
+        # Decoder components
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, 
             nhead=n_heads, 
@@ -141,58 +166,59 @@ class TransformerAutoencoder(nn.Module):
             batch_first=True
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=n_layers)
-        
-        # --- Final Projection to vocab_size ---
         self.fc_out = nn.Linear(embed_dim, vocab_size)
 
     def forward(self, x):
-        """
-        x: [batch_size, seq_len]
-        returns: [batch_size, encode_last_n_length, vocab_size]
-        """
         batch_size, seq_len = x.size()
         
-        # ---------------------
-        # 1) Encoder
-        # ---------------------
-        positions_enc = torch.arange(seq_len, device=x.device).unsqueeze(0)  # [1, seq_len]
-        x_enc = self.embed_enc(x) + self.pos_embed_enc(positions_enc)        # [batch_size, seq_len, embed_dim]
-        enc_out = self.encoder(x_enc)                                        # [batch_size, seq_len, embed_dim]
+        # Encoder pathway
+        positions_enc = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        x_enc = self.embed_enc(x) + self.pos_embed_enc(positions_enc)
+        enc_out = self.encoder(x_enc)
         
-        # Prepare for conv: (bsz, channels=embed_dim, seq_len)
-        enc_out = enc_out.permute(0, 2, 1)
+        x_enc_mean = enc_out.flatten(1).mean(dim=1)
 
-        try:
+        noise = torch.rand_like(x_enc_mean) * 0.1
+        x_enc_mean += noise
 
-            #xmean = torch.mean(x_enc.flatten(1),dim=1)
+        # Reshape for compression pathway
+        current_features = enc_out.reshape(batch_size, seq_len//8, self.embed_dim * 8)
+        
+        for i, compress_layer in enumerate(self.compress_pathway):
+            # Apply compression and add residual mean
+            compressed = compress_layer(current_features)
+            noise = torch.rand_like(x_enc_mean) * 0.1
+            x_enc_mean += noise
+            current_features = compressed + x_enc_mean.unsqueeze(1).unsqueeze(1)
+        
+        # Compress to hypertoken
+        flattened = current_features.reshape(batch_size, -1)
+         
+        # Add residual connection
+        combined_features = flattened + x_enc_mean.unsqueeze(1)
+        hypertoken = self.final_compress(combined_features)
+       
+        hypertoken_mean = hypertoken.mean(dim=1)
+        noise = torch.rand_like(hypertoken_mean) * 0.1
+        hypertoken_mean += noise
 
-            # --- Multiscale Convolutions (parallel) ---
-            conv_out = self.conv_k3(enc_out)
+        # Initial expansion from hypertoken
+        current_features = self.initial_expand(hypertoken) + hypertoken_mean.unsqueeze(1)
+        current_features = current_features.reshape(batch_size, seq_len // 8, self.embed_dim * 2)
+        
+        # Progressive expansion
+        for i, expand_layer in enumerate(self.expand_pathway):
+            current_features = expand_layer(current_features) + hypertoken_mean.unsqueeze(1).unsqueeze(1)
 
-            # Optional second downsampling
-            downsampled = self.conv_down(conv_out)  # (bsz, embed_dim, seq_len/4)
-
-            # Flatten for linear compression
-            downsampled = downsampled.view(batch_size, -1)   # (bsz, embed_dim * seq_len/4)
-            
-            # --- Compress to hypertoken ---
-            hypertoken = self.fc_compress(downsampled) 
-            
-
-            #hypertoken_mean = torch.mean(hypertoken,dim=1)
-
-            # --- Expand + Decoder Input ---
-            dec_in = self.fc_expand(hypertoken) #+ hypertoken_mean.unsqueeze(1)    # (batch, decoder_seq_len * embed_dim)
-            dec_in = dec_in.view(-1, self.decoder_seq_len, self.embed_dim)
-            
-            # --- Decode & Project ---
-            dec_out = self.decoder(dec_in) #+ hypertoken_mean.unsqueeze(1).unsqueeze(2)      # (batch, decoder_seq_len, embed_dim)
-            logits = self.fc_out(dec_out)  #+ hypertoken_mean.unsqueeze(1).unsqueeze(2)        # (batch, decoder_seq_len, vocab_size)                              
-            
-            return logits
-        except Exception as e:
-            print(e)
-            return None
+        
+        # Reshape for decoder
+        dec_in = current_features.reshape(batch_size, self.decoder_seq_len, self.embed_dim)
+        
+        # Decode and project
+        dec_out = self.decoder(dec_in)
+        logits = self.fc_out(dec_out)
+        
+        return logits
 
 
 
