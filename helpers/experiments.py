@@ -60,6 +60,8 @@ def count_parameters(model: nn.Module) -> tuple[int, dict]:
 
 
 def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
+
+
     # Initialize wandb
     wandb.login(key="2a4c6ae7fe4efb074b06e1bb9eca12afba05e310")
 
@@ -73,15 +75,17 @@ def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
     start_time = time.time()
    
     try:
+
         # Train model and get parameters count
         model = train_model(wandb,**config)
-        total_params, params_by_layer = count_parameters(model)
         
+        total_params, params_by_layer = count_parameters(model)
+
         # Log parameters count
         wandb.log({
             "total_parameters": total_params,
         })
-
+    
         memory_usage = get_memory_gb()
         gpu_memory_usage = get_gpu_memory_gb()
     except Exception as e:
