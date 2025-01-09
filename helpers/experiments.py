@@ -104,7 +104,7 @@ def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
     wandb.init(
         project=projectName,
         config=config,
-        name=f"{projectName}-{config['seq_len']}-{config['encode_last_n_length']}-{config['hypertoken_size']}-{config['epochs']}-{config['batch_size']}-{config['lr']}-{config['n_heads']}-{config['n_layers']}-{config['embed_dim']}",
+        name=f"{projectName}-sl:{config['seq_len']}-elnl:{config['encode_last_n_length']}-hs:{config['hypertoken_size']}-e:{config['epochs']}-bs:{config['batch_size']}-lr:{config['lr']}-hs:{config['head_size']}-nl:{config['n_layers']}-ed:{config['embed_dim']}",
         )
     
 

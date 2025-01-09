@@ -127,7 +127,7 @@ class TransformerAutoencoder(nn.Module):
         encode_last_n_length: int, 
         embed_dim: int = 16, 
         seq_len: int = 128, 
-        n_heads: int = 2, 
+        head_size: int = 32, 
         n_layers: int = 2, 
         hypertoken_size: int = 32, 
         mode: str = "autoencoder"
@@ -173,7 +173,7 @@ class TransformerAutoencoder(nn.Module):
 
             for in_dim, out_dim in self.compression_sizes:
 
-                nh = n_heads if in_dim//n_heads > 16 else 2
+                nh = max(2, out_dim // head_size)
 
                 t_layer = nn.TransformerEncoderLayer(
                     d_model=in_dim,
@@ -211,12 +211,15 @@ class TransformerAutoencoder(nn.Module):
             self.expansion_sizes = list(zip(expanssion_sizes[:-1], expanssion_sizes[1:]))
             # Create progressive transformer layers
             self.expansion_layers = nn.ModuleList([])
+         
 
             for in_dim, out_dim in self.expansion_sizes:
+                
+                nh = max(2, out_dim // head_size)
 
                 t_layer = nn.TransformerEncoderLayer(
                     d_model=out_dim,
-                    nhead=max(1, out_dim // 32),  # Ensure reasonable number of heads
+                    nhead=nh,  # Ensure reasonable number of heads
                     dim_feedforward=out_dim * 4,
                     batch_first=True,
                     dtype=torch.bfloat16,
@@ -230,6 +233,7 @@ class TransformerAutoencoder(nn.Module):
                         nn.Linear(in_dim, out_dim),
                     )
                 )
+
                 #then transformer
                 self.expansion_layers.append(
                     nn.TransformerEncoder(t_layer, num_layers=n_layers)
@@ -375,7 +379,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, criterion: nn.Modul
 
 
 def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len=128, 
-                hypertoken_size=16, n_heads=2, n_layers=2, embed_dim=16, lr=.0025):
+                hypertoken_size=16, head_size=32, n_layers=2, embed_dim=16, lr=.0025):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
    
     segments = 10
@@ -387,7 +391,7 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
     val_dataset = TinyShakespeareDataset(encode_last_n_length,segments=segments,seq_len=seq_len,type="validation")
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    model = TransformerAutoencoder(vocab_size=vocab_size, seq_len=seq_len, encode_last_n_length=encode_last_n_length, hypertoken_size=hypertoken_size, n_heads=n_heads, n_layers=n_layers, embed_dim=embed_dim).to(device)
+    model = TransformerAutoencoder(vocab_size=vocab_size, seq_len=seq_len, encode_last_n_length=encode_last_n_length, hypertoken_size=hypertoken_size, head_size=head_size, n_layers=n_layers, embed_dim=embed_dim).to(device)
     #model = torch.compile(model)
 
     count_parameters(model)
@@ -494,14 +498,14 @@ if __name__ == "__main__":
             "epochs": 1,
             "batch_size": 512,
             "lr": 0.0001,
-            "n_heads": nh,
+            "head_size": head_size,
             "n_layers": n_layers,
             "embed_dim": ed
         }
         for hs in [512]  # Varying hypertoken_size
         for ed in [512]  # Varying embed_dim
-        for n_layers in [1,2,3]  # Varying n_layers
-        for nh in [8]  # Varying n_heads
+        for n_layers in [1]  # Varying n_layers
+        for head_size in [32,64]  # Varying head_size
         
     ]
   
