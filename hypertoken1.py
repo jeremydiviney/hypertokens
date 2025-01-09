@@ -7,6 +7,7 @@ import math
 import random
 from helpers.experiments import run_experiment, ExperimentConfig, get_memory_gb, count_parameters
 from torch.amp import autocast, GradScaler
+
 # --------------------------------------------------
 # 1. Data Preparation
 # --------------------------------------------------
@@ -137,6 +138,7 @@ class TransformerAutoencoder(nn.Module):
         self.encode_last_n_length = encode_last_n_length
         self.embed_dim = embed_dim
         self.hypertoken_size = hypertoken_size
+       
 
         if hypertoken_size > embed_dim:
            raise ValueError("Hypertoken size must be less than or equal to embed_dim")
@@ -149,106 +151,94 @@ class TransformerAutoencoder(nn.Module):
         # Embeddings
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.pos_embed = nn.Embedding(seq_len, embed_dim)
-        
-        # Transformer layers
-        transformer_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=n_heads, 
-            dim_feedforward=embed_dim * 4,
-            batch_first=True,
-            dtype=torch.bfloat16,
-            dropout=0
-        )
-
-        self.FINAL_COMPRESS_DIM = max(1024, hypertoken_size)
+  
+        self.COMPRESS_FACTOR = 2
+        self.MIN_EMBED_DIM = hypertoken_size//self.seq_len
               
         if self.mode in {"encoder", "autoencoder"}:
-            self.encoder = nn.TransformerEncoder(transformer_layer, num_layers=n_layers)
-            # self.compress_layers = nn.Sequential(
-            #     nn.Linear(self.embed_dim * self.seq_len, (self.embed_dim * self.seq_len) // 4),
-            #     nn.Linear((self.embed_dim * self.seq_len) // 4, self.hypertoken_size),
-            # )
 
             compression_sizes = []
             current_size = self.embed_dim
-            while current_size > hypertoken_size//self.seq_len:
+            while current_size > self.MIN_EMBED_DIM:
                 compression_sizes.append(current_size)
-                current_size //= 2
+                current_size //= self.COMPRESS_FACTOR
 
+            if compression_sizes[-1] != hypertoken_size//self.seq_len:
+                compression_sizes.append(self.MIN_EMBED_DIM)
             
+            self.compression_sizes = list(zip(compression_sizes[:-1], compression_sizes[1:]))
+
             # Create progressive transformer layers
             self.compression_layers = nn.ModuleList([])
 
-            for in_dim, out_dim in zip(compression_sizes[:-1], compression_sizes[1:]):
+            for in_dim, out_dim in self.compression_sizes:
+
+                nh = n_heads if in_dim//n_heads > 16 else 2
 
                 t_layer = nn.TransformerEncoderLayer(
                     d_model=in_dim,
-                    nhead=max(1, in_dim // 32),  # Ensure reasonable number of heads
+                    nhead=nh,  # Ensure reasonable number of heads
                     dim_feedforward=in_dim * 4,
                     batch_first=True,
                     dtype=torch.bfloat16,
-                    dropout=0.025
+                    dropout=0.025,
+                    norm_first=True
                 )
 
                 self.compression_layers.append(
-                    nn.TransformerEncoder(t_layer, num_layers=1)
+                    nn.TransformerEncoder(t_layer, num_layers=n_layers)
                 )
 
-            self.final_compression_layer = nn.Linear(16 * self.seq_len, self.hypertoken_size)
+            self.final_compression_layer = nn.Sequential(
+                nn.Linear(self.seq_len*self.compression_sizes[-1][1], self.hypertoken_size),
+            )
+
 
         if self.mode in {"decoder", "autoencoder"}:
              
-            self.decoder = nn.TransformerEncoder(transformer_layer, num_layers=n_layers * 2)
-
             self.fc_out = nn.Linear(embed_dim, vocab_size)
- 
-            if self.hypertoken_size != self.embed_dim:
-                self.expand_layers = nn.Sequential(
-                    nn.Linear(self.hypertoken_size, self.embed_dim),
-                    nn.Linear( self.embed_dim, self.embed_dim * 4),
-                    nn.Linear( self.embed_dim * 4, self.embed_dim * 8),
-                )
-            else:
-                self.expand_layers = nn.Identity()
 
-   
-            # self.expand_layers2 = nn.Sequential(
-            #     nn.Linear(self.hypertoken_size, (self.embed_dim * self.encode_last_n_length) // 4),
-            #     nn.Linear((self.embed_dim * self.encode_last_n_length) // 4, self.embed_dim * self.encode_last_n_length),
-            # )
-
-            expand_sizes = []
-            current_size = 2 * (hypertoken_size//self.encode_last_n_length)
+            expanssion_sizes = []
+            current_size = self.compression_sizes[-1][1]
             while current_size < self.embed_dim:
-                expand_sizes.append(current_size)
-                current_size *= 2
-            expand_sizes.append(self.embed_dim)
-            
+                expanssion_sizes.append(current_size)
+                current_size *= self.COMPRESS_FACTOR
+            expanssion_sizes.append(self.embed_dim)
 
+            if expanssion_sizes[-1] != self.embed_dim:
+                expanssion_sizes.append(self.embed_dim)
+            
+            self.expansion_sizes = list(zip(expanssion_sizes[:-1], expanssion_sizes[1:]))
             # Create progressive transformer layers
             self.expansion_layers = nn.ModuleList([])
 
-            for in_dim, out_dim in zip(expand_sizes[:-1], expand_sizes[1:]):
+            for in_dim, out_dim in self.expansion_sizes:
 
                 t_layer = nn.TransformerEncoderLayer(
-                    d_model=in_dim,
-                    nhead=max(1, in_dim // 32),  # Ensure reasonable number of heads
-                    dim_feedforward=in_dim * 4,
+                    d_model=out_dim,
+                    nhead=max(1, out_dim // 32),  # Ensure reasonable number of heads
+                    dim_feedforward=out_dim * 4,
                     batch_first=True,
                     dtype=torch.bfloat16,
-                    dropout=0.025
+                    dropout=0.025,
+                    norm_first=True
                 )
 
+                #expand first
                 self.expansion_layers.append(
-                    nn.TransformerEncoder(t_layer, num_layers=1)
+                    nn.Sequential(
+                        nn.Linear(in_dim, out_dim),
+                    )
                 )
-
+                #then transformer
                 self.expansion_layers.append(
-                    nn.Linear(in_dim, out_dim)
+                    nn.TransformerEncoder(t_layer, num_layers=n_layers)
                 )
 
-
-
+            final_compress_in = self.final_compression_layer[0].in_features
+            final_compress_out = self.final_compression_layer[0].out_features
+            self.initial_expansion_layer =  nn.Linear(final_compress_out, final_compress_in)
+            
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.size()
@@ -257,20 +247,23 @@ class TransformerAutoencoder(nn.Module):
 
             positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
             embedded = self.embed(x) + self.pos_embed(positions)
-            enc_out = self.encoder(embedded)
 
-            compressed = enc_out
+            compressed = embedded
 
-            #enc_mean = compressed.mean(dim=(1,2)).unsqueeze(1).unsqueeze(1)
-
-            #hypertoken = compressed.reshape(batch_size,self.hypertoken_size,-1).mean(dim=2)
-            # Pass through progressive compression layers
-            for layer in self.compression_layers:
-                compressed = layer(compressed)
-                compressed = compressed.reshape(batch_size, seq_len, compressed.size(-1)//2,2)
+            # Pass through progressive compression transformer layers
+            for i, (dim_in,dim_out) in enumerate(self.compression_sizes):
+                compressed = self.compression_layers[i](compressed)
+                compress_factor = dim_in//dim_out
+                compressed = compressed.reshape(batch_size, seq_len, compressed.size(-1)//compress_factor,compress_factor)
                 compressed = compressed.mean(dim=-1)
 
-            hypertoken = compressed.flatten(start_dim=1)
+
+            if compressed.size(-1) > self.hypertoken_size//self.seq_len:
+                compressed = self.final_compression_layer(compressed.flatten(start_dim=1))
+            else:
+                compressed = compressed.flatten(start_dim=1)
+
+            hypertoken = compressed
         
             if self.mode == "encoder":
                 return hypertoken
@@ -280,26 +273,27 @@ class TransformerAutoencoder(nn.Module):
             if self.mode == "decoder":
                 hypertoken = x
 
-            #expanded = self.expand_layers(hypertoken)   
-            
-            # #expanded = expanded.reshape(batch_size, -1, self.embed_dim)
-            
-            # expanded = expanded.unsqueeze(1).expand(-1, self.encode_last_n_length, -1)
 
-            # # Add positional encodings
-            # positions = torch.arange(self.encode_last_n_length, device=x.device).unsqueeze(0)
-            # expanded = expanded + self.pos_embed(positions)
+            if hypertoken.size(-1)//self.seq_len < self.expansion_sizes[0][0]:
+                expanded = self.initial_expansion_layer(hypertoken)
+            else:
+                expanded = hypertoken   
 
             # Start with hypertoken expanded across sequence length
-            expanded = hypertoken.reshape(batch_size, self.encode_last_n_length, -1)
+            expanded = expanded.reshape(batch_size, self.encode_last_n_length, -1)
+            
             # Pass through progressive expansion layers
-            for layer in self.expansion_layers:
-                expanded = layer(expanded)
+            sub_layer_index = 0
+         
 
+            for i, (dim_in,dim_out) in enumerate(self.expansion_sizes):
+                expanded = self.expansion_layers[sub_layer_index](expanded) #transformer layer
+                sub_layer_index += 1
 
-            dec_out = self.decoder(expanded)
+                expanded = self.expansion_layers[sub_layer_index](expanded) #linear layer
+                sub_layer_index += 1
 
-            logits = self.fc_out(dec_out)
+            logits = self.fc_out(expanded)
 
             return logits
         
@@ -418,6 +412,8 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
 
     #evaluate_model(model, val_dataloader, criterion, device)
 
+    low_loss = 10000
+
     for epoch in range(epochs):
         epoch_loss = 0
         batch_count = 0
@@ -445,6 +441,10 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
                 # Update metrics
                 segment_loss += loss.item()
                 epoch_loss += loss.item()
+
+                if loss.item() < low_loss:
+                    low_loss = loss.item()
+                    print(f"New low loss: {low_loss:.4f}")
 
                 # Log batch metrics
                 if batch_count % 10 == 0:
@@ -491,16 +491,18 @@ if __name__ == "__main__":
             "seq_len": 64,
             "encode_last_n_length": 64,
             "hypertoken_size": hs,
-            "epochs": 2,
+            "epochs": 1,
             "batch_size": 512,
             "lr": 0.0001,
             "n_heads": nh,
-            "n_layers": 3,
+            "n_layers": n_layers,
             "embed_dim": ed
         }
-        for hs in [128]  # Varying hypertoken_size
-        for ed in [256]  # Varying embed_dim
-        for nh in [32]  # Varying n_heads
+        for hs in [512]  # Varying hypertoken_size
+        for ed in [512]  # Varying embed_dim
+        for n_layers in [1,2,3]  # Varying n_layers
+        for nh in [8]  # Varying n_heads
+        
     ]
   
     enable_torch_optimizations()
