@@ -189,11 +189,6 @@ class TransformerAutoencoder(nn.Module):
                     nn.TransformerEncoder(t_layer, num_layers=n_layers)
                 )
 
-            self.final_compression_layer = nn.Sequential(
-                nn.Linear(self.seq_len*self.compression_sizes[-1][1], self.hypertoken_size),
-            )
-
-
         if self.mode in {"decoder", "autoencoder"}:
              
             self.fc_out = nn.Linear(embed_dim, vocab_size)
@@ -239,10 +234,7 @@ class TransformerAutoencoder(nn.Module):
                     nn.TransformerEncoder(t_layer, num_layers=n_layers)
                 )
 
-            final_compress_in = self.final_compression_layer[0].in_features
-            final_compress_out = self.final_compression_layer[0].out_features
-            self.initial_expansion_layer =  nn.Linear(final_compress_out, final_compress_in)
-            
+           
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.size()
@@ -259,15 +251,11 @@ class TransformerAutoencoder(nn.Module):
                 compressed = self.compression_layers[i](compressed)
                 compress_factor = dim_in//dim_out
                 compressed = compressed.reshape(batch_size, seq_len, compressed.size(-1)//compress_factor,compress_factor)
-                compressed = compressed.mean(dim=-1)
+                compressed = compressed.sum(dim=-1)
 
-
-            if compressed.size(-1) > self.hypertoken_size//self.seq_len:
-                compressed = self.final_compression_layer(compressed.flatten(start_dim=1))
-            else:
-                compressed = compressed.flatten(start_dim=1)
-
-            hypertoken = compressed
+   
+   
+            hypertoken = compressed.flatten(start_dim=1)
         
             if self.mode == "encoder":
                 return hypertoken
@@ -278,10 +266,7 @@ class TransformerAutoencoder(nn.Module):
                 hypertoken = x
 
 
-            if hypertoken.size(-1)//self.seq_len < self.expansion_sizes[0][0]:
-                expanded = self.initial_expansion_layer(hypertoken)
-            else:
-                expanded = hypertoken   
+            expanded = hypertoken
 
             # Start with hypertoken expanded across sequence length
             expanded = expanded.reshape(batch_size, self.encode_last_n_length, -1)
