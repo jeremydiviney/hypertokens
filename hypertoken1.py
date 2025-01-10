@@ -240,7 +240,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConf
 
 
 
-def verify_hyperparameters(hs,ed,n_layers,head_size,lr,seq_len,hypertoken_size,compress_factor,encode_last_n_length):
+def verify_model_params(hs,ed,n_layers,head_size,lr,seq_len,hypertoken_size,compress_factor,encode_last_n_length):
 
     print(f"Verifying hyperparameters \n\
             hypertoken_size: {hypertoken_size}, \n\
@@ -368,7 +368,7 @@ if __name__ == "__main__":
         val_dataset = TinyShakespeareDataset(encode_last_n_length,segments=segments,seq_len=seq_len,type="validation")
         val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        verify_hyperparameters(
+        verify_model_params(
             experiment["hypertoken_size"],experiment["embed_dim"],
             experiment["n_layers"],experiment["head_size"],experiment["lr"],
             experiment["seq_len"],experiment["hypertoken_size"],
