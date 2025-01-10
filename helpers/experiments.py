@@ -93,8 +93,7 @@ def save_project_files_as_artifact(wandb_run):
     # Log the artifact
     wandb_run.log_artifact(artifact)
 
-def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
-
+def run_experiment(projectName,model,train_model,dataloader,val_dataloader,config: ExperimentConfig) -> None:
 
     # Initialize wandb
     wandb.login(key="2a4c6ae7fe4efb074b06e1bb9eca12afba05e310")
@@ -112,7 +111,7 @@ def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
     try:
 
         # Train model and get parameters count
-        model = train_model(wandb,**config)
+        model = train_model(wandb,model,dataloader,val_dataloader,config)
         
         total_params, params_by_layer = count_parameters(model)
 
@@ -125,7 +124,7 @@ def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
         save_project_files_as_artifact(wandb.run)
     
         memory_usage = model.average_memory_usage
-        
+
         gpu_memory_usage = get_gpu_memory_gb()
     except Exception as e:
         print(e)
