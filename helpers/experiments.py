@@ -4,9 +4,8 @@ import psutil
 import torch.nn as nn
 import torch
 from typing import TypedDict
-import os
 import glob
-
+from datetime import datetime
 
 # Define experiment configuration type
 class ExperimentConfig(TypedDict):
@@ -104,11 +103,17 @@ def run_experiment(projectName,model,train_model,dataloader,val_dataloader,confi
         name=f"{projectName}-sl:{config['seq_len']}-elnl:{config['encode_last_n_length']}-hts:{config['hypertoken_size']}-e:{config['epochs']}-bs:{config['batch_size']}-lr:{config['lr']}-hs:{config['head_size']}-nl:{config['n_layers']}-ed:{config['embed_dim']}-cf:{config['compress_factor']}",
         )
     
+    wandb.log({
+        "run_id": wandb.run.id
+    })
 
     # Track time and memory
     start_time = time.time()
    
     try:
+
+        # Save source code at start of run
+        save_project_files_as_artifact(wandb.run)
 
         # Train model and get parameters count
         model = train_model(wandb,model,dataloader,val_dataloader,config)
@@ -120,8 +125,7 @@ def run_experiment(projectName,model,train_model,dataloader,val_dataloader,confi
             "total_parameters": total_params,
         })
 
-        # Save source code at start of run
-        save_project_files_as_artifact(wandb.run)
+      
     
         memory_usage = model.average_memory_usage
 
