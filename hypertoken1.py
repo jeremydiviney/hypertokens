@@ -7,6 +7,8 @@ import math
 import random
 from helpers.experiments import run_experiment, ExperimentConfig, get_memory_gb, count_parameters
 from torch.amp import autocast, GradScaler
+from lion_pytorch import Lion
+from torch.utils.checkpoint import checkpoint
 
 # --------------------------------------------------
 # 1. Data Preparation
@@ -125,11 +127,12 @@ class TransformerAutoencoder(nn.Module):
         self, 
         vocab_size: int, 
         encode_last_n_length: int, 
-        embed_dim: int = 16, 
-        seq_len: int = 128, 
-        head_size: int = 32, 
-        n_layers: int = 2, 
-        hypertoken_size: int = 32, 
+        embed_dim: int, 
+        seq_len: int, 
+        head_size: int, 
+        n_layers: int, 
+        hypertoken_size: int, 
+        compress_factor: int,
         mode: str = "autoencoder"
     ) -> None:
         super().__init__()
@@ -138,11 +141,11 @@ class TransformerAutoencoder(nn.Module):
         self.encode_last_n_length = encode_last_n_length
         self.embed_dim = embed_dim
         self.hypertoken_size = hypertoken_size
+
+        self.average_memory_usage = 0
        
-
-        if hypertoken_size > embed_dim:
-           raise ValueError("Hypertoken size must be less than or equal to embed_dim")
-
+        # Add checkpointing flag
+        self.use_checkpointing = False
         # Verify BF16 is supported
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
             print("Warning: BF16 not supported on this device, falling back to FP32")
@@ -152,9 +155,15 @@ class TransformerAutoencoder(nn.Module):
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.pos_embed = nn.Embedding(seq_len, embed_dim)
   
-        self.COMPRESS_FACTOR = 2
+        self.COMPRESS_FACTOR = compress_factor
         self.MIN_EMBED_DIM = hypertoken_size//self.seq_len
               
+        # Register a buffer so it moves to the right device (CPU/GPU),
+        # but won't be updated by the optimizer.
+        self.register_buffer("positions", torch.arange(seq_len).unsqueeze(0))
+
+        # self.use_checkpointing = True  # Add flag for checkpointing
+
         if self.mode in {"encoder", "autoencoder"}:
 
             compression_sizes = []
@@ -172,8 +181,8 @@ class TransformerAutoencoder(nn.Module):
             self.compression_layers = nn.ModuleList([])
 
             for in_dim, out_dim in self.compression_sizes:
-
-                nh = max(2, out_dim // head_size)
+                nh = out_dim // head_size
+                nh = max(2, nh) if nh >= 2 else 1
 
                 t_layer = nn.TransformerEncoderLayer(
                     d_model=in_dim,
@@ -222,37 +231,50 @@ class TransformerAutoencoder(nn.Module):
                     norm_first=True
                 )
 
-                #expand first
-                self.expansion_layers.append(
-                    nn.Sequential(
-                        nn.Linear(in_dim, out_dim),
-                    )
-                )
-
-                #then transformer
                 self.expansion_layers.append(
                     nn.TransformerEncoder(t_layer, num_layers=n_layers)
                 )
 
-           
-        
+    # def forward(self,x):
+    #     if self.use_checkpointing and self.training:
+    #         return checkpoint(self._forward, x)
+
+    #     return self._forward(x)
+
+    def check_memory_usage(self):
+        if torch.cuda.is_available():
+            current_mem = float(torch.cuda.memory_allocated())/1e9
+            #max_mem = float(torch.cuda.max_memory_allocated())/1e9
+            #print("Current memory: {:.2f}GB".format(current_mem))
+            #print("Max memory: {:.2f}GB".format(max_mem))
+            self.average_memory_usage = (self.average_memory_usage + current_mem)/2
+            #print("Average memory usage: {:.2f}GB".format(self.average_memory_usage))
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.size()
         
+        #print("Starting forward pass")
+        #self.print_memory()
+
         if self.mode in {"encoder", "autoencoder"}:
 
-            positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
-            embedded = self.embed(x) + self.pos_embed(positions)
+            #positions = self.positions[:, :seq_len]  # handle seq_len if needed
+            embedded = self.embed(x) + self.pos_embed(self.positions)
 
             compressed = embedded
 
             # Pass through progressive compression transformer layers
             for i, (dim_in,dim_out) in enumerate(self.compression_sizes):
-                compressed = self.compression_layers[i](compressed)
-                compress_factor = dim_in//dim_out
-                compressed = compressed.reshape(batch_size, seq_len, compressed.size(-1)//compress_factor,compress_factor)
-                compressed = compressed.sum(dim=-1)
+                # Apply checkpointing to transformer layers
+                if self.use_checkpointing and self.training and dim_in >= 128:
+                    compressed = checkpoint(self.compression_layers[i], compressed)
+                else:
+                    compressed = self.compression_layers[i](compressed)
 
+
+                compress_factor = dim_in//dim_out
+                compressed = compressed.reshape(batch_size, seq_len, -1, compress_factor).sum(dim=-1)
    
    
             hypertoken = compressed.flatten(start_dim=1)
@@ -272,15 +294,29 @@ class TransformerAutoencoder(nn.Module):
             expanded = expanded.reshape(batch_size, self.encode_last_n_length, -1)
             
             # Pass through progressive expansion layers
-            sub_layer_index = 0
-         
+            for sub_layer_index, (dim_in,dim_out) in enumerate(self.expansion_sizes):
 
-            for i, (dim_in,dim_out) in enumerate(self.expansion_sizes):
-                expanded = self.expansion_layers[sub_layer_index](expanded) #transformer layer
-                sub_layer_index += 1
+                expand_factor = dim_out//dim_in
+                expanded = (
+                    expanded
+                    .unsqueeze(-1)
+                    .expand(-1, -1, -1, expand_factor)
+                    .reshape(batch_size, self.encode_last_n_length, dim_out)
+                    * (1.0 / expand_factor)
+                )
 
-                expanded = self.expansion_layers[sub_layer_index](expanded) #linear layer
-                sub_layer_index += 1
+                # Apply checkpointing to transformer layers
+                if self.use_checkpointing and self.training and dim_out >= 128:
+                    expanded = checkpoint(self.expansion_layers[sub_layer_index], expanded)
+                else:
+                    expanded = self.expansion_layers[sub_layer_index](expanded)
+
+                 # Mirror compression logic but expand instead
+   
+                # expanded = self.expansion_layers[sub_layer_index](expanded) #linear layer
+                # sub_layer_index += 1
+                
+            self.check_memory_usage()
 
             logits = self.fc_out(expanded)
 
@@ -364,7 +400,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, criterion: nn.Modul
 
 
 def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len=128, 
-                hypertoken_size=16, head_size=32, n_layers=2, embed_dim=16, lr=.0025):
+                hypertoken_size=16, head_size=32, compress_factor=2, n_layers=2, embed_dim=16, lr=.0025):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
    
     segments = 10
@@ -376,13 +412,25 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
     val_dataset = TinyShakespeareDataset(encode_last_n_length,segments=segments,seq_len=seq_len,type="validation")
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    model = TransformerAutoencoder(vocab_size=vocab_size, seq_len=seq_len, encode_last_n_length=encode_last_n_length, hypertoken_size=hypertoken_size, head_size=head_size, n_layers=n_layers, embed_dim=embed_dim).to(device)
-    #model = torch.compile(model)
+    model = TransformerAutoencoder(
+                vocab_size=vocab_size, seq_len=seq_len, encode_last_n_length=encode_last_n_length, 
+                hypertoken_size=hypertoken_size, head_size=head_size, compress_factor=compress_factor, 
+                n_layers=n_layers, embed_dim=embed_dim
+            ).to(device)
+
+    model = torch.compile(model)
 
     count_parameters(model)
 
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # optimizer = Lion(
+    #     model.parameters(),
+    #     lr=lr,  # Usually needs 3-10x smaller learning rate than Adam
+    #     weight_decay=1e-2  # Lion typically works better with higher weight decay
+    # )
+    
     criterion = nn.CrossEntropyLoss()
 
     total_steps = epochs * len(dataloader) * segments
@@ -433,7 +481,7 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
 
                 if loss.item() < low_loss:
                     low_loss = loss.item()
-                    print(f"New low loss: {low_loss:.4f}")
+                    print(f"New low loss: {low_loss:.7f}")
 
                 # Log batch metrics
                 if batch_count % 10 == 0:
@@ -446,6 +494,7 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
                  # Standard backward pass (no scaling needed for BF16)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
                 optimizer.step()
                 
                 scheduler.step()
@@ -472,41 +521,73 @@ def train_model(wandb, epochs=3, batch_size=512, encode_last_n_length=4, seq_len
     return model
 
 
+def verify_hyperparameters(hs,ed,n_layers,head_size,lr,seq_len,hypertoken_size,compress_factor,encode_last_n_length):
+
+    print(f"Verifying hyperparameters \n\
+            hypertoken_size: {hypertoken_size}, \n\
+            seq_len: {seq_len}, \n\
+            encode_last_n_length: {encode_last_n_length}")
+
+    if hypertoken_size < seq_len:
+        raise ValueError("hypertoken_size must be greater than or equal to seq_len")
+
+    if hypertoken_size < encode_last_n_length:
+        raise ValueError("encode_last_n_length must be greater than or equal to hypertoken_size")
+
+    # Add check for embed_dim being multiple of seq_len
+    if hypertoken_size % seq_len != 0:
+        raise ValueError(f"hypertoken_size must be a multiple of seq_len")
+
+    if hypertoken_size % encode_last_n_length != 0:
+        raise ValueError(f"hypertoken_size must be a multiple of encode_last_n_length")
+
+    # Check if embed_dim is a power of compress_factor
+    # if not (math.log(ed, compress_factor).is_integer()):
+    #     raise ValueError(f"Embed_dim ({ed}) must be a power of compress_factor ({compress_factor})")
+
+    if encode_last_n_length > seq_len:
+        raise ValueError("encode_last_n_length must be less than or equal to seq_len")
+
+
 if __name__ == "__main__":
 
     # Define experiments
     experiments: list[ExperimentConfig] = [
         {
-            "seq_len": 64,
-            "encode_last_n_length": 64,
+            "seq_len": 128,
+            "encode_last_n_length": 128,
             "hypertoken_size": hs,
             "epochs": 1,
             "batch_size": 512,
-            "lr": 0.0001,
+            "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
-            "embed_dim": ed
+            "embed_dim": ed,
+            "compress_factor": cf
         }
         for hs in [512]  # Varying hypertoken_size
         for ed in [512]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
-        for head_size in [32,64]  # Varying head_size
+        for head_size in [64]  # Varying head_size
+        for lr in [0.001]
+        for cf in [4]
         
     ]
-  
+
+    for experiment in experiments:
+        verify_hyperparameters(
+            experiment["hypertoken_size"],experiment["embed_dim"],
+            experiment["n_layers"],experiment["head_size"],experiment["lr"],
+            experiment["seq_len"],experiment["hypertoken_size"],
+            experiment["compress_factor"],experiment["encode_last_n_length"]
+        )
+
     enable_torch_optimizations()
     setup_flash_attention()
-
   
     for experiment in experiments:
         run_experiment("HyperTokens",train_model,experiment)
     
-    
-    # Inference example (greedy sampling for demonstration)
-    test_input = "that didn't really seem to "
-    # Convert to indices
-    # ... etc. (omitted to keep script concise)
-    print("Training complete.")
+
 #TODO: fix gpu memory reporting
-#TODO: get 2d hyperperamter search working
 

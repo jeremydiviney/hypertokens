@@ -24,10 +24,8 @@ def get_gpu_memory_gb() -> float:
     """Get current GPU memory usage in GB for the current device"""
     if not torch.cuda.is_available():
         return 0.0
-    
-    current_device = torch.cuda.current_device()
-    memory_allocated = torch.cuda.memory_allocated(current_device)
-    return memory_allocated / (1024 * 1024 * 1024)  # Convert bytes to GB
+
+    return float(torch.cuda.max_memory_allocated())/1e9  # Convert bytes to GB
 
 
 def get_memory_gb() -> float:
@@ -104,7 +102,7 @@ def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
     wandb.init(
         project=projectName,
         config=config,
-        name=f"{projectName}-sl:{config['seq_len']}-elnl:{config['encode_last_n_length']}-hs:{config['hypertoken_size']}-e:{config['epochs']}-bs:{config['batch_size']}-lr:{config['lr']}-hs:{config['head_size']}-nl:{config['n_layers']}-ed:{config['embed_dim']}",
+        name=f"{projectName}-sl:{config['seq_len']}-elnl:{config['encode_last_n_length']}-hts:{config['hypertoken_size']}-e:{config['epochs']}-bs:{config['batch_size']}-lr:{config['lr']}-hs:{config['head_size']}-nl:{config['n_layers']}-ed:{config['embed_dim']}-cf:{config['compress_factor']}",
         )
     
 
@@ -126,7 +124,8 @@ def run_experiment(projectName,train_model,config: ExperimentConfig) -> None:
         # Save source code at start of run
         save_project_files_as_artifact(wandb.run)
     
-        memory_usage = get_memory_gb()
+        memory_usage = model.average_memory_usage
+        
         gpu_memory_usage = get_gpu_memory_gb()
     except Exception as e:
         print(e)
