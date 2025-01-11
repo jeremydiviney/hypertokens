@@ -15,7 +15,7 @@
             "type": "debugpy",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "program": "jpt1.py",
+            "program": "jpt1_train.py",
             "console": "internalConsole",
             "internalConsoleOptions": "openOnSessionStart"
         },
@@ -24,7 +24,7 @@
             "type": "debugpy",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "program": "hypertoken1.py",
+            "program": "hypertoken_train.py",
             "console": "internalConsole",
             "internalConsoleOptions": "openOnSessionStart"
         },

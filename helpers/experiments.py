@@ -86,9 +86,6 @@ def save_project_files_as_artifact(wandb_run):
     for file_path in python_files:
         artifact.add_file(file_path)
     
-    # Add all Python files to artifact
-    for file_path in python_files:
-        artifact.add_file(file_path)
     
     # Log the artifact
     wandb_run.log_artifact(artifact)
@@ -103,10 +100,6 @@ def run_experiment(projectName,model,train_model,dataloader,val_dataloader,confi
         config=config,
         name=f"{projectName}-sl:{config['seq_len']}-elnl:{config['encode_last_n_length']}-hts:{config['hypertoken_size']}-e:{config['epochs']}-bs:{config['batch_size']}-lr:{config['lr']}-hs:{config['head_size']}-nl:{config['n_layers']}-ed:{config['embed_dim']}-cf:{config['compress_factor']}",
         )
-    
-    wandb.log({
-        "run_id": wandb.run.id
-    })
 
     # Track time and memory
     start_time = time.time()
@@ -124,6 +117,7 @@ def run_experiment(projectName,model,train_model,dataloader,val_dataloader,confi
         # Log parameters count
         wandb.log({
             "total_parameters": total_params,
+            "run_id": wandb.run.id
         })
 
       
