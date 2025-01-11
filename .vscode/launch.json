@@ -11,6 +11,15 @@
             "internalConsoleOptions": "openOnSessionStart"
         },
         {
+            "name": "JPT1 main",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "jpt1.py",
+            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart"
+        },
+        {
             "name": "Hypertokens1 main",
             "type": "debugpy",
             "request": "launch",

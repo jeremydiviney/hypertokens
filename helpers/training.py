@@ -114,3 +114,32 @@ def load_model(
         "val_sequence_accuracy": exact_matches/total_samples,
         "val_char_accuracy": matching_chars/total_chars
     }
+
+
+
+# 2. Enable torch.backends optimizations
+def enable_torch_optimizations():
+    if torch.cuda.is_available():
+        # Enable TF32 for faster matrix multiplications
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Enable cudnn benchmarking
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+
+
+def setup_flash_attention():
+    # Enable Flash Attention if available
+    if torch.cuda.is_available():
+        flash_available = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
+        print(f"Flash Attention available and enabled: {flash_available}")
+        # Enable Flash Attention
+        torch.backends.cuda.enable_flash_sdp(True)
+        # Enable Math Flash Attention (more efficient math operations)
+        torch.backends.cuda.enable_math_sdp(True)
+        # Enable Memory Efficient Attention
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        return flash_available
+    print("CUDA not available, Flash Attention disabled")
+    return False       

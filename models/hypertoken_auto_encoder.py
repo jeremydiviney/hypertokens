@@ -58,6 +58,8 @@ class HyperTokenEncoder(nn.Module):
             self.compression_layers.append(
                 nn.TransformerEncoder(t_layer, num_layers=n_layers)
             )
+
+
             
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.size()
@@ -120,6 +122,7 @@ class HyperTokenDecoder(nn.Module):
             self.expansion_layers.append(
                 nn.TransformerEncoder(t_layer, num_layers=n_layers)
             )
+
             
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)

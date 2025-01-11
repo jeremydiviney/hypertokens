@@ -14,7 +14,8 @@ from data.tinyshakespeare import TinyShakespeareDataset
 from helpers.training import save_model, enable_torch_optimizations, setup_flash_attention
 import sys
 from transformers import get_linear_schedule_with_warmup
-
+from models.jpt1 import JPT1
+from data.tinyshakespeare import HyperTokenTinyShakespeareDataset
 # --------------------------------------------------
 # 2. Model Definition
 # --------------------------------------------------
@@ -36,36 +37,46 @@ def batch_tensor_to_text(batch_tensor: torch.Tensor, idx2char: dict) -> list[str
 
 
 
-def evaluate_model(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: str) -> dict:
+def evaluate_model(model: nn.Module, decoder: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: str) -> dict:
     """Evaluate model on given dataloader"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     model.eval()
+    decoder.eval()
     total_loss = 0
     batch_count = 0
     exact_matches = 0
     total_samples = 0
-    # Add character-level tracking
     matching_chars = 0
     total_chars = 0
      
     with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
-        for x, y in dataloader:
-            x = x.to(device)
-            y = y.to(device)
-            logits = model(x)
+        for batch in dataloader:
+            encoded_seq = batch["encoded"].to(device)
+            target_chars = batch["target_chars"].to(device)
+            
+            # Forward through JPT1
+            jpt_output = model(encoded_seq)
+            
+            # Decode each embedding in the sequence
+            decoded_outputs = []
+            for i in range(jpt_output.size(1)):
+                decoded = decoder(jpt_output[:, i])
+                decoded_outputs.append(decoded)
+            
+            # Stack decoded outputs
+            decoded = torch.stack(decoded_outputs, dim=1)
+            
             loss = criterion(
-                logits.reshape(-1, len(dataloader.dataset.char2idx)),
-                y[:, -dataloader.dataset.encode_last_n_length:].reshape(-1)
+                decoded.reshape(-1, len(dataloader.dataset.char2idx)),
+                target_chars.reshape(-1)
             ).mean()
+            
             total_loss += loss.item()
             batch_count += 1
 
-            pred_logits = logits[:, -dataloader.dataset.encode_last_n_length:]
-            pred_indices = torch.argmax(pred_logits, dim=-1)
-            
-            target_seqs = y[:, -dataloader.dataset.encode_last_n_length:]
-            target_texts = batch_tensor_to_text(target_seqs, dataloader.dataset.idx2char)
+            pred_indices = torch.argmax(decoded, dim=-1)
+            target_texts = batch_tensor_to_text(target_chars, dataloader.dataset.idx2char)
             pred_texts = batch_tensor_to_text(pred_indices, dataloader.dataset.idx2char)
             
             # Count exact matches
@@ -85,6 +96,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, criterion: nn.Modul
                 print(f"Current character accuracy: {matching_chars/total_chars:.2%}")
     
     model.train()
+    decoder.train()
     return {
         "val_loss": total_loss / batch_count,
         "val_sequence_accuracy": exact_matches/total_samples,
@@ -92,49 +104,100 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, criterion: nn.Modul
     }
 
 def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConfig):
-   
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    data_segments = config["segments"]
    
-    data_segments = dataloader.dataset.segments
-        
-    lr = config["lr"]
-    epochs = config["epochs"]
-    encode_last_n_length = config["encode_last_n_length"]
+    # Load encoder and decoder
+    encoder = HyperTokenEncoder(
+        vocab_size=config["vocab_size"],
+        seq_len=config["h_seq_len"],
+        embed_dim=config["embed_dim"],
+        head_size=config["head_size"],
+        n_layers=config["n_layers"]
+    )
+    
+    decoder = HyperTokenDecoder(
+        vocab_size=config["vocab_size"],
+        seq_len=config["encode_last_n_length"],
+        embed_dim=config["embed_dim"],
+        head_size=config["head_size"],
+        n_layers=config["n_layers"]
+    ).to(device)
+    
+    # Load weights
+    encoder = load_model(encoder, "saved_models", config["encoder_model_name"], encoder_only=True)
+    encoder.eval()  # Set to eval mode since we're not training it
+    
+    decoder = load_model(decoder, "saved_models", config["decoder_model_name"], decoder_only=True)
+    decoder.train()  # Set to train mode since we're training it end-to-end
+    
+    # Create datasets with encoder
+    train_dataset = HyperTokenTinyShakespeareDataset(
+        encoder=encoder,
+        encode_last_n_length=config["encode_last_n_length"],
+        segments=config["segments"],
+        h_seq_len=config["h_seq_len"],
+        jpt_seq_len=config["jpt_seq_len"],
+        type="train"
+    )
+    
+    val_dataset = HyperTokenTinyShakespeareDataset(
+        encoder=encoder,
+        encode_last_n_length=config["encode_last_n_length"],
+        segments=config["segments"],
+        h_seq_len=config["h_seq_len"],
+        jpt_seq_len=config["jpt_seq_len"],
+        type="validation"
+    )
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+    
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
 
     #only if not debugging
     if sys.gettrace() is None:  # No debugger attached
         model = torch.compile(model)
+        decoder = torch.compile(decoder)
 
     count_parameters(model)
+    count_parameters(decoder)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    
-    # optimizer = Lion(
-    #     model.parameters(),
-    #     lr=lr,  # Usually needs 3-10x smaller learning rate than Adam
-    #     weight_decay=1e-2  # Lion typically works better with higher weight decay
-    # )
-    
+    # Create optimizer for both models
+    optimizer = optim.AdamW(list(model.parameters()) + list(decoder.parameters()), lr=config["lr"])
     criterion = nn.CrossEntropyLoss()
 
-    total_steps = epochs * len(dataloader) * data_segments
+    total_steps = config["epochs"] * len(train_dataloader) * data_segments
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=lr,
+        max_lr=config["lr"],
         total_steps=total_steps,
         pct_start=0.2,
         anneal_strategy='cos',
         cycle_momentum=False
     )
 
-    current_lr = lr
-
+    current_lr = config["lr"]
     low_loss = 10000
+    vocab_size = len(train_dataset.char2idx)
 
-    vocab_size = len(dataloader.dataset.char2idx)
-
-    for epoch in range(epochs):
+    for epoch in range(config["epochs"]):
         epoch_loss = 0
         batch_count = 0
         optimizer.param_groups[0]['lr'] = current_lr
@@ -143,20 +206,30 @@ def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConf
             segment_loss = 0
             segment_batch_count = 0
             
-            for x, y in dataloader:
-
+            for batch in train_dataloader:
                 batch_count += 1
                 segment_batch_count += 1
-                x, y = x.to(device), y.to(device)
+                
+                encoded_seq = batch["encoded"].to(device)
+                target_chars = batch["target_chars"].to(device)
 
                 with autocast(device_type='cuda', dtype=torch.bfloat16):
-
-                    logits = model(x)
-                    loss_per_pos = criterion(
-                        logits.reshape(-1, vocab_size),
-                        y[:, -encode_last_n_length:].reshape(-1)
-                    )
-                    loss = loss_per_pos.mean()
+                    # Forward through JPT1
+                    jpt_output = model(encoded_seq)
+                    
+                    # Decode each embedding in the sequence
+                    decoded_outputs = []
+                    for i in range(jpt_output.size(1)):
+                        decoded = decoder(jpt_output[:, i])
+                        decoded_outputs.append(decoded)
+                    
+                    # Stack decoded outputs
+                    decoded = torch.stack(decoded_outputs, dim=1)
+                    
+                    loss = criterion(
+                        decoded.reshape(-1, vocab_size),
+                        target_chars.reshape(-1)
+                    ).mean()
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -168,6 +241,16 @@ def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConf
 
                 # Log batch metrics
                 if batch_count % 10 == 0:
+                    # Get predictions for logging
+                    with torch.inference_mode():
+                        pred_indices = torch.argmax(decoded, dim=-1)
+                        target_texts = batch_tensor_to_text(target_chars, train_dataset.idx2char)
+                        pred_texts = batch_tensor_to_text(pred_indices, train_dataset.idx2char)
+                        
+                        print(f"\nSample {batch_count}:")
+                        print(f"Target: {target_texts[0]}")
+                        print(f"Pred:   {pred_texts[0]}")
+                    
                     wandb.log({
                         "batch_loss": loss.item(),
                         "learning_rate": optimizer.param_groups[0]['lr'],
@@ -176,40 +259,41 @@ def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConf
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-
                 optimizer.step()
-                
                 scheduler.step()
 
             # Log segment metrics
             avg_segment_loss = segment_loss / segment_batch_count
 
-        # Log epoch metrics
-        eval_results = evaluate_model(model, val_dataloader, criterion, device)
+        # Evaluation
+ 
+        eval_results = evaluate_model(model, decoder, val_dataloader, criterion, device)
+
+        
         val_loss = eval_results["val_loss"]
         val_sequence_accuracy = eval_results["val_sequence_accuracy"]
         val_char_accuracy = eval_results["val_char_accuracy"]
 
-
         wandb.log({
-                    "epoch_loss": epoch_loss/batch_count,
-                    "val_loss": val_loss,
-                    "val_sequence_accuracy": val_sequence_accuracy,
-                    "val_char_accuracy": val_char_accuracy,
-                    "epoch": epoch,
-                })
+            "epoch_loss": epoch_loss/batch_count,
+            "val_loss": val_loss,
+            "val_sequence_accuracy": val_sequence_accuracy,
+            "val_char_accuracy": val_char_accuracy,
+            "epoch": epoch,
+        })
 
-        print(f"Epoch {epoch} train_loss: {avg_segment_loss:.4f}, val_loss: {val_loss:.4f}, val_sequence_accuracy: {val_sequence_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}")
+        print(f"Epoch {epoch} train_loss: {avg_segment_loss:.4f}, val_loss: {val_loss:.4f}, "
+              f"val_sequence_accuracy: {val_sequence_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}")
 
-    # After training loop ends, save the model
+    # Save both models
     save_dir = "saved_models"
     timestamp = datetime.now().isoformat()
-    model_name = f"hypertoken_{timestamp}_encode_last_n_length{encode_last_n_length}_hypertoken_size{config['hypertoken_size']}"
-    save_model(model, save_dir, model_name)
+    model_name = f"jpt1_{timestamp}_encode_last_n_length{config['encode_last_n_length']}_h_seq_len{config['h_seq_len']}"
+    
+    save_model(model, save_dir, f"{model_name}_jpt1")
+    save_model(decoder, save_dir, f"{model_name}_decoder")
 
-    return model
-
-
+    return model, decoder
 
 def verify_model_params(hs,ed,n_layers,head_size,lr,seq_len,hypertoken_size,compress_factor,encode_last_n_length):
 
@@ -294,9 +378,9 @@ if __name__ == "__main__":
     # Define experiments
     experiments: list[ExperimentConfig] = [
         {
-            "seq_len": 128,
+            "seq_len": 6,
             "encode_last_n_length": 128,
-            "hypertoken_size": hs,
+            "hypertoken_size": 512,
             "epochs": 1,
             "batch_size": 512,
             "lr": lr,
@@ -305,10 +389,9 @@ if __name__ == "__main__":
             "embed_dim": ed,
             "compress_factor": cf
         }
-        for hs in [512]  # Varying hypertoken_size
         for ed in [512]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
-        for head_size in [32]  # Varying head_size
+        for head_size in [64]  # Varying head_size
         for lr in [0.001]
         for cf in [4]
         
@@ -360,6 +443,16 @@ if __name__ == "__main__":
             experiment["seq_len"],experiment["hypertoken_size"],
             experiment["compress_factor"],experiment["encode_last_n_length"]
         )
+
+        gptModel = JPT1(
+            vocab_size=vocab_size, 
+            seq_len=seq_len, 
+            embed_dim=embed_dim,
+            num_heads=head_size,
+            num_layers=n_layers,
+            ff_dim=embed_dim*4,
+            dropout=0.1
+        ).to(device)
 
         model = HyperTokenAutoencoder(
             vocab_size=vocab_size, 
