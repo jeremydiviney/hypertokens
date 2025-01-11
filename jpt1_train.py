@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch
-from helpers.experiments import run_experiment, ExperimentConfig,count_parameters
+from helpers.experiments import run_experiment, count_parameters
 from torch.amp import autocast, GradScaler
 from lion_pytorch import Lion
 from torch.utils.checkpoint import checkpoint
@@ -103,7 +103,7 @@ def evaluate_model(model: nn.Module, decoder: nn.Module, dataloader: DataLoader,
         "val_char_accuracy": matching_chars/total_chars
     }
 
-def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConfig):
+def train_model(wandb, model, dataloader, val_dataloader, config: dict):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     data_segments = config["segments"]
    
@@ -296,31 +296,31 @@ def train_model(wandb, model, dataloader, val_dataloader, config: ExperimentConf
     return model, decoder
 
 def verify_model_params(hs,ed,n_layers,head_size,lr,seq_len,hypertoken_size,compress_factor,encode_last_n_length):
+    return
+    # print(f"Verifying hyperparameters \n\
+    #         hypertoken_size: {hypertoken_size}, \n\
+    #         seq_len: {seq_len}, \n\
+    #         encode_last_n_length: {encode_last_n_length}")
 
-    print(f"Verifying hyperparameters \n\
-            hypertoken_size: {hypertoken_size}, \n\
-            seq_len: {seq_len}, \n\
-            encode_last_n_length: {encode_last_n_length}")
+    # if hypertoken_size < seq_len:
+    #     raise ValueError("hypertoken_size must be greater than or equal to seq_len")
 
-    if hypertoken_size < seq_len:
-        raise ValueError("hypertoken_size must be greater than or equal to seq_len")
+    # if hypertoken_size < encode_last_n_length:
+    #     raise ValueError("encode_last_n_length must be greater than or equal to hypertoken_size")
 
-    if hypertoken_size < encode_last_n_length:
-        raise ValueError("encode_last_n_length must be greater than or equal to hypertoken_size")
+    # # Add check for embed_dim being multiple of seq_len
+    # if hypertoken_size % seq_len != 0:
+    #     raise ValueError(f"hypertoken_size must be a multiple of seq_len")
 
-    # Add check for embed_dim being multiple of seq_len
-    if hypertoken_size % seq_len != 0:
-        raise ValueError(f"hypertoken_size must be a multiple of seq_len")
+    # if hypertoken_size % encode_last_n_length != 0:
+    #     raise ValueError(f"hypertoken_size must be a multiple of encode_last_n_length")
 
-    if hypertoken_size % encode_last_n_length != 0:
-        raise ValueError(f"hypertoken_size must be a multiple of encode_last_n_length")
+    # # Check if embed_dim is a power of compress_factor
+    # # if not (math.log(ed, compress_factor).is_integer()):
+    # #     raise ValueError(f"Embed_dim ({ed}) must be a power of compress_factor ({compress_factor})")
 
-    # Check if embed_dim is a power of compress_factor
-    # if not (math.log(ed, compress_factor).is_integer()):
-    #     raise ValueError(f"Embed_dim ({ed}) must be a power of compress_factor ({compress_factor})")
-
-    if encode_last_n_length > seq_len:
-        raise ValueError("encode_last_n_length must be less than or equal to seq_len")
+    # if encode_last_n_length > seq_len:
+    #     raise ValueError("encode_last_n_length must be less than or equal to seq_len")
 
 
 def load_model(
@@ -376,10 +376,10 @@ def load_model(
 if __name__ == "__main__":
 
     # Define experiments
-    experiments: list[ExperimentConfig] = [
+    experiments: list[dict] = [
         {
             "seq_len": 6,
-            "encode_last_n_length": 128,
+            "hypertoken_seq_len": 128,
             "hypertoken_size": 512,
             "epochs": 1,
             "batch_size": 512,
@@ -387,7 +387,6 @@ if __name__ == "__main__":
             "head_size": head_size,
             "n_layers": n_layers,
             "embed_dim": ed,
-            "compress_factor": cf
         }
         for ed in [512]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
@@ -404,10 +403,9 @@ if __name__ == "__main__":
 
     for experiment in experiments:
         seq_len = experiment["seq_len"]
-        encode_last_n_length = experiment["encode_last_n_length"]
+        hypertoken_seq_len = experiment["hypertoken_seq_len"]
         hypertoken_size = experiment["hypertoken_size"]
         batch_size = experiment["batch_size"]
-        compress_factor = experiment["compress_factor"]
         n_layers = experiment["n_layers"]
         head_size = experiment["head_size"]
         embed_dim = experiment["embed_dim"]
@@ -415,7 +413,9 @@ if __name__ == "__main__":
 
         #model = load_model(model, "saved_models", "hypertoken_2025-01-10T00:21:59.914619_encode_last_n_length128_hypertoken_size512")
 
-        dataset = TinyShakespeareDataset(encode_last_n_length,segments=segments,seq_len=seq_len)
+        model = load_model(model, "saved_models", "hypertoken_2025-01-10T00:21:59.914619_encode_last_n_length128_hypertoken_size512")
+
+        dataset = HyperTokenTinyShakespeareDataset(hypertoken_seq_len=hypertoken_seq_len,segments=segments,seq_len=seq_len)
         vocab_size = len(dataset.char2idx)
         dataloader = DataLoader(
             dataset, 
@@ -427,7 +427,7 @@ if __name__ == "__main__":
             prefetch_factor=2,  # Number of batches loaded in advance per worker)
         ) 
 
-        val_dataset = TinyShakespeareDataset(encode_last_n_length,segments=segments,seq_len=seq_len,type="validation")
+        val_dataset = HyperTokenTinyShakespeareDataset(hypertoken_seq_len,segments=segments,seq_len=seq_len,type="validation")
         val_dataloader = DataLoader(val_dataset,  
             batch_size=batch_size, 
             shuffle=False,
@@ -454,16 +454,29 @@ if __name__ == "__main__":
             dropout=0.1
         ).to(device)
 
-        model = HyperTokenAutoencoder(
+        h_decoder_model = HyperTokenDecoder(
             vocab_size=vocab_size, 
             seq_len=seq_len, 
-            encode_last_n_length=encode_last_n_length, 
+            encode_last_n_length=hypertoken_seq_len, 
             hypertoken_size=hypertoken_size, 
             head_size=head_size, 
-            compress_factor=compress_factor, 
+            compress_factor=1, 
             n_layers=n_layers, 
             embed_dim=embed_dim,
         ).to(device)
+
+        h_encoder_model = HyperTokenEncoder(
+            vocab_size=vocab_size, 
+            seq_len=seq_len, 
+            encode_last_n_length=hypertoken_seq_len, 
+            hypertoken_size=hypertoken_size, 
+            head_size=head_size, 
+            compress_factor=1, 
+            n_layers=n_layers, 
+            embed_dim=embed_dim,
+        ).to(device)
+
+       
 
         run_experiment("HyperTokens",model,train_model,dataloader, val_dataloader, experiment)
     

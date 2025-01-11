@@ -7,17 +7,7 @@ from typing import TypedDict
 import glob
 from datetime import datetime
 
-# Define experiment configuration type
-class ExperimentConfig(TypedDict):
-    seq_len: int
-    encode_last_n_length: int
-    hypertoken_size: int
-    epochs: int
-    batch_size: int
-    lr: float
-    n_heads: int
-    n_layers: int
-    embed_dim: int
+
 
 def get_gpu_memory_gb() -> float:
     """Get current GPU memory usage in GB for the current device"""
@@ -90,7 +80,7 @@ def save_project_files_as_artifact(wandb_run):
     # Log the artifact
     wandb_run.log_artifact(artifact)
 
-def run_experiment(projectName,model,train_model,dataloader,val_dataloader,config: ExperimentConfig) -> None:
+def run_experiment(projectName,model,train_model,dataloader,val_dataloader,config: dict) -> None:
 
     # Initialize wandb
     wandb.login(key="2a4c6ae7fe4efb074b06e1bb9eca12afba05e310")
