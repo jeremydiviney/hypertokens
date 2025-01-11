@@ -338,7 +338,7 @@ if __name__ == "__main__":
         for ed in [512]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
         for head_size in [128]  # Varying head_size
-        for lr in [0.005,0.001]
+        for lr in [0.001]
         for cf in [4]
         
     ]

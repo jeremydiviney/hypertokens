@@ -71,7 +71,8 @@ def save_project_files_as_artifact(wandb_run):
     exclude_patterns = [
         '.venv/**/*.py',
         '.vscode/**/*.py',
-        'wandb/**/*.py'
+        'wandb/**/*.py',
+        '**/__init__.py'
     ]
     
     # Get all Python files then filter out excluded paths
