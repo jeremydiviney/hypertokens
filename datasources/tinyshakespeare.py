@@ -133,6 +133,10 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         type: str = "train",
     ):
 
+        encoder.eval()
+
+        self.encoder = encoder
+
         self.encoder = encoder
         self.hypertoken_seq_len = hypertoken_seq_len  # hypertoken sequence length
         self.seq_len = seq_len  # JPT1 sequence length
@@ -235,7 +239,9 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         # Process in smaller batches if needed
         encoded_chunks_list = []
+
         for i in range(0, self.batch_size, items_per_batch):
+
             batch_slice = slice(i, min(i + items_per_batch, self.batch_size))
             current_input = input_chunks[batch_slice].to(device)
 
@@ -243,10 +249,11 @@ class HyperTokenTinyShakespeareDataset(Dataset):
             batch_size_current = current_input.size(0)
             current_input = current_input.view(-1, self.hypertoken_seq_len)
 
-            with torch.inference_mode(), torch.autocast(
-                device_type=device.type, dtype=torch.bfloat16
-            ):
+            with torch.inference_mode():
+                start_time = time.time()
                 encoded = self.encoder(current_input)
+                end_time = time.time()
+                print(f"Time taken for encoding: {end_time - start_time} seconds")
                 # Reshape back to [batch_size, seq_len, encoder_output_dim]
                 encoded = encoded.view(batch_size_current, self.seq_len, -1)
                 encoded_chunks_list.append(encoded)

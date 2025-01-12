@@ -3,7 +3,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch
 from helpers.experiments import run_experiment, count_parameters
-from torch.amp import autocast, GradScaler
 from lion_pytorch import Lion
 from torch.utils.checkpoint import checkpoint
 import os
@@ -47,10 +46,10 @@ def evaluate_model(
     matching_chars = 0
     total_chars = 0
 
-    with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
+    with torch.inference_mode():
         for x, y in dataloader:
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device)  # x is in int (char index)
+            y = y.to(device)  # y is in int (char index)
             logits = model(x)
             loss = criterion(
                 logits.reshape(-1, len(dataloader.dataset.char2idx)),
@@ -110,13 +109,13 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     count_parameters(model)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # optimizer = Lion(
-    #     model.parameters(),
-    #     lr=lr,  # Usually needs 3-10x smaller learning rate than Adam
-    #     weight_decay=1e-2  # Lion typically works better with higher weight decay
-    # )
+    optimizer = Lion(
+        model.parameters(),
+        lr=lr,  # Usually needs 3-10x smaller learning rate than Adam
+        weight_decay=1e-2,  # Lion typically works better with higher weight decay
+    )
 
     criterion = nn.CrossEntropyLoss()
 
@@ -150,16 +149,15 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
                 batch_count += 1
                 segment_batch_count += 1
-                x, y = x.to(device), y.to(device)
+                x = x.to(device)  # x is in int (char index)
+                y = y.to(device)  # y is in int (char index)
 
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
-
-                    logits = model(x)
-                    loss_per_pos = criterion(
-                        logits.reshape(-1, vocab_size),
-                        y[:, -encode_last_n_length:].reshape(-1),
-                    )
-                    loss = loss_per_pos.mean()
+                logits = model(x)
+                loss_per_pos = criterion(
+                    logits.reshape(-1, vocab_size),
+                    y[:, -encode_last_n_length:].reshape(-1),
+                )
+                loss = loss_per_pos.mean()
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -317,7 +315,7 @@ if __name__ == "__main__":
         for ed in [512]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
         for head_size in [16]  # Varying head_size
-        for lr in [0.0005]
+        for lr in [0.0001]
         for cf in [4]
     ]
 

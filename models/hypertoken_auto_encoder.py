@@ -21,8 +21,8 @@ class HyperTokenEncoder(nn.Module):
         self.hypertoken_size = hypertoken_size
 
         # Embeddings
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embed = nn.Embedding(seq_len, embed_dim)
+        self.embed = nn.Embedding(vocab_size, embed_dim).to(torch.bfloat16)
+        self.pos_embed = nn.Embedding(seq_len, embed_dim).to(torch.bfloat16)
 
         self.COMPRESS_FACTOR = compress_factor
         self.MIN_EMBED_DIM = hypertoken_size // self.seq_len
@@ -60,6 +60,8 @@ class HyperTokenEncoder(nn.Module):
             self.compression_layers.append(
                 nn.TransformerEncoder(t_layer, num_layers=n_layers)
             )
+
+        self.to(torch.bfloat16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.size()
@@ -126,6 +128,8 @@ class HyperTokenDecoder(nn.Module):
                 nn.TransformerEncoder(t_layer, num_layers=n_layers)
             )
 
+        self.to(torch.bfloat16)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)
         expanded = x.reshape(batch_size, self.encode_last_n_length, -1)
@@ -177,6 +181,8 @@ class HyperTokenAutoencoder(nn.Module):
             hypertoken_size=hypertoken_size,
             compress_factor=compress_factor,
         )
+
+        self.to(torch.bfloat16)
 
     def check_memory_usage(self):
         if torch.cuda.is_available():

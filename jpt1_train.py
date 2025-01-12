@@ -405,14 +405,14 @@ if __name__ == "__main__":
         h_encoder_model = load_model(
             h_encoder_model,
             "saved_models",
-            "hypertoken_2025-01-11T23:44:20.144846_encode_last_n_length128_hypertoken_size512",
+            "hypertoken_2025-01-12T15:34:15.275481_encode_last_n_length128_hypertoken_size512",
             encoder_only=True,
         )
 
         h_decoder_model = load_model(
             h_decoder_model,
             "saved_models",
-            "hypertoken_2025-01-11T23:44:20.144846_encode_last_n_length128_hypertoken_size512",
+            "hypertoken_2025-01-12T15:34:15.275481_encode_last_n_length128_hypertoken_size512",
             decoder_only=True,
         )
 
