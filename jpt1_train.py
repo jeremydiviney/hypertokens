@@ -14,7 +14,7 @@ from models.hypertoken_auto_encoder import (
     HyperTokenAutoencoder,
 )
 from datetime import datetime
-from data.tinyshakespeare import TinyShakespeareDataset
+from datasources.tinyshakespeare import TinyShakespeareDataset
 from helpers.training import (
     save_model,
     enable_torch_optimizations,
@@ -23,8 +23,9 @@ from helpers.training import (
 import sys
 from transformers import get_linear_schedule_with_warmup
 from models.jpt1 import JPT1
-from data.tinyshakespeare import HyperTokenTinyShakespeareDataset
+from datasources.tinyshakespeare import HyperTokenTinyShakespeareDataset
 from helpers.training import batch_tensor_to_text
+import time
 
 # --------------------------------------------------
 # 2. Model Definition
@@ -58,14 +59,12 @@ def evaluate_model(
             # Forward through JPT1
             jpt_output = model(encoded_seq)
 
-            # Decode each embedding in the sequence
-            decoded_outputs = []
-            for i in range(jpt_output.size(1)):
-                decoded = decoder(jpt_output[:, i])
-                decoded_outputs.append(decoded)
+            # Decode only the final embedding in the sequence
+            final_embedding = jpt_output[:, -1]  # Take the last embedding
+            decoded = decoder(final_embedding)
 
-            # Stack decoded outputs
-            decoded = torch.stack(decoded_outputs, dim=1)
+            # Reshape decoded output to match expected dimensions
+            decoded = decoded.unsqueeze(1)  # Add sequence dimension
 
             loss = criterion(
                 decoded.reshape(-1, len(dataloader.dataset.char2idx)),
@@ -116,6 +115,11 @@ def train_model(
 
     train_dataset = train_dataloader.dataset
 
+    # Freeze decoder parameters to prevent updates
+    for param in decoder_model.parameters():
+        param.requires_grad = False
+    decoder_model.eval()  # Set decoder to evaluation mode
+
     # only if not debugging
     if sys.gettrace() is None:  # No debugger attached
         model = torch.compile(model)
@@ -124,10 +128,8 @@ def train_model(
     count_parameters(model)
     count_parameters(decoder_model)
 
-    # Create optimizer for both models
-    optimizer = optim.AdamW(
-        list(model.parameters()) + list(decoder_model.parameters()), lr=config["lr"]
-    )
+    # Create optimizer only for JPT1 model parameters
+    optimizer = optim.AdamW(model.parameters(), lr=config["lr"])  # Only JPT1 parameters
     criterion = nn.CrossEntropyLoss()
 
     total_steps = config["epochs"] * len(train_dataloader) * data_segments
@@ -153,10 +155,16 @@ def train_model(
         for segment in range(data_segments):
             segment_loss = 0
             segment_batch_count = 0
-
+            fetch_start_time = time.time()
             for x, y in train_dataloader:
+
+                fetch_end_time = time.time()
+
+                print(f"Fetch time: {fetch_end_time - fetch_start_time:.4f} seconds")
                 batch_count += 1
                 segment_batch_count += 1
+
+                train_step_start = time.time()
 
                 encoded_seq = x.to(device)
                 target_chars = y.to(device)
@@ -165,29 +173,29 @@ def train_model(
                     # Forward through JPT1
                     jpt_output = model(encoded_seq)
 
-                    # Decode each embedding in the sequence
-                    decoded_outputs = []
-                    for i in range(jpt_output.size(1)):
-                        decoded = decoder_model(jpt_output[:, i])
-                        decoded_outputs.append(decoded)
-
-                    # Stack decoded outputs
-                    decoded = torch.stack(decoded_outputs, dim=1)
+                    # Decode only the final embedding in the sequence
+                    final_embedding = jpt_output[:, -1]  # Take the last embedding
+                    decoded = decoder_model(final_embedding)
 
                     loss = criterion(
                         decoded.reshape(-1, vocab_size), target_chars.reshape(-1)
                     ).mean()
 
+                    print("loss: ", loss.item())
+
                 # Update metrics
                 segment_loss += loss.item()
                 epoch_loss += loss.item()
 
+                new_low = False
+
                 if loss.item() < low_loss:
                     low_loss = loss.item()
                     print(f"New low loss: {low_loss:.7f}")
-
+                    new_low = True
                 # Log batch metrics
-                if batch_count % 10 == 0:
+
+                if batch_count % 10 == 0 or new_low:
                     # Get predictions for logging
                     with torch.inference_mode():
                         pred_indices = torch.argmax(decoded, dim=-1)
@@ -198,6 +206,7 @@ def train_model(
                             pred_indices, train_dataset.idx2char
                         )
 
+                    if new_low:
                         print(f"\nSample {batch_count}:")
                         print(f"Target: {target_texts[0]}")
                         print(f"Pred:   {pred_texts[0]}")
@@ -214,6 +223,12 @@ def train_model(
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
+
+                fetch_start_time = time.time()
+                train_step_end = time.time()
+                print(
+                    f"Train step time: {train_step_end - train_step_start:.4f} seconds"
+                )
 
             # Log segment metrics
             avg_segment_loss = segment_loss / segment_batch_count
@@ -329,7 +344,7 @@ if __name__ == "__main__":
             "data_segments": 10,
         }
         for n_layers in [1]  # Varying n_layers
-        for head_size in [64]  # Varying head_size
+        for head_size in [32]  # Varying head_size
         for lr in [0.001]
     ]
 
@@ -370,9 +385,9 @@ if __name__ == "__main__":
             vocab_size=vocab_size,
             encode_last_n_length=hypertoken_seq_len,
             hypertoken_size=hypertoken_size,
-            head_size=head_size,
+            head_size=16,
             compress_factor=hypertoeken_compress_factor,
-            n_layers=n_layers,
+            n_layers=1,
             embed_dim=hypertoken_embed_dim,
         ).to(device)
 
@@ -381,22 +396,23 @@ if __name__ == "__main__":
             seq_len=hypertoken_seq_len,
             encode_last_n_length=hypertoken_seq_len,
             hypertoken_size=hypertoken_size,
-            head_size=head_size,
+            head_size=16,
             compress_factor=hypertoeken_compress_factor,
-            n_layers=n_layers,
+            n_layers=1,
             embed_dim=hypertoken_embed_dim,
-        ).to(device)
+        )
 
         h_encoder_model = load_model(
             h_encoder_model,
             "saved_models",
-            "hypertoken_2025-01-10T17:44:02.397086_encode_last_n_length128_hypertoken_size512",
+            "hypertoken_2025-01-11T23:44:20.144846_encode_last_n_length128_hypertoken_size512",
             encoder_only=True,
         )
+
         h_decoder_model = load_model(
             h_decoder_model,
             "saved_models",
-            "hypertoken_2025-01-10T17:44:02.397086_encode_last_n_length128_hypertoken_size512",
+            "hypertoken_2025-01-11T23:44:20.144846_encode_last_n_length128_hypertoken_size512",
             decoder_only=True,
         )
 
@@ -405,6 +421,7 @@ if __name__ == "__main__":
             hypertoken_seq_len=hypertoken_seq_len,
             segments=data_segments,
             seq_len=seq_len,
+            batch_size=batch_size,
         )
         vocab_size = len(dataset.char2idx)
 
@@ -422,16 +439,14 @@ if __name__ == "__main__":
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4 if not is_debugging else 0,  # Parallel data loading
-            pin_memory=(
-                True if not is_debugging else False
-            ),  # Faster data transfer to GPU
-            persistent_workers=(
-                True if not is_debugging else False
-            ),  # Keep workers alive between epochs
-            prefetch_factor=(
-                4 if not is_debugging else None
-            ),  # Number of batches loaded in advance per worker)
+            # num_workers=4 if not is_debugging else 0,  # Parallel data loading
+            # pin_memory=False,  # Faster data transfer to GPU
+            # persistent_workers=(
+            #     True if not is_debugging else False
+            # ),  # Keep workers alive between epochs
+            # prefetch_factor=(
+            #     4 if not is_debugging else None
+            # ),  # Number of batches loaded in advance per worker)
         )
 
         val_dataset = HyperTokenTinyShakespeareDataset(
@@ -439,22 +454,22 @@ if __name__ == "__main__":
             hypertoken_seq_len=hypertoken_seq_len,
             segments=data_segments,
             seq_len=seq_len,
+            batch_size=batch_size,
             type="validation",
         )
+
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=4 if not is_debugging else 0,  # Parallel data loading
-            pin_memory=(
-                True if not is_debugging else False
-            ),  # Faster data transfer to GPU
-            persistent_workers=(
-                True if not is_debugging else False
-            ),  # Keep workers alive between epochs
-            prefetch_factor=(
-                4 if not is_debugging else None
-            ),  # Number of batches loaded in advance per worker)
+            # num_workers=4 if not is_debugging else 0,  # Parallel data loading
+            # pin_memory=False,
+            # persistent_workers=(
+            #     True if not is_debugging else False
+            # ),  # Keep workers alive between epochs
+            # prefetch_factor=(
+            #     4 if not is_debugging else None
+            # ),  # Number of batches loaded in advance per worker)
         )
 
         verify_model_params()

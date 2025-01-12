@@ -91,37 +91,32 @@ def run_experiment(projectName, train_model, exp_name, config: dict) -> None:
     # Track time and memory
     start_time = time.time()
 
-    try:
+    # Save source code at start of run
+    save_project_files_as_artifact(wandb.run)
 
-        # Save source code at start of run
-        save_project_files_as_artifact(wandb.run)
+    # Train model and get parameters count
+    train_model = train_model(wandb)
 
-        # Train model and get parameters count
-        model = train_model(wandb)
+    total_params, params_by_layer = count_parameters(train_model)
 
-        total_params, params_by_layer = count_parameters(model)
+    # Log parameters count
+    wandb.log({"total_parameters": total_params, "run_id": wandb.run.id})
 
-        # Log parameters count
-        wandb.log({"total_parameters": total_params, "run_id": wandb.run.id})
+    memory_usage = train_model.average_memory_usage
 
-        memory_usage = model.average_memory_usage
+    gpu_memory_usage = get_gpu_memory_gb()
 
-        gpu_memory_usage = get_gpu_memory_gb()
-    except Exception as e:
-        print(e)
+    # Log time and memory metrics
+    end_time = time.time()
+    duration = end_time - start_time
 
-    finally:
-        # Log time and memory metrics
-        end_time = time.time()
-        duration = end_time - start_time
+    wandb.log(
+        {
+            "duration_seconds": duration,
+            "duration_per_epoch_seconds": duration / config["epochs"],
+            "memory_usage_gb": memory_usage,
+            "gpu_memory_usage_gb": gpu_memory_usage,
+        }
+    )
 
-        wandb.log(
-            {
-                "duration_seconds": duration,
-                "duration_per_epoch_seconds": duration / config["epochs"],
-                "memory_usage_gb": memory_usage,
-                "gpu_memory_usage_gb": gpu_memory_usage,
-            }
-        )
-
-        wandb.finish()
+    wandb.finish()

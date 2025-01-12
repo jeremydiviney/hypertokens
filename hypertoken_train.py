@@ -14,7 +14,7 @@ from models.hypertoken_auto_encoder import (
     HyperTokenAutoencoder,
 )
 from datetime import datetime
-from data.tinyshakespeare import TinyShakespeareDataset
+from datasources.tinyshakespeare import TinyShakespeareDataset
 from helpers.training import (
     save_model,
     enable_torch_optimizations,
@@ -24,6 +24,8 @@ import sys
 from transformers import get_linear_schedule_with_warmup
 from helpers.training import batch_tensor_to_text
 
+
+# test test tes
 
 # --------------------------------------------------
 # 2. Model Definition
@@ -80,7 +82,7 @@ def evaluate_model(
             if batch_count % 10 == 0:
                 print(f"\nSample {batch_count}:")
                 print(f"Target: {target_texts[0]}")
-                print(f"Pred:   {pred_texts[0]}")
+                print(f"Pred: {pred_texts[0]}")
                 print(f"Current sequence accuracy: {exact_matches/total_samples:.2%}")
                 print(f"Current character accuracy: {matching_chars/total_chars:.2%}")
 
@@ -108,7 +110,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     count_parameters(model)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # optimizer = Lion(
     #     model.parameters(),
@@ -303,7 +305,7 @@ if __name__ == "__main__":
             "seq_len": 128,
             "encode_last_n_length": 128,
             "hypertoken_size": hs,
-            "epochs": 1,
+            "epochs": 3,
             "batch_size": 512,
             "lr": lr,
             "head_size": head_size,
@@ -314,8 +316,8 @@ if __name__ == "__main__":
         for hs in [512]  # Varying hypertoken_size
         for ed in [512]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
-        for head_size in [32]  # Varying head_size
-        for lr in [0.001]
+        for head_size in [16]  # Varying head_size
+        for lr in [0.0005]
         for cf in [4]
     ]
 
@@ -389,13 +391,14 @@ if __name__ == "__main__":
 
         # create wrapper function for train_model
         def train_model_lambda(wandb):
-            model = train_model(wandb, model, dataloader, val_dataloader, experiment)
-            return model
+            return train_model(wandb, model, dataloader, val_dataloader, experiment)
 
         project_name = "HyperTokens"
         exp_name = f"{project_name}-sl:{experiment['seq_len']}-elnl:{experiment['encode_last_n_length']}-hts:{experiment['hypertoken_size']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['embed_dim']}-cf:{experiment['compress_factor']}"
 
         run_experiment(project_name, train_model_lambda, exp_name, experiment)
 
+    print("Training complete")
+    sys.exit()
 
 # TODO: fix gpu memory reporting
