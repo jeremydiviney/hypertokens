@@ -11,6 +11,16 @@ from torch.amp import autocast
 Model = TypeVar("Model", bound=nn.Module)
 
 
+def check_memory_usage(model: nn.Module):
+    if torch.cuda.is_available():
+        current_mem = float(torch.cuda.memory_allocated()) / 1e9
+        # max_mem = float(torch.cuda.max_memory_allocated())/1e9
+        # print("Current memory: {:.2f}GB".format(current_mem))
+        # print("Max memory: {:.2f}GB".format(max_mem))
+        model.average_memory_usage = (model.average_memory_usage + current_mem) / 2
+        # print("Average memory usage: {:.2f}GB".format(self.average_memory_usage))
+
+
 def save_model(
     model: Any, save_dir: str, model_name: str, save_separate: bool = True
 ) -> None:
@@ -26,17 +36,8 @@ def save_model(
     os.makedirs(save_dir, exist_ok=True)
 
     # Save full model
-    full_model_path = os.path.join(save_dir, f"{model_name}_full.pt")
+    full_model_path = os.path.join(save_dir, f"{model_name}.pt")
     torch.save(model.state_dict(), full_model_path)
-
-    if save_separate:
-        # Save encoder
-        encoder_path = os.path.join(save_dir, f"{model_name}_encoder.pt")
-        torch.save(model.encoder.state_dict(), encoder_path)
-
-        # Save decoder
-        decoder_path = os.path.join(save_dir, f"{model_name}_decoder.pt")
-        torch.save(model.decoder.state_dict(), decoder_path)
 
 
 def load_model(
@@ -92,9 +93,24 @@ def batch_tensor_to_text(batch_tensor: torch.Tensor, idx2char: dict) -> list[str
     sequences = batch_tensor.cpu().numpy()
     pad_token = len(idx2char) - 1
 
-    # Process all sequences at once
-    ret = [
-        "".join(idx2char[idx] for idx in seq if idx != pad_token) for seq in sequences
-    ]
+    # # Handle 1D array (single sequence)
+    # if sequences.ndim == 1:
+    #     return [idx2char[int(idx)] for idx in sequences if int(idx) != pad_token]
 
-    return ret
+    # # Handle batch of sequences
+    # return [
+    #     (idx2char[int(idx)] for idx in seq if int(idx) != pad_token)
+    #     for seq in sequences
+    # ]
+
+    # Handle 1D array (single sequence)
+    if sequences.ndim == 1:
+        return [
+            "".join(idx2char[int(idx)] for idx in sequences if int(idx) != pad_token)
+        ]
+
+    # Handle batch of sequences
+    return [
+        "".join(idx2char[int(idx)] for idx in seq if int(idx) != pad_token)
+        for seq in sequences
+    ]

@@ -6,7 +6,7 @@ from helpers.experiments import run_experiment, count_parameters
 from lion_pytorch import Lion
 from torch.utils.checkpoint import checkpoint
 import os
-from typing import Optional
+from typing import Optional, Any
 from models.hypertoken_auto_encoder import (
     HyperTokenEncoder,
     HyperTokenDecoder,
@@ -15,7 +15,6 @@ from models.hypertoken_auto_encoder import (
 from datetime import datetime
 from datasources.tinyshakespeare import TinyShakespeareDataset
 from helpers.training import (
-    save_model,
     enable_torch_optimizations,
     setup_flash_attention,
 )
@@ -24,7 +23,33 @@ from transformers import get_linear_schedule_with_warmup
 from helpers.training import batch_tensor_to_text
 
 
-# test test tes
+def save_model(
+    model: Any, save_dir: str, model_name: str, save_separate: bool = True
+) -> None:
+    """
+    Save the model state. Optionally save encoder and decoder separately.
+
+    Args:
+        model: The model to save
+        save_dir: Directory to save the model(s) in
+        model_name: Base name for the saved model files
+        save_separate: If True, save encoder and decoder separately
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save full model
+    full_model_path = os.path.join(save_dir, f"{model_name}_full.pt")
+    torch.save(model.state_dict(), full_model_path)
+
+    if save_separate:
+        # Save encoder
+        encoder_path = os.path.join(save_dir, f"{model_name}_encoder.pt")
+        torch.save(model.encoder.state_dict(), encoder_path)
+
+        # Save decoder
+        decoder_path = os.path.join(save_dir, f"{model_name}_decoder.pt")
+        torch.save(model.decoder.state_dict(), decoder_path)
+
 
 # --------------------------------------------------
 # 2. Model Definition
@@ -300,8 +325,8 @@ if __name__ == "__main__":
     # Define experiments
     experiments: list[dict] = [
         {
-            "seq_len": 128,
-            "encode_last_n_length": 128,
+            "seq_len": 1,
+            "encode_last_n_length": 1,
             "hypertoken_size": hs,
             "epochs": 3,
             "batch_size": 512,
@@ -311,12 +336,12 @@ if __name__ == "__main__":
             "embed_dim": ed,
             "compress_factor": cf,
         }
-        for hs in [512]  # Varying hypertoken_size
-        for ed in [512]  # Varying embed_dim
+        for hs in [32]  # Varying hypertoken_size
+        for ed in [128]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
         for head_size in [16]  # Varying head_size
         for lr in [0.0001]
-        for cf in [4]
+        for cf in [2]
     ]
 
     enable_torch_optimizations()

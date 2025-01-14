@@ -8,6 +8,9 @@ from typing import TypedDict
 import torch.nn as nn
 from helpers.training import batch_tensor_to_text
 import time
+from torch.utils.data import Sampler
+from typing import Iterator, List, Optional, Tuple
+from torch.utils.data.dataset import Dataset
 
 
 def process_character_sequence(dataset: Dataset, sequence: torch.Tensor) -> str:
@@ -181,14 +184,22 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         else:
             return len(self.data)
 
-    def get_batch_item(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_batch_item(
+        self, idx: int, chunk_count: int = None, chunk_size: int = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         device = next(self.encoder.parameters()).device
+
+        if chunk_count is None:
+            chunk_count = self.seq_len + 1
+
+        if chunk_size is None:
+            chunk_size = self.hypertoken_seq_len
 
         if self.type == "train":
             idx = random.randint(0, len(self.data) - 1)
 
         # Get sequence that will fit jpt_seq_len hypertokens
-        total_chars_needed = self.hypertoken_seq_len * (self.seq_len + 1)
+        total_chars_needed = chunk_size * (chunk_count)
 
         # Ensure we have enough characters
         if total_chars_needed >= len(self.data) - idx:
@@ -206,60 +217,60 @@ class HyperTokenTinyShakespeareDataset(Dataset):
             char_sequence = torch.cat([padding, char_sequence])
 
         # Reshape to get hypertoken chunks
-        char_chunks = char_sequence.view(self.seq_len + 1, self.hypertoken_seq_len)
+        char_chunks = char_sequence.view(chunk_count, chunk_size)
+
+        if char_chunks.shape[0] != chunk_count:
+            print("char_chunks.device.shape[0] != chunk_count")
+            raise Exception("char_chunks.device.shape[0] != chunk_count")
+
+        if char_chunks.shape[1] != chunk_size:
+            print("char_chunks.device.shape[1] != chunk_size")
+            raise Exception("char_chunks.device.shape[1] != chunk_size")
         return char_chunks
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitems__(
+        self, batch_indices: List[int]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         device = next(self.encoder.parameters()).device
 
-        if self.type == "train":
-            idx = random.randint(0, len(self.data) - 1)
+        pre_batch_items = [self.get_batch_item(idx) for idx in batch_indices]
+        actual_batch_size = len(pre_batch_items)
 
-        pre_batch_items = []
+        all_chunks = torch.stack(pre_batch_items).to(device)
 
-        for i in range(self.batch_size):
-            item = self.get_batch_item(idx)
-            pre_batch_items.append(item)
-
-        # Stack all items into a single tensor
-        all_chunks = torch.stack(
-            pre_batch_items
-        )  # Shape: [batch_size, seq_len + 1, hypertoken_seq_len]
-
-        # Calculate how many chunks we can process at once
-        # Each item has seq_len chunks to encode
         chunks_per_item = self.seq_len
         items_per_batch = 2048 // chunks_per_item
 
-        # Prepare input chunks (all except last sequence for each item)
-        input_chunks = all_chunks[
-            :, :-1
-        ]  # Shape: [batch_size, seq_len, hypertoken_seq_len]
-        target_chunks = all_chunks[:, -1]  # Shape: [batch_size, hypertoken_seq_len]
+        input_chunks = all_chunks[:, :-1]
+        target_chunks = all_chunks[:, -1]
 
-        # Process in smaller batches if needed
-        encoded_chunks_list = []
+        batch_items: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-        for i in range(0, self.batch_size, items_per_batch):
+        # Calculate batch sizes to process
+        batch_sizes = []
+        remaining = actual_batch_size
+        while remaining > 0:
+            current_batch = min(items_per_batch, remaining)
+            batch_sizes.append(current_batch)
+            remaining -= current_batch
 
-            batch_slice = slice(i, min(i + items_per_batch, self.batch_size))
-            current_input = input_chunks[batch_slice].to(device)
+        # Process each batch size
+        start_idx = 0
+        for size in batch_sizes:
+            end_idx = start_idx + size
+            batch_slice = slice(start_idx, end_idx)
 
-            # Reshape to encode all sequences at once
-            batch_size_current = current_input.size(0)
-            current_input = current_input.view(-1, self.hypertoken_seq_len)
+            current_input = input_chunks[batch_slice]
+            current_target = target_chunks[batch_slice][:, 0]
 
+            # Encode current batch
             with torch.inference_mode():
-                start_time = time.time()
-                encoded = self.encoder(current_input)
-                end_time = time.time()
-                print(f"Time taken for encoding: {end_time - start_time} seconds")
-                # Reshape back to [batch_size, seq_len, encoder_output_dim]
-                encoded = encoded.view(batch_size_current, self.seq_len, -1)
-                encoded_chunks_list.append(encoded)
+                current_input_flat = current_input.reshape(-1, self.hypertoken_seq_len)
+                encoded = self.encoder(current_input_flat)
+                encoded = encoded.reshape(current_input.size(0), self.seq_len, -1)
 
-        # Combine all encoded chunks
-        x = torch.cat(encoded_chunks_list, dim=0)
-        y = target_chunks
+            # Zip encoded inputs with targets and extend batch_items
+            batch_items.extend(list(zip(encoded, current_target)))
+            start_idx = end_idx
 
-        return x, y
+        return batch_items

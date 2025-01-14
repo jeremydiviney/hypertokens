@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from helpers.training import check_memory_usage
 
 
 class HyperTokenEncoder(nn.Module):
@@ -72,6 +73,7 @@ class HyperTokenEncoder(nn.Module):
         for i, (dim_in, dim_out) in enumerate(self.compression_sizes):
             compressed = self.compression_layers[i](compressed)
             compress_factor = dim_in // dim_out
+
             compressed = compressed.reshape(
                 batch_size, seq_len, -1, compress_factor
             ).sum(dim=-1)
@@ -184,17 +186,8 @@ class HyperTokenAutoencoder(nn.Module):
 
         self.to(torch.bfloat16)
 
-    def check_memory_usage(self):
-        if torch.cuda.is_available():
-            current_mem = float(torch.cuda.memory_allocated()) / 1e9
-            # max_mem = float(torch.cuda.max_memory_allocated())/1e9
-            # print("Current memory: {:.2f}GB".format(current_mem))
-            # print("Max memory: {:.2f}GB".format(max_mem))
-            self.average_memory_usage = (self.average_memory_usage + current_mem) / 2
-            # print("Average memory usage: {:.2f}GB".format(self.average_memory_usage))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hypertoken = self.encoder(x)
         decoded = self.decoder(hypertoken)
-        self.check_memory_usage()
+        check_memory_usage(self)
         return decoded
