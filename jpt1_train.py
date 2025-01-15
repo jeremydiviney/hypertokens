@@ -56,22 +56,17 @@ def evaluate_model(
 
             jpt_output = model(encoded_seq)
 
-            # Decode only the final embedding in the sequence
-            final_embedding = jpt_output[:, -1]
-
-            # decoded = decoder_model(final_embedding)
-
-            loss = criterion(
-                final_embedding,
-                target_chars,
-            ).mean()
+            loss = calculate_loss(jpt_output, target_chars, criterion)
 
             total_loss += loss.item()
             batch_count += 1
 
-            pred_indices = torch.argmax(final_embedding, dim=-1)
+            final_embedding = jpt_output[:, -1]
+            final_target_char = target_chars[:, -1]
+
+            pred_indices = torch.argmax(final_embedding, dim=-1).unsqueeze(1)
             target_texts = batch_tensor_to_text(
-                target_chars, dataloader.dataset.idx2char
+                final_target_char, dataloader.dataset.idx2char
             )
             pred_texts = batch_tensor_to_text(pred_indices, dataloader.dataset.idx2char)
 
@@ -102,6 +97,31 @@ def evaluate_model(
         "val_sequence_accuracy": exact_matches / total_samples,
         "val_char_accuracy": matching_chars / total_chars,
     }
+
+
+def calculate_loss(model_output, target_chars, criterion):
+    all_embeddings = model_output
+    cur_batch_size = all_embeddings.size(0)
+    final_embedding = all_embeddings.view(cur_batch_size, -1, vocab_size)
+    target_chars = target_chars.view(cur_batch_size, -1)
+
+    # Split the predictions into final and non-final timesteps
+    final_pred = final_embedding[:, -1:]  # Get last timestep
+    other_preds = final_embedding[:, :-1]  # Get all other timesteps
+
+    final_target = target_chars[:, -1:]
+    other_targets = target_chars[:, :-1]
+
+    # Calculate losses separately
+    final_loss = criterion(
+        final_pred.transpose(1, 2), final_target
+    ).mean()  # Multiply final loss by weight (e.g. 10x)
+
+    other_loss = criterion(other_preds.transpose(1, 2), other_targets).mean()
+
+    # Combine losses
+    loss = other_loss / 10 + final_loss
+    return loss
 
 
 def train_model(
@@ -151,7 +171,7 @@ def train_model(
         cycle_momentum=False,
     )
 
-    # evaluate_model(model, decoder_model, val_dataloader, criterion, device)
+    evaluate_model(model, decoder_model, val_dataloader, criterion, device)
 
     current_lr = config["lr"]
     low_loss = 10000
@@ -185,15 +205,7 @@ def train_model(
                     # Forward through JPT1
                     jpt_output = model(encoded_seq)
 
-                    # Use last embeddings
-                    final_embedding = jpt_output[:, -1]
-
-                    loss = criterion(
-                        final_embedding,
-                        target_chars,
-                    ).mean()
-
-                    # print("loss: ", loss.item())
+                    loss = calculate_loss(jpt_output, target_chars, criterion)
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -365,6 +377,7 @@ def validate_hypertoken_models(
     encoder: nn.Module,
     decoder: nn.Module,
     dataset: TinyShakespeareDataset,
+    hypertoken_seq_len: int,
     num_samples: int = 10,
     device: str = "cuda",
 ) -> None:
@@ -388,7 +401,9 @@ def validate_hypertoken_models(
 
     with torch.inference_mode():
         for i in range(num_samples):
-            input_chunk = dataset.get_batch_item(i, chunk_count=1, chunk_size=128)
+            input_chunk = dataset.get_batch_item(
+                i, chunk_count=1, chunk_size=hypertoken_seq_len
+            )
             input_chunk = input_chunk.view(-1).to(device)
 
             # Convert to text for display
@@ -502,23 +517,25 @@ if __name__ == "__main__":
     # Define experiments
     experiments: list[dict] = [
         {
-            "seq_len": 6,
-            "hypertoken_seq_len": 128,
-            "hypertoken_size": 512,
-            "hypertoken_embed_dim": 512,
-            "epochs": 4,
-            "batch_size": 256,
+            "seq_len": sl,
+            "hypertoken_seq_len": 1,
+            "hypertoken_size": 32,
+            "epochs": epochs,
+            "batch_size": 64,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
-            "hypertoken_embed_dim": 512,
-            "jpt_embed_dim": 512 * 3,
-            "compress_factor": 4,
+            "hypertoken_embed_dim": 128,
+            "jpt_embed_dim": jed,
+            "compress_factor": 2,
             "data_segments": 10,
         }
         for n_layers in [6]  # Varying n_layers
-        for head_size in [32]  # Varying head_size
-        for lr in [0.00033]
+        for head_size in [64]  # Varying head_size
+        for jed in [384]
+        for lr in [0.0003]
+        for sl in [128]
+        for epochs in [3]
     ]
 
     enable_torch_optimizations()
@@ -578,14 +595,14 @@ if __name__ == "__main__":
         h_encoder_model = load_model(
             h_encoder_model,
             "saved_models",
-            "hypertoken_2025-01-12T15:34:15.275481_encode_last_n_length128_hypertoken_size512",
+            "hypertoken_2025-01-14T02:13:00.639557_encode_last_n_length1_hypertoken_size32",
             encoder_only=True,
         )
 
         h_decoder_model = load_model(
             h_decoder_model,
             "saved_models",
-            "hypertoken_2025-01-12T15:34:15.275481_encode_last_n_length128_hypertoken_size512",
+            "hypertoken_2025-01-14T02:13:00.639557_encode_last_n_length1_hypertoken_size32",
             decoder_only=True,
         )
 
@@ -646,7 +663,9 @@ if __name__ == "__main__":
 
         verify_model_params(experiment)
 
-        validate_hypertoken_models(h_encoder_model, h_decoder_model, dataset)
+        validate_hypertoken_models(
+            h_encoder_model, h_decoder_model, dataset, hypertoken_seq_len
+        )
 
         # create wrapper function for train_model
         def train_model_lambda(wandb):

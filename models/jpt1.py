@@ -33,7 +33,12 @@ class JPT1(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.initial_expand = nn.Linear(hypertoken_size, embed_dim)
+        self.initial_expand = nn.Sequential(
+            nn.Linear(hypertoken_size, embed_dim // 2),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Linear(embed_dim // 2, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
 
         self.ln_final = nn.LayerNorm(embed_dim)
         self.fc_out = nn.Linear(embed_dim, vocab_size)

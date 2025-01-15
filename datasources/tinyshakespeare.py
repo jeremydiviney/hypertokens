@@ -239,10 +239,10 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         all_chunks = torch.stack(pre_batch_items).to(device)
 
         chunks_per_item = self.seq_len
-        items_per_batch = 2048 // chunks_per_item
+        items_per_batch = 4096 // chunks_per_item
 
         input_chunks = all_chunks[:, :-1]
-        target_chunks = all_chunks[:, -1]
+        target_chunks = all_chunks[:, 1:]
 
         batch_items: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
@@ -261,7 +261,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
             batch_slice = slice(start_idx, end_idx)
 
             current_input = input_chunks[batch_slice]
-            current_target = target_chunks[batch_slice][:, 0]
+            current_target = target_chunks[batch_slice]
 
             # Encode current batch
             with torch.inference_mode():
