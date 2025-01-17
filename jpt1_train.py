@@ -123,19 +123,19 @@ def calculate_loss(model_output, target_chars, criterion):
     # Calculate losses separately
     # final_loss = criterion(final_pred.transpose(1, 2), final_target).mean()
 
-    seq_length = all_targets.size(1)
+    # seq_length = all_targets.size(1)
     # position_weights = torch.linspace(0.01, 2.0, seq_length, device=all_targets.device)
-    position_weights = torch.exp(
-        torch.linspace(0, 2, seq_length, device=all_targets.device)
-    )
+    # position_weights = torch.exp(
+    #     torch.linspace(0.1, 2, seq_length, device=all_targets.device)
+    # )
 
     # loss = criterion(final_preds.transpose(1, 2), final_target).mean()
 
     loss = criterion(all_preds.transpose(1, 2), all_targets).mean()
-    weighted_loss = (loss * position_weights).mean()
+    # weighted_loss = (loss * position_weights).mean()
 
     # Combine losses
-    loss = weighted_loss  # + final_loss
+    # loss = weighted_loss  # + final_loss
     return loss
 
 
@@ -553,7 +553,7 @@ if __name__ == "__main__":
         for lr in [0.0003]
         for sl in [256]
         for epochs in [1]
-        for dropout in [0.3, 0.4, 0.5]
+        for dropout in [0.3]
     ]
 
     enable_torch_optimizations()
