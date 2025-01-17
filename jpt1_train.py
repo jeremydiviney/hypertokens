@@ -26,11 +26,30 @@ from models.jpt1 import JPT1
 from datasources.tinyshakespeare import HyperTokenTinyShakespeareDataset
 from helpers.training import batch_tensor_to_text
 import time
-import random
+import torch.nn.functional as F
 
 # --------------------------------------------------
 # 2. Model Definition
 # --------------------------------------------------
+
+
+def decode_text_from_hypertoken(hypertoken: torch.Tensor, decoder: nn.Module) -> [str]:
+
+    with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
+        decoder_output = decoder(hypertoken)  # [batch_size,  vocab_size]
+
+        # Get predicted indices for each position in the sequence
+        pred_indices = torch.argmax(
+            decoder_output, dim=-1
+        ).cpu()  # [batch_size, seq_len]
+
+        # Convert indices to text for each item in the batch
+        batch_texts = []
+        for indices in pred_indices:
+            text = "".join([dataset.idx2char[idx.item()] for idx in indices])
+            batch_texts.append(text)
+
+    return batch_texts
 
 
 def evaluate_model(
@@ -39,6 +58,7 @@ def evaluate_model(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: str,
+    from_hypertoken: bool = False,
 ) -> dict:
     model.eval()
     decoder.eval()
@@ -64,11 +84,25 @@ def evaluate_model(
             final_embedding = jpt_output[:, -1]
             final_target_char = target[:, -1]
 
-            pred_indices = torch.argmax(final_embedding, dim=-1).unsqueeze(1)
-            target_texts = batch_tensor_to_text(
-                final_target_char, dataloader.dataset.idx2char
-            )
-            pred_texts = batch_tensor_to_text(pred_indices, dataloader.dataset.idx2char)
+            if from_hypertoken:
+
+                # we are actually dealing with hypertokens not characters and character probabilities
+                final_hypertoken_pred = final_embedding
+                final_hypertoken_target = final_target_char
+                pred_texts = decode_text_from_hypertoken(final_hypertoken_pred, decoder)
+                target_texts = decode_text_from_hypertoken(
+                    final_hypertoken_target, decoder
+                )
+
+            else:
+
+                pred_indices = torch.argmax(final_embedding, dim=-1).unsqueeze(1)
+                target_texts = batch_tensor_to_text(
+                    final_target_char, dataloader.dataset.idx2char
+                )
+                pred_texts = batch_tensor_to_text(
+                    pred_indices, dataloader.dataset.idx2char
+                )
 
             # Count exact matches
             exact_matches += sum(
@@ -90,7 +124,7 @@ def evaluate_model(
                 print(f"Current sequence accuracy: {exact_matches/total_samples:.2%}")
                 print(f"Current character accuracy: {matching_chars/total_chars:.2%}")
 
-    generate_text(model, decoder, "", 500, dataloader.dataset)
+    generate_text(model, decoder, " ", 500, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
@@ -107,10 +141,28 @@ def calculate_hypertoken_loss(model_output, target_hypertokens, criterion):
     all_preds = model_output
     all_targets = target_hypertokens
 
-    # For MSE loss, we don't need to transpose since we're comparing tensors directly
-    loss = criterion(all_preds, all_targets)
+    # # For MSE loss, we don't need to transpose since we're comparing tensors directly
+    # loss = criterion(all_preds, all_targets)
 
-    return loss
+    # Cosine similarity loss - better for comparing vector directions
+    cos_similarity = nn.CosineSimilarity(dim=-1)
+    cos_loss = 1 - cos_similarity(model_output, target_hypertokens).mean()
+
+    # # L1 loss - less sensitive to outliers than MSE
+    # l1_loss = nn.L1Loss()(model_output, target_hypertokens)
+
+    # mse_loss = nn.MSELoss()(model_output, target_hypertokens)
+
+    # # Huber loss - combines best of L1 and MSE
+    # huber_loss = nn.HuberLoss(delta=1.0)(model_output, target_hypertokens)
+
+    # # Smooth L1 - another robust option
+    # smooth_l1_loss = nn.SmoothL1Loss()(model_output, target_hypertokens)
+
+    # Return the normalized approach by default, or combine them if you like
+    return cos_loss
+
+    # return huber_loss
 
 
 def calculate_loss(model_output, target_chars, criterion):
@@ -150,7 +202,12 @@ def calculate_loss(model_output, target_chars, criterion):
 
 
 def train_model(
-    wandb, model, decoder_model, train_dataloader, val_dataloader, config: dict
+    wandb,
+    model,
+    decoder_model,
+    train_dataloader,
+    val_dataloader,
+    config: dict,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_segments = config["data_segments"]
@@ -183,8 +240,9 @@ def train_model(
     #     weight_decay=1e-2,  # Lion typically works better with higher weight decay
     # )
 
-    # criterion = nn.CrossEntropyLoss()
-    criterion = nn.MSELoss()  # now predicting hypertokens directly
+    criterion = nn.CrossEntropyLoss()
+    # criterion = nn.MSELoss()  # now predicting hypertokens directly
+    # criterion = nn.L1Loss()
 
     total_steps = config["epochs"] * len(train_dataloader) * data_segments
 
@@ -192,12 +250,22 @@ def train_model(
         optimizer,
         max_lr=config["lr"],
         total_steps=total_steps,
-        pct_start=0.2,
+        pct_start=0.05,
         anneal_strategy="cos",
         cycle_momentum=False,
     )
 
-    # evaluate_model(model, decoder_model, val_dataloader, criterion, device)
+    # set hypertoken output mode
+    hypertoken_output = True
+
+    # evaluate_model(
+    #     model,
+    #     decoder_model,
+    #     val_dataloader,
+    #     criterion,
+    #     device,
+    #     from_hypertoken=hypertoken_output,
+    # )
 
     current_lr = config["lr"]
     low_loss = 10000
@@ -229,7 +297,12 @@ def train_model(
 
                 if samples_since_eval >= eval_every_n_samples:
                     eval_results = evaluate_model(
-                        model, decoder_model, val_dataloader, criterion, device
+                        model,
+                        decoder_model,
+                        val_dataloader,
+                        criterion,
+                        device,
+                        hypertoken_output,
                     )
                     samples_since_eval = 0
                     wandb.log(
@@ -315,7 +388,12 @@ def train_model(
 
     # Final Evaluation
     eval_results = evaluate_model(
-        model, decoder_model, val_dataloader, criterion, device
+        model,
+        decoder_model,
+        val_dataloader,
+        criterion,
+        device,
+        from_hypertoken=hypertoken_output,
     )
     wandb.log(
         {
@@ -485,46 +563,60 @@ def validate_hypertoken_models(
 
 def generate_text(
     jpt_model: nn.Module,
-    encoder_model: nn.Module,
+    decoder_model: nn.Module,
     prompt: str,
     max_new_chars: int,
     dataset: HyperTokenTinyShakespeareDataset,
     temperature: float = 0.5,
+    from_hypertoken: bool = True,
     device: str = "cuda",
 ) -> str:
     # Set models to eval mode
     jpt_model.eval()
-    encoder_model.eval()
+    decoder_model.eval()
 
     print("Generating...\n")
 
     print(f"\nPrompt: {prompt}\n", end="", flush=True)
 
+    if len(prompt) == 0:
+        raise ValueError("Prompt must be at least one character long")
+
     result: [str] = list(prompt)
 
     with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
         for i in range(max_new_chars):
+
             current_context = "".join(result)
             encoded_list = dataset.encode_to_hypertokens_from_text(current_context)
             encoded = torch.stack(encoded_list).to(device)
 
-            # Get prediction from JPT1
             output = jpt_model(encoded)
-            logits = output[0, -1] / temperature
 
-            # Apply softmax and handle any numerical instabilities
-            probs = torch.nn.functional.softmax(logits, dim=-1)
+            logits = output[0, -1]  # get first batch and the final set of logits
 
-            # Optional: Apply top-k sampling
-            k = 10  # Adjust based on your needs
-            top_k = min(k, probs.size(-1))
-            indices_to_remove = probs < torch.topk(probs, top_k)[0][..., -1, None]
-            probs[indices_to_remove] = 0
-            probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+            if from_hypertoken:
+                hypertoken = logits.unsqueeze(0)
+                pred_texts = decode_text_from_hypertoken(hypertoken, decoder_model)
+                next_char = pred_texts[0][-1]
+            else:
 
-            # Sample next character
-            next_char_idx = torch.multinomial(probs, num_samples=1).item()
-            next_char = dataset.idx2char[next_char_idx]
+                # Get prediction from JPT1
+                logits /= temperature
+
+                # Apply softmax and handle any numerical instabilities
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+
+                # Optional: Apply top-k sampling
+                k = 10  # Adjust based on your needs
+                top_k = min(k, probs.size(-1))
+                indices_to_remove = probs < torch.topk(probs, top_k)[0][..., -1, None]
+                probs[indices_to_remove] = 0
+                probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+
+                # Sample next character
+                next_char_idx = torch.multinomial(probs, num_samples=1).item()
+                next_char = dataset.idx2char[next_char_idx]
 
             # Print the generated character
             print(next_char, end="", flush=True)
@@ -560,11 +652,11 @@ if __name__ == "__main__":
         }
         for n_layers in [6]  # Varying n_layers
         for head_size in [64]  # Varying head_size
-        for jed in [384]
+        for jed in [512]
         for lr in [0.0003]
-        for sl in [256]
-        for epochs in [1]
-        for dropout in [0.3]
+        for sl in [512]
+        for epochs in [2]
+        for dropout in [0.25]
     ]
 
     enable_torch_optimizations()
