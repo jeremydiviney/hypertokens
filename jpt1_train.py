@@ -83,20 +83,24 @@ def evaluate_model(
                 # for p, t in zip(pred, target):
                 #     print(f"pred: {p}, target: {t}, {"!" if p == t else " "}")
 
-            if batch_count % 2 == 0:
+            if batch_count % 10 == 0:
                 print(f"\nSample {batch_count}:")
                 # print(f"Target: {target_texts[0]}")
                 # print(f"Pred:   {pred_texts[0]}")
                 print(f"Current sequence accuracy: {exact_matches/total_samples:.2%}")
                 print(f"Current character accuracy: {matching_chars/total_chars:.2%}")
 
-    model.train()
-    decoder.train()
-    return {
+    generate_text(model, decoder, "", 500, dataloader.dataset)
+
+    result = {
         "val_loss": total_loss / batch_count,
         "val_sequence_accuracy": exact_matches / total_samples,
         "val_char_accuracy": matching_chars / total_chars,
     }
+
+    model.train()
+    decoder.train()
+    return result
 
 
 def calculate_loss(model_output, target_chars, criterion):
@@ -106,21 +110,32 @@ def calculate_loss(model_output, target_chars, criterion):
     target_chars = target_chars.view(cur_batch_size, -1)
 
     # Split the predictions into final and non-final timesteps
-    final_pred = final_embedding[:, -1:]  # Get last timestep
-    other_preds = final_embedding[:, :-1]  # Get all other timesteps
+    final_preds = final_embedding[:, -8:]  # Shape: [batch_size, 2, vocab_size]
 
-    final_target = target_chars[:, -1:]
-    other_targets = target_chars[:, :-1]
+    all_preds = final_embedding  # Get all other timesteps
+
+    # final_target = target_chars[:, -1:].expand(-1, all_preds.size(1))
+    final_target = target_chars[:, -8:]
+
+    # other_targets = target_chars[:, :-1]
+    all_targets = target_chars
 
     # Calculate losses separately
-    final_loss = criterion(
-        final_pred.transpose(1, 2), final_target
-    ).mean()  # Multiply final loss by weight (e.g. 10x)
+    # final_loss = criterion(final_pred.transpose(1, 2), final_target).mean()
 
-    other_loss = criterion(other_preds.transpose(1, 2), other_targets).mean()
+    seq_length = all_targets.size(1)
+    # position_weights = torch.linspace(0.01, 2.0, seq_length, device=all_targets.device)
+    position_weights = torch.exp(
+        torch.linspace(0, 2, seq_length, device=all_targets.device)
+    )
+
+    # loss = criterion(final_preds.transpose(1, 2), final_target).mean()
+
+    loss = criterion(all_preds.transpose(1, 2), all_targets).mean()
+    weighted_loss = (loss * position_weights).mean()
 
     # Combine losses
-    loss = other_loss / 10 + final_loss
+    loss = weighted_loss  # + final_loss
     return loss
 
 
@@ -146,7 +161,7 @@ def train_model(
     count_parameters(decoder_model)
 
     # Create optimizer for both JPT1 and decoder model parameters
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         # list(model.parameters()) + list(decoder_model.parameters()),
         model.parameters(),
         lr=config["lr"],
@@ -180,6 +195,11 @@ def train_model(
     train_time_start = time.time()
     total_training_examples = 0
 
+    loss_history = []
+
+    eval_every_n_samples = 50000
+    samples_since_eval = 0
+
     for epoch in range(config["epochs"]):
         epoch_loss = 0
         batch_count = 0
@@ -194,6 +214,24 @@ def train_model(
 
                 fetch_end_time = time.time()
 
+                samples_since_eval += x.shape[0]
+
+                if samples_since_eval >= eval_every_n_samples:
+                    eval_results = evaluate_model(
+                        model, decoder_model, val_dataloader, criterion, device
+                    )
+                    samples_since_eval = 0
+                    wandb.log(
+                        {
+                            "val_loss": eval_results["val_loss"],
+                            "val_sequence_accuracy": eval_results[
+                                "val_sequence_accuracy"
+                            ],
+                            "val_char_accuracy": eval_results["val_char_accuracy"],
+                            "epoch": epoch,
+                        }
+                    )
+
                 batch_count += 1
                 segment_batch_count += 1
                 total_training_examples += x.shape[0]
@@ -204,40 +242,32 @@ def train_model(
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     # Forward through JPT1
                     jpt_output = model(encoded_seq)
-
                     loss = calculate_loss(jpt_output, target_chars, criterion)
 
                 # Update metrics
                 segment_loss += loss.item()
                 epoch_loss += loss.item()
 
+                loss_history.append(loss.item())
+
+                if len(loss_history) > 20:
+                    loss_history.pop(0)
+
+                current_mean_loss = sum(loss_history) / len(loss_history)
+
                 new_low = False
 
-                if loss.item() < low_loss:
-                    low_loss = loss.item()
+                if current_mean_loss < low_loss:
+                    low_loss = current_mean_loss
                     print(f"New low loss: {low_loss:.7f}")
                     new_low = True
                 # Log batch metrics
 
                 if batch_count % 10 == 0:
-                    # Get predictions for logging
-                    # with torch.inference_mode():
-                    # pred_indices = torch.argmax(decoded, dim=-1)
-                    # target_texts = batch_tensor_to_text(
-                    #     target_chars, train_dataset.idx2char
-                    # )
-                    # pred_texts = batch_tensor_to_text(
-                    #     pred_indices, train_dataset.idx2char
-                    # )
-
-                    # if new_low:
-                    #     print(f"\nSample {batch_count}:")
-                    #     print(f"Target: {target_texts[0]}")
-                    #     print(f"Pred:   {pred_texts[0]}")
 
                     wandb.log(
                         {
-                            "batch_loss": loss.item(),
+                            "batch_loss": current_mean_loss,
                             "learning_rate": optimizer.param_groups[0]["lr"],
                             "epoch": epoch,
                         }
@@ -246,7 +276,7 @@ def train_model(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+                # scheduler.step()
 
                 train_step_end = time.time()
 
@@ -256,11 +286,6 @@ def train_model(
             # Log segment metrics
             avg_segment_loss = segment_loss / segment_batch_count
 
-        # Evaluation
-        eval_results = evaluate_model(
-            model, decoder_model, val_dataloader, criterion, device
-        )
-
         val_loss = eval_results["val_loss"]
         val_sequence_accuracy = eval_results["val_sequence_accuracy"]
         val_char_accuracy = eval_results["val_char_accuracy"]
@@ -268,9 +293,6 @@ def train_model(
         wandb.log(
             {
                 "epoch_loss": epoch_loss / batch_count,
-                "val_loss": val_loss,
-                "val_sequence_accuracy": val_sequence_accuracy,
-                "val_char_accuracy": val_char_accuracy,
                 "epoch": epoch,
             }
         )
@@ -280,6 +302,19 @@ def train_model(
             f"val_sequence_accuracy: {val_sequence_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}"
         )
 
+    # Final Evaluation
+    eval_results = evaluate_model(
+        model, decoder_model, val_dataloader, criterion, device
+    )
+    wandb.log(
+        {
+            "epoch_loss": epoch_loss / batch_count,
+            "val_loss": eval_results["val_loss"],
+            "val_sequence_accuracy": eval_results["val_sequence_accuracy"],
+            "val_char_accuracy": eval_results["val_char_accuracy"],
+            "epoch": epoch,
+        }
+    )
     train_time_end = time.time()
 
     total_time = train_time_end - train_time_start
@@ -442,73 +477,54 @@ def generate_text(
     encoder_model: nn.Module,
     prompt: str,
     max_new_chars: int,
-    hypertoken_seq_len: int,
     dataset: HyperTokenTinyShakespeareDataset,
-    temperature: float = 1.0,
+    temperature: float = 0.5,
     device: str = "cuda",
 ) -> str:
     # Set models to eval mode
     jpt_model.eval()
     encoder_model.eval()
 
-    print(f"\nPrompt: {prompt}\n")
     print("Generating...\n")
 
-    # Initialize result with prompt
-    result = list(prompt)
+    print(f"\nPrompt: {prompt}\n", end="", flush=True)
+
+    result: [str] = list(prompt)
 
     with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
         for i in range(max_new_chars):
-            # Get the last hypertoken_seq_len * seq_len characters
-            input_text = result[-(hypertoken_seq_len * jpt_model.seq_len) :]
-
-            # Pad if we don't have enough characters
-            if len(input_text) < hypertoken_seq_len * jpt_model.seq_len:
-                padding = ["<PAD>"] * (
-                    hypertoken_seq_len * jpt_model.seq_len - len(input_text)
-                )
-                input_text = padding + input_text
-
-            # Convert to character indices and chunk into hypertoken_seq_len sized pieces
-            char_indices = [
-                dataset.char2idx.get(c, dataset.pad_token) for c in input_text
-            ]
-            char_chunks = torch.tensor(char_indices, dtype=torch.long).view(
-                -1, hypertoken_seq_len
-            )
-
-            # Ensure we have the right shape
-            if char_chunks.size(0) != jpt_model.seq_len:
-                padding_chunks = torch.full(
-                    (jpt_model.seq_len - char_chunks.size(0), hypertoken_seq_len),
-                    dataset.pad_token,
-                    dtype=torch.long,
-                )
-                char_chunks = torch.cat([padding_chunks, char_chunks])
-
-            # Process through encoder
-            char_chunks = char_chunks.to(device)
-            encoded = encoder_model(char_chunks.view(-1, hypertoken_seq_len))
-            encoded = encoded.view(1, jpt_model.seq_len, -1)
+            current_context = "".join(result)
+            encoded_list = dataset.encode_to_hypertokens_from_text(current_context)
+            encoded = torch.stack(encoded_list).to(device)
 
             # Get prediction from JPT1
             output = jpt_model(encoded)
             logits = output[0, -1] / temperature
 
-            # Apply softmax to get probabilities
+            # Apply softmax and handle any numerical instabilities
             probs = torch.nn.functional.softmax(logits, dim=-1)
+
+            # Optional: Apply top-k sampling
+            k = 10  # Adjust based on your needs
+            top_k = min(k, probs.size(-1))
+            indices_to_remove = probs < torch.topk(probs, top_k)[0][..., -1, None]
+            probs[indices_to_remove] = 0
+            probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
 
             # Sample next character
             next_char_idx = torch.multinomial(probs, num_samples=1).item()
             next_char = dataset.idx2char[next_char_idx]
 
             # Print the generated character
-            print(f"[{i+1}/{max_new_chars}] Generated: '{next_char}'")
+            print(next_char, end="", flush=True)
 
-            result.append(next_char)
+            result.append(next_char if next_char != "<PAD>" else " ")
+
+            if len(result) > jpt_model.seq_len:
+                result.pop(0)
 
     final_text = "".join(result)
-    print(f"\nFinal text:\n{final_text}")
+    # print(f"\nFinal text:\n{final_text}")
     return final_text
 
 
@@ -529,13 +545,15 @@ if __name__ == "__main__":
             "jpt_embed_dim": jed,
             "compress_factor": 2,
             "data_segments": 10,
+            "dropout": dropout,
         }
         for n_layers in [6]  # Varying n_layers
         for head_size in [64]  # Varying head_size
         for jed in [384]
         for lr in [0.0003]
-        for sl in [128]
-        for epochs in [3]
+        for sl in [256]
+        for epochs in [1]
+        for dropout in [0.3, 0.4, 0.5]
     ]
 
     enable_torch_optimizations()
@@ -558,7 +576,7 @@ if __name__ == "__main__":
         jpt_embed_dim = experiment["jpt_embed_dim"]
         hypertoeken_compress_factor = experiment["compress_factor"]
         data_segments = experiment["data_segments"]
-
+        dropout = experiment["dropout"]
         # load this just to get the vocab size
         if vocab_size == 0:
             tmp_dset = TinyShakespeareDataset(
@@ -621,7 +639,7 @@ if __name__ == "__main__":
             embed_dim=jpt_embed_dim,
             num_heads=head_size,
             num_layers=n_layers,
-            dropout=0.1,
+            dropout=dropout,
             hypertoken_size=hypertoken_size,
         ).to(device)
 

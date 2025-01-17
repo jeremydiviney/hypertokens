@@ -13,7 +13,7 @@ class JPT1(nn.Module):
         num_heads: int,
         num_layers: int,
         hypertoken_size: int,
-        dropout: float = 0.1,
+        dropout: float,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -31,23 +31,46 @@ class JPT1(nn.Module):
             batch_first=True,
             norm_first=True,  # Pre-norm architecture
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.initial_expand = nn.Sequential(
-            nn.Linear(hypertoken_size, embed_dim // 2),
-            nn.LayerNorm(embed_dim // 2),
-            nn.Linear(embed_dim // 2, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # self.transformer = nn.TransformerDecoder(encoder_layer, num_layers=num_layers)
+
+        # self.initial_expand = nn.Sequential(
+        #     nn.Linear(hypertoken_size, embed_dim // 2),
+        #     nn.ReLU(),
+        #     nn.Dropout(dropout),
+        #     nn.LayerNorm(embed_dim // 2),
+        #     nn.Linear(embed_dim // 2, embed_dim),
+        #     nn.ReLU(),
+        #     nn.Dropout(dropout),
+        #     nn.LayerNorm(embed_dim),
+        # )
 
         self.ln_final = nn.LayerNorm(embed_dim)
         self.fc_out = nn.Linear(embed_dim, vocab_size)
 
+    def generate_square_subsequent_mask(self, sz):
+        """Generate a causal mask to prevent attending to future tokens."""
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1)  # Upper triangular matrix
+        mask = mask.masked_fill(
+            mask == 1, float("-inf")
+        )  # Mask future tokens with -inf
+        return mask
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hypertoken_size = x.shape
 
+        # Create causal mask to prevent attending to future tokens
+        causal_mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
+
         # Embeddings
-        token_embed = self.initial_expand(x)  # expand the hypertoken into the embed_dim
+        # token_embed = self.initial_expand(x)  # expand the hypertoken into the embed_dim
+
+        expand_factor = self.embed_dim // hypertoken_size
+        token_embed = x.unsqueeze(-1).expand(-1, -1, -1, expand_factor).reshape(
+            batch_size, seq_len, self.embed_dim
+        ) * (1.0 / expand_factor)
+
         position_ids = (
             torch.arange(seq_len, device=x.device)
             .unsqueeze(0)
@@ -57,7 +80,13 @@ class JPT1(nn.Module):
         x = token_embed + self.position_embedding(position_ids)
 
         # Transformer blocks
-        x = self.transformer(x)
+        # For TransformerDecoder, we need memory (encoder output) and target (decoder input)
+        # Using a zero memory tensor of the same size as input
+        memory = torch.zeros_like(x)
+
+        # Transformer blocks - note we're passing memory as the first argument
+        x = self.transformer(x, mask=causal_mask)
+        # x = self.transformer(tgt=x, memory=memory, tgt_mask=causal_mask)
 
         check_memory_usage(self)
 

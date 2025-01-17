@@ -36,9 +36,9 @@ def count_parameters(model: nn.Module) -> tuple[int, dict]:
     formatted_layers = {name: f"{count:,}" for name, count in params_by_layer.items()}
 
     print(f"\nTotal trainable parameters: {total_params:,}")
-    # print("\nParameters per layer:")
-    # for name, count in formatted_layers.items():
-    #     print(f"{name}: {count}")
+    print("\nParameters per layer:")
+    for name, count in formatted_layers.items():
+        print(f"{name}: {count}")
 
     return total_params, params_by_layer
 
