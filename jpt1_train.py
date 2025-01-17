@@ -52,17 +52,17 @@ def evaluate_model(
     with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
         for x, y in dataloader:
             encoded_seq = x.to(device)
-            target_chars = y.to(device)
+            target = y.to(device)
 
             jpt_output = model(encoded_seq)
 
-            loss = calculate_loss(jpt_output, target_chars, criterion)
+            loss = calculate_hypertoken_loss(jpt_output, target, criterion)
 
             total_loss += loss.item()
             batch_count += 1
 
             final_embedding = jpt_output[:, -1]
-            final_target_char = target_chars[:, -1]
+            final_target_char = target[:, -1]
 
             pred_indices = torch.argmax(final_embedding, dim=-1).unsqueeze(1)
             target_texts = batch_tensor_to_text(
@@ -101,6 +101,16 @@ def evaluate_model(
     model.train()
     decoder.train()
     return result
+
+
+def calculate_hypertoken_loss(model_output, target_hypertokens, criterion):
+    all_preds = model_output
+    all_targets = target_hypertokens
+
+    # For MSE loss, we don't need to transpose since we're comparing tensors directly
+    loss = criterion(all_preds, all_targets)
+
+    return loss
 
 
 def calculate_loss(model_output, target_chars, criterion):
@@ -173,7 +183,8 @@ def train_model(
     #     weight_decay=1e-2,  # Lion typically works better with higher weight decay
     # )
 
-    criterion = nn.CrossEntropyLoss()
+    # criterion = nn.CrossEntropyLoss()
+    criterion = nn.MSELoss()  # now predicting hypertokens directly
 
     total_steps = config["epochs"] * len(train_dataloader) * data_segments
 
@@ -186,7 +197,7 @@ def train_model(
         cycle_momentum=False,
     )
 
-    evaluate_model(model, decoder_model, val_dataloader, criterion, device)
+    # evaluate_model(model, decoder_model, val_dataloader, criterion, device)
 
     current_lr = config["lr"]
     low_loss = 10000
@@ -237,12 +248,12 @@ def train_model(
                 total_training_examples += x.shape[0]
 
                 encoded_seq = x.to(device)
-                target_chars = y.to(device)
+                target = y.to(device)
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     # Forward through JPT1
                     jpt_output = model(encoded_seq)
-                    loss = calculate_loss(jpt_output, target_chars, criterion)
+                    loss = calculate_hypertoken_loss(jpt_output, target, criterion)
 
                 # Update metrics
                 segment_loss += loss.item()

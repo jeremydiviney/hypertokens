@@ -239,22 +239,25 @@ class HyperTokenTinyShakespeareDataset(Dataset):
     def encode_to_hypertokens(self, char_sequence: torch.Tensor) -> torch.Tensor:
         # Calculate batch sizes to process
         device = next(self.encoder.parameters()).device
+
+        cur_seq_len = char_sequence.size(1)
+
         # Take up to sequence length and pad if needed
-        if char_sequence.size(1) < self.seq_len:
+        if char_sequence.size(1) < cur_seq_len:
             padding = torch.full(
                 (
                     char_sequence.size(0),
-                    self.seq_len - char_sequence.size(1),
-                    self.hypertoken_seq_len,
+                    cur_seq_len - char_sequence.size(1),
+                    self.hypertoken_cur_seq_len,
                 ),
                 self.pad_token,
                 device=device,
             )
             char_sequence = torch.cat([padding, char_sequence], dim=1)
         else:
-            char_sequence = char_sequence[:, -self.seq_len :]
+            char_sequence = char_sequence[:, -cur_seq_len:]
 
-        chunks_per_item = self.seq_len
+        chunks_per_item = cur_seq_len
         items_per_batch = 4096 // chunks_per_item
 
         actual_batch_size = char_sequence.size(0)
@@ -281,7 +284,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
             with torch.inference_mode():
                 current_input_flat = current_input.reshape(-1, self.hypertoken_seq_len)
                 encoded = self.encoder(current_input_flat)
-                encoded = encoded.reshape(current_input.size(0), self.seq_len, -1)
+                encoded = encoded.reshape(current_input.size(0), cur_seq_len, -1)
                 encoded_list.extend(encoded)
 
             start_idx = end_idx
@@ -302,9 +305,13 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         batch_items: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-        encoded_list = self.encode_to_hypertokens(input_chunks)
+        encoded_tensor = torch.stack(self.encode_to_hypertokens(all_chunks))
+
+        # Now we can properly slice the stacked tensor
+        input_chunks = encoded_tensor[:, :-1]
+        target_chunks = encoded_tensor[:, 1:]
 
         # Zip encoded inputs with targets and extend batch_items
-        batch_items = list(zip(encoded_list, target_chunks))
+        batch_items = list(zip(input_chunks, target_chunks))
 
         return batch_items

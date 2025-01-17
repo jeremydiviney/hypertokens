@@ -47,7 +47,7 @@ class JPT1(nn.Module):
         # )
 
         self.ln_final = nn.LayerNorm(embed_dim)
-        self.fc_out = nn.Linear(embed_dim, vocab_size)
+        self.fc_out = nn.Linear(embed_dim, hypertoken_size)
 
     def generate_square_subsequent_mask(self, sz):
         """Generate a causal mask to prevent attending to future tokens."""
@@ -91,6 +91,7 @@ class JPT1(nn.Module):
         check_memory_usage(self)
 
         x = self.ln_final(x)
-        return self.fc_out(x)
+        x = self.fc_out(x)
+        return x
 
         # return x  # we output the raw embeddings that will flow into the decoder model
