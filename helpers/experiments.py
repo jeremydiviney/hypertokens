@@ -1,11 +1,11 @@
-import wandb
 import time
-import psutil
-import torch.nn as nn
-import torch
-from typing import TypedDict
 import glob
-from datetime import datetime
+
+import psutil
+from torch import nn
+import torch
+
+import wandb
 
 
 def get_gpu_memory_gb() -> float:
@@ -27,18 +27,16 @@ def count_parameters(model: nn.Module) -> tuple[int, dict]:
     Count total trainable parameters and parameters per layer
     Returns: (total_params, params_by_layer)
     """
-    params_by_layer = {
-        name: p.numel() for name, p in model.named_parameters() if p.requires_grad
-    }
+    params_by_layer = {name: p.numel() for name, p in model.named_parameters() if p.requires_grad}
     total_params = sum(params_by_layer.values())
 
     # Format large numbers with commas
-    formatted_layers = {name: f"{count:,}" for name, count in params_by_layer.items()}
+    # formatted_layers = {name: f"{count:,}" for name, count in params_by_layer.items()}
 
     print(f"\nTotal trainable parameters: {total_params:,}")
-    print("\nParameters per layer:")
-    for name, count in formatted_layers.items():
-        print(f"{name}: {count}")
+    # print("\nParameters per layer:")
+    # for name, count in formatted_layers.items():
+    #     print(f"{name}: {count}")
 
     return total_params, params_by_layer
 
@@ -63,11 +61,7 @@ def save_project_files_as_artifact(wandb_run):
     ]
 
     # Get all Python files then filter out excluded paths
-    python_files = set(glob.glob(include_pattern, recursive=True)) - set(
-        file
-        for pattern in exclude_patterns
-        for file in glob.glob(pattern, recursive=True)
-    )
+    python_files = set(glob.glob(include_pattern, recursive=True)) - set(file for pattern in exclude_patterns for file in glob.glob(pattern, recursive=True))
 
     # Add files to artifact
     for file_path in python_files:

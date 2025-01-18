@@ -2,7 +2,15 @@
     "[python]": {
         "editor.defaultFormatter": "ms-python.black-formatter",
         "editor.formatOnSave": true,
-        "python.linting.enabled": true,
-        "python.linting.pylintEnabled": true
-    }
+    },
+    "black-formatter.args": [
+        "--line-length=180",
+    ],
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.linting.pylintArgs": [
+        "--disable=missing-docstring",
+        "--disable=C0111",
+        "--disable=redefined-outer-name"
+    ]
 }

@@ -56,11 +56,7 @@ class TinyShakespeareDataset(Dataset):
 
         all_text = train_text + val_text + test_text
 
-        text = (
-            train_text
-            if type == "train"
-            else val_text if type == "validation" else test_text
-        )
+        text = train_text if type == "train" else val_text if type == "validation" else test_text
 
         # Build vocabulary
         chars = sorted(list(set(all_text)))
@@ -115,9 +111,7 @@ class TinyShakespeareDataset(Dataset):
         # Place sequence in padded tensor
         if len(sequence) > self.encode_last_n_length:
             overflow = len(sequence) - self.encode_last_n_length
-            x[boundary_index - overflow : boundary_index + len(sequence) - overflow] = (
-                sequence
-            )
+            x[boundary_index - overflow : boundary_index + len(sequence) - overflow] = sequence
         else:
             x[boundary_index : boundary_index + len(sequence)] = sequence
 
@@ -156,11 +150,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         all_text = train_text + val_text + test_text
 
-        text = (
-            train_text
-            if type == "train"
-            else val_text if type == "validation" else test_text
-        )
+        text = train_text if type == "train" else val_text if type == "validation" else test_text
 
         # Build vocabulary
         chars = sorted(list(set(all_text)))
@@ -184,10 +174,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         else:
             return len(self.data)
 
-    def get_batch_item(
-        self, idx: int, chunk_count: int = None, chunk_size: int = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = next(self.encoder.parameters()).device
+    def get_batch_item(self, idx: int, chunk_count: int = None, chunk_size: int = None) -> tuple[torch.Tensor, torch.Tensor]:
 
         if chunk_count is None:
             chunk_count = self.seq_len + 1
@@ -226,13 +213,12 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         if char_chunks.shape[1] != chunk_size:
             print("char_chunks.device.shape[1] != chunk_size")
             raise Exception("char_chunks.device.shape[1] != chunk_size")
+
         return char_chunks
 
     def encode_to_hypertokens_from_text(self, text: str) -> torch.Tensor:
         device = next(self.encoder.parameters()).device
-        char_sequence_indexes = torch.tensor(
-            [self.char2idx[ch] for ch in text], dtype=torch.long
-        ).to(device)
+        char_sequence_indexes = torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long).to(device)
 
         return self.encode_to_hypertokens(char_sequence_indexes.reshape(1, -1, 1))
 
@@ -248,7 +234,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
                 (
                     char_sequence.size(0),
                     cur_seq_len - char_sequence.size(1),
-                    self.hypertoken_cur_seq_len,
+                    char_sequence.size(1),
                 ),
                 self.pad_token,
                 device=device,
@@ -291,9 +277,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         return encoded_list
 
-    def __getitems__(
-        self, batch_indices: List[int]
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    def __getitems__(self, batch_indices: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         device = next(self.encoder.parameters()).device
 
         pre_batch_items = [self.get_batch_item(idx) for idx in batch_indices]
@@ -310,8 +294,9 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         # Now we can properly slice the stacked tensor
         input_chunks = encoded_tensor[:, :-1]
         target_chunks = encoded_tensor[:, 1:]
+        target_chars = all_chunks[:, 1:]
 
         # Zip encoded inputs with targets and extend batch_items
-        batch_items = list(zip(input_chunks, target_chunks))
+        batch_items = list(zip(input_chunks, zip(target_chunks, target_chars)))
 
         return batch_items

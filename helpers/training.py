@@ -1,12 +1,7 @@
-from typing import Callable, TypeVar, Any, Optional
+from typing import TypeVar, Any, Optional
+import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast
-from datetime import datetime
-import os
-import torch.optim as optim
-from torch.amp import autocast
 
 Model = TypeVar("Model", bound=nn.Module)
 
@@ -21,9 +16,7 @@ def check_memory_usage(model: nn.Module):
         # print("Average memory usage: {:.2f}GB".format(self.average_memory_usage))
 
 
-def save_model(
-    model: Any, save_dir: str, model_name: str, save_separate: bool = True
-) -> None:
+def save_model(model: Any, save_dir: str, model_name: str) -> None:
     """
     Save the model state. Optionally save encoder and decoder separately.
 
@@ -31,7 +24,6 @@ def save_model(
         model: The model to save
         save_dir: Directory to save the model(s) in
         model_name: Base name for the saved model files
-        save_separate: If True, save encoder and decoder separately
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -40,16 +32,12 @@ def save_model(
     torch.save(model.state_dict(), full_model_path)
 
 
-def load_model(
-    model: Model, load_dir: str, model_name: str, device: Optional[str] = None
-) -> Model:
+def load_model(model: Model, load_dir: str, model_name: str, device: Optional[str] = None) -> Model:
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def clean_state_dict(state_dict: dict) -> dict:
-        return {
-            key.replace("_orig_mod.", ""): value for key, value in state_dict.items()
-        }
+        return {key.replace("_orig_mod.", ""): value for key, value in state_dict.items()}
 
     full_model_path = os.path.join(load_dir, f"{model_name}_full.pt")
     state_dict = torch.load(full_model_path, map_location=device)
@@ -72,9 +60,7 @@ def enable_torch_optimizations():
 def setup_flash_attention():
     # Enable Flash Attention if available
     if torch.cuda.is_available():
-        flash_available = torch.backends.cuda.sdp_kernel(
-            enable_flash=True, enable_math=True, enable_mem_efficient=True
-        )
+        flash_available = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
         print(f"Flash Attention available and enabled: {flash_available}")
         # Enable Flash Attention
         torch.backends.cuda.enable_flash_sdp(True)
@@ -105,12 +91,7 @@ def batch_tensor_to_text(batch_tensor: torch.Tensor, idx2char: dict) -> list[str
 
     # Handle 1D array (single sequence)
     if sequences.ndim == 1:
-        return [
-            "".join(idx2char[int(idx)] for idx in sequences if int(idx) != pad_token)
-        ]
+        return ["".join(idx2char[int(idx)] for idx in sequences if int(idx) != pad_token)]
 
     # Handle batch of sequences
-    return [
-        "".join(idx2char[int(idx)] for idx in seq if int(idx) != pad_token)
-        for seq in sequences
-    ]
+    return ["".join(idx2char[int(idx)] for idx in seq if int(idx) != pad_token) for seq in sequences]

@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 from helpers.training import check_memory_usage
 
 
@@ -39,9 +39,7 @@ class HyperTokenEncoder(nn.Module):
         if compression_sizes[-1] != hypertoken_size // self.seq_len:
             compression_sizes.append(self.MIN_EMBED_DIM)
 
-        self.compression_sizes = list(
-            zip(compression_sizes[:-1], compression_sizes[1:])
-        )
+        self.compression_sizes = list(zip(compression_sizes[:-1], compression_sizes[1:]))
         self.compression_layers = nn.ModuleList([])
 
         for in_dim, out_dim in self.compression_sizes:
@@ -58,9 +56,7 @@ class HyperTokenEncoder(nn.Module):
                 norm_first=True,
             )
 
-            self.compression_layers.append(
-                nn.TransformerEncoder(t_layer, num_layers=n_layers)
-            )
+            self.compression_layers.append(nn.TransformerEncoder(t_layer, num_layers=n_layers))
 
         self.to(torch.bfloat16)
 
@@ -74,9 +70,7 @@ class HyperTokenEncoder(nn.Module):
             compressed = self.compression_layers[i](compressed)
             compress_factor = dim_in // dim_out
 
-            compressed = compressed.reshape(
-                batch_size, seq_len, -1, compress_factor
-            ).sum(dim=-1)
+            compressed = compressed.reshape(batch_size, seq_len, -1, compress_factor).sum(dim=-1)
 
         return compressed.flatten(start_dim=1)
 
@@ -126,9 +120,7 @@ class HyperTokenDecoder(nn.Module):
                 norm_first=True,
             )
 
-            self.expansion_layers.append(
-                nn.TransformerEncoder(t_layer, num_layers=n_layers)
-            )
+            self.expansion_layers.append(nn.TransformerEncoder(t_layer, num_layers=n_layers))
 
         self.to(torch.bfloat16)
 
@@ -138,9 +130,7 @@ class HyperTokenDecoder(nn.Module):
 
         for sub_layer_index, (dim_in, dim_out) in enumerate(self.expansion_sizes):
             expand_factor = dim_out // dim_in
-            expanded = expanded.unsqueeze(-1).expand(-1, -1, -1, expand_factor).reshape(
-                batch_size, self.encode_last_n_length, dim_out
-            ) * (1.0 / expand_factor)
+            expanded = expanded.unsqueeze(-1).expand(-1, -1, -1, expand_factor).reshape(batch_size, self.encode_last_n_length, dim_out) * (1.0 / expand_factor)
 
             expanded = self.expansion_layers[sub_layer_index](expanded)
 
