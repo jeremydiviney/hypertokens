@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from helpers.training import check_memory_usage
 
 
 class HyperTokenEncoder(nn.Module):
@@ -179,5 +178,4 @@ class HyperTokenAutoencoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hypertoken = self.encoder(x)
         decoded = self.decoder(hypertoken)
-        check_memory_usage(self)
         return decoded

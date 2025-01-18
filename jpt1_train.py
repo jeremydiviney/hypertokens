@@ -738,5 +738,3 @@ if __name__ == "__main__":
 
 
 print("Training Complete")
-
-# TODO: fix gpu memory reporting
