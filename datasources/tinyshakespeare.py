@@ -1,16 +1,19 @@
-import torch
-from torch.utils.data import Dataset
-from datasets import load_dataset
 import random
 import math
 import re
-from typing import TypedDict
+
+from typing import List, Tuple
+from torchtyping import TensorType, patch_typeguard
+from typeguard import typechecked
+
+import numpy as np
+import torch
 import torch.nn as nn
-from helpers.training import batch_tensor_to_text
-import time
-from torch.utils.data import Sampler
-from typing import Iterator, List, Optional, Tuple
+from torch.amp import autocast
+
 from torch.utils.data.dataset import Dataset
+
+from datasets import load_dataset
 
 
 def process_character_sequence(dataset: Dataset, sequence: torch.Tensor) -> str:
@@ -33,6 +36,19 @@ def process_character_sequence(dataset: Dataset, sequence: torch.Tensor) -> str:
 
     if len(words) > 0:
         sequence_str = "".join(words)
+
+
+def decode_indices_to_text(char_sequence: TensorType["batch_size", "seq_len", "token_char_len"], idx2char: [int], pad_token_idx: int) -> np.ndarray:
+    # Convert indices to numpy array once
+    indices_array = char_sequence.cpu().numpy()
+    # Create mask for non-pad tokens
+    mask = indices_array == pad_token_idx
+    # Create a lookup array with the character mapping
+    char_lookup = np.array([idx2char[i] for i in range(len(idx2char))])
+    # Use numpy vectorized lookup
+    chars_array = char_lookup[indices_array]
+    chars_array[mask] = ""
+    return chars_array
 
 
 # --------------------------------------------------
@@ -218,11 +234,15 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
     def encode_to_hypertokens_from_text(self, text: str) -> torch.Tensor:
         device = next(self.encoder.parameters()).device
+
         char_sequence_indexes = torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long).to(device)
 
         return self.encode_to_hypertokens(char_sequence_indexes.reshape(1, -1, 1))
 
-    def encode_to_hypertokens(self, char_sequence: torch.Tensor) -> torch.Tensor:
+    def encode_characters_to_indexes(self, text: str) -> torch.Tensor:
+        return torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
+
+    def encode_to_hypertokens(self, char_sequence: torch.Tensor) -> List[torch.Tensor]:
         # Calculate batch sizes to process
         device = next(self.encoder.parameters()).device
 
@@ -266,37 +286,29 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
             current_input = char_sequence[batch_slice]
 
+            current_input_flat = current_input.reshape(-1, self.hypertoken_seq_len)
             # Encode current batch
-            with torch.inference_mode():
-                current_input_flat = current_input.reshape(-1, self.hypertoken_seq_len)
-                encoded = self.encoder(current_input_flat)
-                encoded = encoded.reshape(current_input.size(0), cur_seq_len, -1)
-                encoded_list.extend(encoded)
+            encoded = self.encoder(current_input_flat.to(device))
+
+            encoded = encoded.reshape(current_input.size(0), cur_seq_len, -1)
+            encoded_list.extend(encoded)
 
             start_idx = end_idx
 
         return encoded_list
 
     def __getitems__(self, batch_indices: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        device = next(self.encoder.parameters()).device
 
         pre_batch_items = [self.get_batch_item(idx) for idx in batch_indices]
 
-        all_chunks = torch.stack(pre_batch_items).to(device)
-
-        input_chunks = all_chunks[:, :-1]
-        target_chunks = all_chunks[:, 1:]
+        all_chunks = torch.stack(pre_batch_items)
 
         batch_items: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-        encoded_tensor = torch.stack(self.encode_to_hypertokens(all_chunks))
-
-        # Now we can properly slice the stacked tensor
-        input_chunks = encoded_tensor[:, :-1]
-        target_chunks = encoded_tensor[:, 1:]
         target_chars = all_chunks[:, 1:]
+        input_chars = all_chunks[:, :-1]
 
         # Zip encoded inputs with targets and extend batch_items
-        batch_items = list(zip(input_chunks, zip(target_chunks, target_chars)))
+        batch_items = list(zip(input_chars, target_chars))
 
         return batch_items

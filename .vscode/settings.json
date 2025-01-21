@@ -11,6 +11,7 @@
     "python.linting.pylintArgs": [
         "--disable=missing-docstring",
         "--disable=C0111",
-        "--disable=redefined-outer-name"
+        "--disable=redefined-outer-name",
+        "--max-line-length=180"
     ]
 }

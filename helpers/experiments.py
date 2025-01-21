@@ -96,8 +96,6 @@ def run_experiment(projectName, train_model, exp_name, config: dict) -> None:
     # Log parameters count
     wandb.log({"total_parameters": total_params, "run_id": wandb.run.id})
 
-    memory_usage = train_model.average_memory_usage
-
     gpu_memory_usage = get_gpu_memory_gb()
 
     # Log time and memory metrics
@@ -108,7 +106,6 @@ def run_experiment(projectName, train_model, exp_name, config: dict) -> None:
         {
             "duration_seconds": duration,
             "duration_per_epoch_seconds": duration / config["epochs"],
-            "memory_usage_gb": memory_usage,
             "gpu_memory_usage_gb": gpu_memory_usage,
         }
     )

@@ -1,5 +1,8 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
+from typeguard import typechecked
+from torchtyping import TensorType
 
 
 class HyperTokenEncoder(nn.Module):
@@ -59,7 +62,8 @@ class HyperTokenEncoder(nn.Module):
 
         self.to(torch.bfloat16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @typechecked
+    def forward(self, x: TensorType["batch_size", "seq_len"]) -> TensorType["batch_size", "hypertoken_size"]:
         batch_size, seq_len = x.size()
 
         embedded = self.embed(x) + self.pos_embed(self.positions)
@@ -69,9 +73,12 @@ class HyperTokenEncoder(nn.Module):
             compressed = self.compression_layers[i](compressed)
             compress_factor = dim_in // dim_out
 
-            compressed = compressed.reshape(batch_size, seq_len, -1, compress_factor).sum(dim=-1)
+            compressed = compressed.reshape(batch_size, seq_len, -1, compress_factor).mean(dim=-1)
 
-        return compressed.flatten(start_dim=1)
+        compressed = compressed.flatten(start_dim=1)
+        # compressed = F.normalize(compressed, p=2, dim=1, eps=1e-2)
+
+        return compressed
 
 
 class HyperTokenDecoder(nn.Module):
@@ -91,6 +98,8 @@ class HyperTokenDecoder(nn.Module):
 
         self.COMPRESS_FACTOR = compress_factor
         self.MIN_EMBED_DIM = hypertoken_size // encode_last_n_length
+
+        self.hypertoken = None
 
         self.fc_out = nn.Linear(embed_dim, vocab_size)
 
@@ -123,9 +132,11 @@ class HyperTokenDecoder(nn.Module):
 
         self.to(torch.bfloat16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @typechecked
+    def forward(self, x: TensorType["batch_size", "hypertoken_size"]) -> TensorType["batch_size", "seq_len", "vocab_size"]:
         batch_size = x.size(0)
         expanded = x.reshape(batch_size, self.encode_last_n_length, -1)
+        # expanded = F.normalize(expanded, p=2, dim=2)
 
         for sub_layer_index, (dim_in, dim_out) in enumerate(self.expansion_sizes):
             expand_factor = dim_out // dim_in
@@ -133,7 +144,8 @@ class HyperTokenDecoder(nn.Module):
 
             expanded = self.expansion_layers[sub_layer_index](expanded)
 
-        return self.fc_out(expanded)
+        fc_out = self.fc_out(expanded)
+        return fc_out
 
 
 class HyperTokenAutoencoder(nn.Module):
@@ -175,7 +187,10 @@ class HyperTokenAutoencoder(nn.Module):
 
         self.to(torch.bfloat16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @typechecked
+    def forward(self, x: TensorType["batch_size", "seq_len"]) -> TensorType["batch_size", "vocab_size"]:
         hypertoken = self.encoder(x)
+        self.hypertoken = hypertoken  # used for some loss stuff later
         decoded = self.decoder(hypertoken)
+
         return decoded

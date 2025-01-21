@@ -4,18 +4,23 @@ from datetime import datetime
 import time
 import sys
 
+import numpy as np
+
+import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torch
 from torch.amp import autocast
 import torch.nn.functional as F
+from torch.utils.data.dataset import Dataset
+
+from torchtyping import TensorType, patch_typeguard
+from typeguard import typechecked
 
 from models.hypertoken_auto_encoder import HyperTokenEncoder, HyperTokenDecoder
 
-from models.jpt1 import JPT1
-from datasources.tinyshakespeare import HyperTokenTinyShakespeareDataset, TinyShakespeareDataset
-from helpers.training import batch_tensor_to_text
+from models.jpt1 import JPT1, ExpandMethod
+from datasources.tinyshakespeare import HyperTokenTinyShakespeareDataset, TinyShakespeareDataset, decode_indices_to_text
 from helpers.experiments import run_experiment, count_parameters
 from helpers.training import (
     save_model,
@@ -23,25 +28,65 @@ from helpers.training import (
     setup_flash_attention,
 )
 
+from helpers.utilities import calculate_text_accuracy
 
 # --------------------------------------------------
 # 2. Model Definition
 # --------------------------------------------------
 
 
-def decode_text_from_hypertoken(hypertoken: torch.Tensor, decoder: nn.Module) -> [str]:
+@typechecked
+def decode_text_from_hypertoken(
+    dataset: Dataset, hypertoken: TensorType["batch_size", "seq_len", "hypertoken_size"], decoder: nn.Module, temperature: float = 0
+) -> np.ndarray[str]:  # --->["batch_size", "seq_len", "character"]:
+
     decoder.eval()
+
+    batch_size, seq_len, hypertoken_size = hypertoken.shape
+    hypertoken_seq_len = dataset.hypertoken_seq_len
+
     with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
-        decoder_output = decoder(hypertoken)  # [batch_size,  vocab_size]
+        hypertoken = hypertoken.reshape(-1, hypertoken_size)
+        decoder_output = decoder(hypertoken)  # [batch_size, seq_len, vocab_size]
+        decoder_output = decoder_output.reshape(batch_size, seq_len, hypertoken_seq_len, -1)
 
-        # Get predicted indices for each position in the sequence
-        pred_indices = torch.argmax(decoder_output, dim=-1).cpu()  # [batch_size, seq_len]
+    # Get predicted indices for each position in the sequence
+    if temperature > 0:
+        # Apply temperature scaling
+        decoder_output = decoder_output / temperature
 
-        # Convert indices to text for each item in the batch
-        batch_texts = []
-        for indices in pred_indices:
-            text = "".join([dataset.idx2char[idx.item()] for idx in indices])
-            batch_texts.append(text)
+        # Apply softmax - handle 3D tensor
+        probs = F.softmax(decoder_output, dim=-1).cpu()  # Remove seq_len dimension
+
+        # Apply top-k sampling
+        k = 12  # Adjust k value as needed
+        top_k = min(k, probs.size(-1))
+
+        # Zero out probabilities below top k
+        top_k_values, _ = torch.topk(probs, top_k, dim=-1)
+        indices_to_remove = probs < top_k_values[..., -1, None]
+        probs[indices_to_remove] = 0
+
+        # Renormalize probabilities
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        # Sample from the filtered distribution
+        pred_indices = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1).view(probs.size(0), probs.size(1), 1)
+    else:
+        pred_indices = torch.argmax(decoder_output, dim=-1).cpu().unsqueeze(-1)
+
+    # Convert indices to text for each item in the batch
+
+    # start_time = time.time()
+
+    # for indices in pred_indices:
+    #     text = "".join([dataset.idx2char[idx.item()] for idx in indices])
+    #     batch_texts.append(text)
+
+    batch_texts = decode_indices_to_text(pred_indices.view(batch_size, seq_len, hypertoken_seq_len), dataset.idx2char, dataset.pad_token)
+
+    # end_time = time.time()
+    # print(f"Time taken to decode: {end_time - start_time:.4f} seconds")
 
     return batch_texts
 
@@ -58,64 +103,60 @@ def evaluate_model(
 
     total_loss = 0
     batch_count = 0
-    exact_matches = 0
-    total_samples = 0
-    matching_chars = 0
-    total_chars = 0
 
-    with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
-        for x, y in dataloader:
-            x = x.to(device)
-            y_encoded = y[0].to(device)
-            y_target_chars = y[1].to(device)
+    for x, y in dataloader:
+        x_chars = x
+        y_chars = y
 
-            jpt_output, loss = inference_and_loss_step(model, decoder_model, x, y_encoded, y_target_chars)
+        jpt_output, loss = inference_and_loss_step(model, decoder_model, x_chars, y_chars)
 
-            total_loss += loss.item()
-            batch_count += 1
+        total_loss += loss.item()
+        batch_count += 1
 
-            final_embedding = jpt_output[:, -1]
-            final_target_encoded = y_encoded[:, -1]
-            final_target_chars = y_target_chars[:, -1]
+        target_texts = decode_indices_to_text(y_chars, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
 
-            target_texts = batch_tensor_to_text(final_target_chars, dataloader.dataset.idx2char)
+        if from_hypertoken:
 
-            if from_hypertoken:
+            # we are actually dealing with hypertokens not characters and character probabilities
+            final_hypertoken_pred = jpt_output
+            pred_texts = decode_text_from_hypertoken(dataloader.dataset, final_hypertoken_pred, decoder_model)
 
-                # we are actually dealing with hypertokens not characters and character probabilities
-                final_hypertoken_pred = final_embedding
-                pred_texts = decode_text_from_hypertoken(final_hypertoken_pred, decoder_model)
+        else:
 
-            else:
+            pred_indices = torch.argmax(jpt_output, dim=-1).unsqueeze(1)
 
-                pred_indices = torch.argmax(final_embedding, dim=-1).unsqueeze(1)
+            pred_texts = decode_indices_to_text(pred_indices, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
 
-                pred_texts = batch_tensor_to_text(pred_indices, dataloader.dataset.idx2char)
+        char_total = 0
+        token_total = 0
+        char_matches_total = 0
+        token_matches_total = 0
 
-            # Count exact matches
-            exact_matches += sum(1 for pred, target in zip(pred_texts, target_texts) if pred == target)
-            total_samples += len(pred_texts)
+        start_time = time.time()
 
-            # Add character-level accuracy calculation
-            for pred, target in zip(pred_texts, target_texts):
-                total_chars += len(target)
-                matching_chars += sum(p == t for p, t in zip(pred, target))
-                # for p, t in zip(pred, target):
-                #     print(f"pred: {p}, target: {t}, {"!" if p == t else " "}")
+        accuracy_metrics = calculate_text_accuracy(pred_texts, target_texts)
 
-            if batch_count % 10 == 0:
-                print(f"\nSample {batch_count}:")
-                # print(f"Target: {target_texts[0]}")
-                # print(f"Pred:   {pred_texts[0]}")
-                print(f"Current sequence accuracy: {exact_matches/total_samples:.2%}")
-                print(f"Current character accuracy: {matching_chars/total_chars:.2%}")
+        char_matches_total += accuracy_metrics["char_matches"]
+        token_matches_total += accuracy_metrics["token_matches"]
+        char_total += accuracy_metrics["char_count"]
+        token_total += accuracy_metrics["token_count"]
+
+        end_time = time.time()
+        # print(f"Time taken to calculate character/token accuracy: {end_time - start_time:.4f} seconds")
+
+        if batch_count % 10 == 0:
+            print(f"\nSample {batch_count}:")
+            # print(f"Target: {target_texts[0]}")
+            # print(f"Pred:   {pred_texts[0]}")
+            print(f"Current sequence accuracy: {token_matches_total/token_total:.2%}")
+            print(f"Current character accuracy: {char_matches_total/char_total:.2%}")
 
     generate_text(model, decoder_model, " ", 500, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
-        "val_sequence_accuracy": exact_matches / total_samples,
-        "val_char_accuracy": matching_chars / total_chars,
+        "val_sequence_accuracy": token_matches_total / token_total,
+        "val_char_accuracy": char_matches_total / char_total,
     }
 
     model.train()
@@ -123,29 +164,13 @@ def evaluate_model(
 
 
 def calculate_hypertoken_loss(model_output, target_hypertokens):
-    all_preds = model_output
-    all_targets = target_hypertokens
 
-    # # For MSE loss, we don't need to transpose since we're comparing tensors directly
-    # loss = criterion(all_preds, all_targets)
-
-    # Cosine similarity loss - better for comparing vector directions
     cos_similarity = nn.CosineSimilarity(dim=-1)
     cos_loss = 1 - cos_similarity(model_output, target_hypertokens).mean()
 
-    # # L1 loss - less sensitive to outliers than MSE
-    # l1_loss = nn.L1Loss()(model_output, target_hypertokens)
+    loss_mse = F.mse_loss(model_output, target_hypertokens)
 
-    # mse_loss = nn.MSELoss()(model_output, target_hypertokens)
-
-    # # Huber loss - combines best of L1 and MSE
-    # huber_loss = nn.HuberLoss(delta=1.0)(model_output, target_hypertokens)
-
-    # # Smooth L1 - another robust option
-    # smooth_l1_loss = nn.SmoothL1Loss()(model_output, target_hypertokens)
-
-    # Return the normalized approach by default, or combine them if you like
-    return cos_loss
+    return cos_loss + loss_mse * 0.1
 
     # return huber_loss
 
@@ -158,27 +183,40 @@ def calculate_loss(model_output, target_chars):
     return loss
 
 
-def inference_and_loss_step(model, decoder_model, x, y_encoded, y_target_chars):
+def inference_and_loss_step(model, decoder_model, x_chars, y_chars):
 
-    encoded_seq = x
+    decoder_device = next(decoder_model.parameters()).device
+
+    seq_len = x_chars.shape[1]
 
     with autocast(device_type="cuda", dtype=torch.bfloat16):
+
+        all_chars = torch.cat([x_chars, y_chars[:, -1:]], dim=1)
+
+        hypertokens = dataset.encode_to_hypertokens(all_chars)
+        hypertokens = torch.stack(hypertokens)
+        x_hypertokens = hypertokens[:, :-1]
+        y_hypertokens = hypertokens[:, 1:]
+
         # Forward through JPT1
-        jpt_output = model(encoded_seq)
-        last_n = 256
-        last_n_hypertokens = jpt_output[:, -last_n:]
-        last_n_hypertokens = last_n_hypertokens.reshape(-1, last_n_hypertokens.shape[2])
+        jpt_output = model(x_hypertokens)  # [batch_size, seq_len, hypertoken_size]
 
-        last_n_target_chars = y_target_chars[:, -last_n:].reshape(-1, 1).unsqueeze(1)
+        # Get decoder output for each token
+        batch_size, seq_len, _ = jpt_output.shape
 
-        decoded_hypertokens = decoder_model(last_n_hypertokens)
+        # Reshape to decode one token at a time
+        hypertokens_output = jpt_output.reshape(batch_size * seq_len, 1, -1)
+        decoded = decoder_model(hypertokens_output)  # [batch_size * seq_len, 1, vocab_size]
 
-        loss_ce = calculate_loss(decoded_hypertokens, last_n_target_chars)
+        # Reshape targets
+        targets = y_chars.reshape(-1)
 
-        loss_ht = calculate_hypertoken_loss(jpt_output, y_encoded)
-        # print("loss_ce", loss_ce.item())
-        # loss = loss_ht + loss_ce * 0.5
-        loss = loss_ce + loss_ht
+        # Calculate losses
+        loss_ce = F.cross_entropy(decoded.view(-1, decoded.shape[-1]), targets.to(decoder_device))
+        loss_ht = calculate_hypertoken_loss(jpt_output, y_hypertokens)
+
+        # Maybe scale cross entropy loss down
+        loss = loss_ht + loss_ce * 0.01
 
     return jpt_output, loss
 
@@ -196,13 +234,8 @@ def train_model(
 
     # Freeze decoder parameters to prevent updates
     for param in decoder_model.parameters():
-        param.requires_grad = True
-    decoder_model.train()  # Set decoder to evaluation mode
-
-    # only if not debugging
-    if sys.gettrace() is None:  # No debugger attached
-        model = torch.compile(model)
-        decoder_model = torch.compile(decoder_model)
+        param.requires_grad = False
+    decoder_model.eval()  # Set decoder to evaluation mode
 
     count_parameters(model)
     count_parameters(decoder_model)
@@ -212,6 +245,7 @@ def train_model(
         list(model.parameters()) + list(decoder_model.parameters()),
         # model.parameters(),
         lr=config["lr"],
+        fused=True,
     )
 
     # Create optimizer with Lion instead of AdamW
@@ -235,14 +269,6 @@ def train_model(
     # set hypertoken output mode
     hypertoken_output = True
 
-    # evaluate_model(
-    #     model,
-    #     decoder_model,
-    #     val_dataloader,
-    #     device,
-    #     from_hypertoken=hypertoken_output,
-    # )
-
     current_lr = config["lr"]
     low_loss = 10000
 
@@ -251,24 +277,37 @@ def train_model(
 
     loss_history = []
 
-    eval_every_n_samples = 50000
+    eval_every_n_samples = 100000
     samples_since_eval = 0
+
+    batches_per_epoch = 100000 // config["batch_size"]
+
+    wandb.watch(model, log_freq=batches_per_epoch, log="all")
+
+    eval_results = evaluate_model(
+        model,
+        decoder_model,
+        val_dataloader,
+        device,
+        from_hypertoken=hypertoken_output,
+    )
 
     for epoch in range(config["epochs"]):
         epoch_loss = 0
         batch_count = 0
         optimizer.param_groups[0]["lr"] = current_lr
 
+        train_epoch_start = time.time()
+        tokens_processed = 0
+
         for segment in range(data_segments):
             segment_loss = 0
             segment_batch_count = 0
-            fetch_start_time = time.time()
-            train_step_start = fetch_start_time
+
             for x, y in train_dataloader:
 
-                x.to(device)
-                y_encoded = y[0].to(device)
-                y_target_chars = y[1].to(device)
+                x_chars = x
+                y_chars = y
 
                 samples_since_eval += x.shape[0]
 
@@ -289,7 +328,7 @@ def train_model(
 
                 total_training_examples += x.shape[0]
 
-                jpt_output, loss = inference_and_loss_step(model, decoder_model, x, y_encoded, y_target_chars)
+                jpt_output, loss = inference_and_loss_step(model, decoder_model, x_chars, y_chars)
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -308,27 +347,24 @@ def train_model(
 
                 # Log batch metrics
 
-                if batch_count % 10 == 0:
-
-                    wandb.log(
-                        {
-                            "batch_loss": current_mean_loss,
-                            "learning_rate": optimizer.param_groups[0]["lr"],
-                            "epoch": epoch,
-                        }
-                    )
-
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 # scheduler.step()
 
-                train_step_end = time.time()
+                tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
+                if batch_count % 10 == 0:
+                    train_epoch_time = time.time() - train_epoch_start
+                    tokens_per_second = tokens_processed / train_epoch_time
+                    wandb.log(
+                        {
+                            "batch_loss": current_mean_loss,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                            "epoch": epoch,
+                            "tokens_per_second": tokens_per_second,
+                        }
+                    )
 
-                train_step_start = train_step_end
-                fetch_start_time = train_step_start
-
-            # Log segment metrics
             avg_segment_loss = segment_loss / segment_batch_count
 
         val_loss = eval_results["val_loss"]
@@ -401,6 +437,10 @@ def verify_model_params(config: dict):
     multiple = config["jpt_embed_dim"] // config["hypertoken_size"]
     if multiple <= 1:
         raise ValueError(f"embed_dim must be at least 2x hypertoken_size. Current ratio: {multiple}")
+
+    # because we tile in the hypertoken into the jpt_embed_dim
+    if config["jpt_embed_dim"] % config["hypertoken_size"] != 0:
+        raise ValueError(f"embed_dim ({config['jpt_embed_dim']}) must be a multiple of hypertoken_size ({config['hypertoken_size']})")
 
 
 def load_model(
@@ -480,36 +520,35 @@ def validate_hypertoken_models(
 
     good_count = 0
 
-    with torch.inference_mode():
-        for i in range(num_samples):
-            input_chunk = dataset.get_batch_item(i, chunk_count=1, chunk_size=hypertoken_seq_len)
-            input_chunk = input_chunk.view(-1).to(device)
+    for i in range(num_samples):
+        input_chunk = dataset.get_batch_item(i, chunk_count=1, chunk_size=hypertoken_seq_len)
+        input_chunk = input_chunk.view(-1).to(device)
 
-            # Convert to text for display
-            input_text = "".join([dataset.idx2char[idx.item()] for idx in input_chunk])
+        # Convert to text for display
+        input_text = "".join([dataset.idx2char[idx.item()] for idx in input_chunk])
 
+        with torch.inference_mode():
             # Encode
             encoded = encoder(input_chunk.unsqueeze(0))
-
             # Decode
             decoded = decoder(encoded)
 
-            # Get predicted text
-            pred_indices = torch.argmax(decoded, dim=-1)[0]
-            output_text = "".join([dataset.idx2char[idx.item()] for idx in pred_indices])
+        # Get predicted text
+        pred_indices = torch.argmax(decoded, dim=-1)[0]
+        output_text = "".join([dataset.idx2char[idx.item()] for idx in pred_indices])
 
-            # Calculate character accuracy
-            good = output_text == input_text
+        # Calculate character accuracy
+        good = output_text == input_text
 
-            if good:
-                good_count += 1
+        if good:
+            good_count += 1
 
-            accuracy = good_count / (i + 1)
+        accuracy = good_count / (i + 1)
 
-            print(f"\nSample {i+1}:")
-            print(f"Input:  '{input_text}'")
-            print(f"Output: '{output_text}'")
-            print(f"Character Accuracy: {accuracy:.2%}")
+        print(f"\nSample {i+1}:")
+        print(f"Input:  '{input_text}'")
+        print(f"Output: '{output_text}'")
+        print(f"Character Accuracy: {accuracy:.2%}")
 
     print("\nValidation Complete")
 
@@ -537,47 +576,46 @@ def generate_text(
 
     result: [str] = list(prompt)
 
-    with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
-        for i in range(max_new_chars):
+    for i in range(max_new_chars):
 
-            current_context = "".join(result)
-            encoded_list = dataset.encode_to_hypertokens_from_text(current_context)
-            encoded = torch.stack(encoded_list).to(device)
+        current_context = "".join(result)
+        encoded_list = dataset.encode_to_hypertokens_from_text(current_context)
+        encoded = torch.stack(encoded_list).to(device)
 
-            output = jpt_model(encoded)
+        output = jpt_model(encoded)
 
-            logits = output[0, -1]  # get first batch and the final set of logits
+        logits = output[0, -1]  # get first batch and the final set of logits
 
-            if from_hypertoken:
-                hypertoken = logits.unsqueeze(0)
-                pred_texts = decode_text_from_hypertoken(hypertoken, decoder_model)
-                next_char = pred_texts[0][-1]
-            else:
+        if from_hypertoken:
+            hypertoken = logits.unsqueeze(0)
+            pred_texts = decode_text_from_hypertoken(dataset, hypertoken, decoder_model, 0.3)
+            next_char = pred_texts[0][-1]
+        else:
 
-                # Get prediction from JPT1
-                logits /= temperature
+            # Get prediction from JPT1
+            logits /= temperature
 
-                # Apply softmax and handle any numerical instabilities
-                probs = torch.nn.functional.softmax(logits, dim=-1)
+            # Apply softmax and handle any numerical instabilities
+            probs = torch.nn.functional.softmax(logits, dim=-1)
 
-                # Optional: Apply top-k sampling
-                k = 10  # Adjust based on your needs
-                top_k = min(k, probs.size(-1))
-                indices_to_remove = probs < torch.topk(probs, top_k)[0][..., -1, None]
-                probs[indices_to_remove] = 0
-                probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+            # Optional: Apply top-k sampling
+            k = 10  # Adjust based on your needs
+            top_k = min(k, probs.size(-1))
+            indices_to_remove = probs < torch.topk(probs, top_k)[0][..., -1, None]
+            probs[indices_to_remove] = 0
+            probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
 
-                # Sample next character
-                next_char_idx = torch.multinomial(probs, num_samples=1).item()
-                next_char = dataset.idx2char[next_char_idx]
+            # Sample next character
+            next_char_idx = torch.multinomial(probs, num_samples=1).item()
+            next_char = dataset.idx2char[next_char_idx]
 
-            # Print the generated character
-            print(next_char, end="", flush=True)
+        # Print the generated character
+        print(next_char, end="", flush=True)
 
-            result.append(next_char if next_char != "<PAD>" else " ")
+        result.append(next_char if next_char != "<PAD>" else " ")
 
-            if len(result) > jpt_model.seq_len:
-                result.pop(0)
+        if len(result) > jpt_model.seq_len:
+            result.pop(0)
 
     final_text = "".join(result)
     # print(f"\nFinal text:\n{final_text}")
@@ -590,26 +628,30 @@ if __name__ == "__main__":
     experiments: list[dict] = [
         {
             "seq_len": sl,
-            "hypertoken_seq_len": 1,
-            "hypertoken_size": 32,
+            "hypertoken_seq_len": 2,
+            "hypertoken_size": 64,
             "epochs": epochs,
             "batch_size": 64,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
-            "hypertoken_embed_dim": 128,
+            "hypertoken_embed_dim": 256,
             "jpt_embed_dim": jed,
-            "compress_factor": 2,
+            "compress_factor": 4,
             "data_segments": 10,
             "dropout": dropout,
+            "expand_method": expand_method,
         }
-        for n_layers in [8]  # Varying n_layers
-        for head_size in [32]  # Varying head_size
+        for n_layers in [6]  # Varying n_layers
+        for head_size in [64]  # Varying head_size
         for jed in [384]
-        for lr in [0.0003]
+        for lr in [0.001]
         for sl in [256]
         for epochs in [2]
-        for dropout in [0.25]
+        for dropout in [0.3]
+        for expand_method in [
+            ExpandMethod.TILED,
+        ]
     ]
 
     enable_torch_optimizations()
@@ -632,6 +674,7 @@ if __name__ == "__main__":
         hypertoeken_compress_factor = experiment["compress_factor"]
         data_segments = experiment["data_segments"]
         dropout = experiment["dropout"]
+        expand_method = experiment["expand_method"]
         # load this just to get the vocab size
         if vocab_size == 0:
             tmp_dset = TinyShakespeareDataset(
@@ -668,14 +711,14 @@ if __name__ == "__main__":
         h_encoder_model = load_model(
             h_encoder_model,
             "saved_models",
-            "hypertoken_2025-01-14T02:13:00.639557_encode_last_n_length1_hypertoken_size32",
+            "hypertoken_2025-01-21T01:10:39.914403_encode_last_n_length2_hypertoken_size64",
             encoder_only=True,
         )
 
-        h_decoder_model = load_model(
+        h_model = load_model(
             h_decoder_model,
             "saved_models",
-            "hypertoken_2025-01-14T02:13:00.639557_encode_last_n_length1_hypertoken_size32",
+            "hypertoken_2025-01-21T01:10:39.914403_encode_last_n_length2_hypertoken_size64",
             decoder_only=True,
         )
 
@@ -688,7 +731,7 @@ if __name__ == "__main__":
         )
         vocab_size = len(dataset.char2idx)
 
-        gptModel = JPT1(
+        gpt_model = JPT1(
             vocab_size=vocab_size,
             seq_len=seq_len,
             embed_dim=jpt_embed_dim,
@@ -696,6 +739,7 @@ if __name__ == "__main__":
             num_layers=n_layers,
             dropout=dropout,
             hypertoken_size=hypertoken_size,
+            expand_method=expand_method,
         ).to(DEVICE)
 
         dataloader = DataLoader(
@@ -718,13 +762,21 @@ if __name__ == "__main__":
             batch_size=batch_size,
         )
 
+        # only if not debugging
+        if sys.gettrace() is None:  # No debugger attached
+            print("Compiling models...")
+            gpt_model = torch.compile(gpt_model)
+            h_decoder_model = torch.compile(h_decoder_model)
+            h_encoder_model = torch.compile(h_encoder_model)
+            print("Models compiled!")
+
         verify_model_params(experiment)
 
         validate_hypertoken_models(h_encoder_model, h_decoder_model, dataset, hypertoken_seq_len)
 
         # create wrapper function for train_model
         def train_model_lambda(wandb):
-            model = train_model(wandb, gptModel, h_decoder_model, dataloader, val_dataloader, experiment)
+            model = train_model(wandb, gpt_model, h_decoder_model, dataloader, val_dataloader, experiment)
             return model[0]
 
         project_name = "jpt1"

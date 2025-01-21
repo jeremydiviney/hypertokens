@@ -1,31 +1,31 @@
+import sys
+import os
+from datetime import datetime
+from typing import Optional, Any
+
+import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torch
-from helpers.experiments import run_experiment, count_parameters
+from torch.utils.data import DataLoader
+from datasources.tinyshakespeare import TinyShakespeareDataset, decode_indices_to_text
+import torch.nn.functional as F
 from lion_pytorch import Lion
-from torch.utils.checkpoint import checkpoint
-import os
-from typing import Optional, Any
+
 from models.hypertoken_auto_encoder import (
-    HyperTokenEncoder,
-    HyperTokenDecoder,
     HyperTokenAutoencoder,
 )
-from datetime import datetime
-from datasources.tinyshakespeare import TinyShakespeareDataset
+
+from helpers.experiments import run_experiment, count_parameters
+
 from helpers.training import (
     enable_torch_optimizations,
     setup_flash_attention,
 )
-import sys
-from transformers import get_linear_schedule_with_warmup
-from helpers.training import batch_tensor_to_text
+
+from helpers.utilities import calculate_text_accuracy
 
 
-def save_model(
-    model: Any, save_dir: str, model_name: str, save_separate: bool = True
-) -> None:
+def save_model(model: Any, save_dir: str, model_name: str, save_separate: bool = True) -> None:
     """
     Save the model state. Optionally save encoder and decoder separately.
 
@@ -56,66 +56,94 @@ def save_model(
 # --------------------------------------------------
 
 
-def evaluate_model(
-    model: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: str
-) -> dict:
+def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dict:
     """Evaluate model on given dataloader"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model.eval()
     total_loss = 0
     batch_count = 0
-    exact_matches = 0
-    total_samples = 0
-    # Add character-level tracking
-    matching_chars = 0
-    total_chars = 0
+    token_matches_total = 0
+    char_matches_total = 0
+    token_total = 0
+    char_total = 0
+
+    vocab_size = len(dataloader.dataset.char2idx)
+    encode_last_n_length = dataloader.dataset.encode_last_n_length
+
+    dataset = dataloader.dataset
 
     with torch.inference_mode():
         for x, y in dataloader:
-            x = x.to(device)  # x is in int (char index)
-            y = y.to(device)  # y is in int (char index)
+            x = x.to(device)
+            y = y.to(device)
             logits = model(x)
-            loss = criterion(
-                logits.reshape(-1, len(dataloader.dataset.char2idx)),
-                y[:, -dataloader.dataset.encode_last_n_length :].reshape(-1),
-            ).mean()
+
+            loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, encode_last_n_length=encode_last_n_length)
             total_loss += loss.item()
             batch_count += 1
 
-            pred_logits = logits[:, -dataloader.dataset.encode_last_n_length :]
-            pred_indices = torch.argmax(pred_logits, dim=-1)
+            pred_logits = logits[:, -encode_last_n_length:]
+            pred_indices = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
 
-            target_seqs = y[:, -dataloader.dataset.encode_last_n_length :]
-            target_texts = batch_tensor_to_text(
-                target_seqs, dataloader.dataset.idx2char
-            )
-            pred_texts = batch_tensor_to_text(pred_indices, dataloader.dataset.idx2char)
+            target_seqs = y[:, -encode_last_n_length:].unsqueeze(0)  # reshape to [1, seq_len, encode_last_n_length]
+            target_texts = decode_indices_to_text(target_seqs, dataset.idx2char, dataset.pad_token)
+            pred_texts = decode_indices_to_text(pred_indices, dataset.idx2char, dataset.pad_token)
 
-            # Count exact matches
-            exact_matches += sum(
-                1 for pred, target in zip(pred_texts, target_texts) if pred == target
-            )
-            total_samples += len(pred_texts)
+            accuracy_metrics = calculate_text_accuracy(pred_texts, target_texts)
 
-            # Add character-level accuracy calculation
-            for pred, target in zip(pred_texts, target_texts):
-                total_chars += len(target)
-                matching_chars += sum(p == t for p, t in zip(pred, target))
+            char_matches_total += accuracy_metrics["char_matches"]
+            token_matches_total += accuracy_metrics["token_matches"]
+            char_total += accuracy_metrics["char_count"]
+            token_total += accuracy_metrics["token_count"]
+
+            char_accuracy = char_matches_total / char_total
+            token_accuracy = token_matches_total / token_total
 
             if batch_count % 10 == 0:
                 print(f"\nSample {batch_count}:")
-                print(f"Target: {target_texts[0]}")
-                print(f"Pred: {pred_texts[0]}")
-                print(f"Current sequence accuracy: {exact_matches/total_samples:.2%}")
-                print(f"Current character accuracy: {matching_chars/total_chars:.2%}")
+                print(f"Target: {target_texts.squeeze(0)[0]}")
+                print(f"Pred: {pred_texts.squeeze(0)[0]}")
+                print(f"Current sequence accuracy: {token_accuracy:.4%}")
+                print(f"Current character accuracy: {char_accuracy:.4%}")
 
     model.train()
     return {
         "val_loss": total_loss / batch_count,
-        "val_sequence_accuracy": exact_matches / total_samples,
-        "val_char_accuracy": matching_chars / total_chars,
+        "val_sequence_accuracy": token_accuracy,
+        "val_char_accuracy": char_accuracy,
     }
+
+
+def calculate_loss(
+    model: nn.Module, logits: torch.Tensor, target: torch.Tensor, vocab_size: int, encode_last_n_length: int, hypertoken_weight: float = 1, spread_weight: float = 1
+) -> tuple[torch.Tensor, dict]:
+    # Calculate main loss
+    loss_per_pos = F.cross_entropy(logits.reshape(-1, vocab_size), target[:, -encode_last_n_length:].reshape(-1), reduction="mean")
+
+    # Calculate hypertoken normalization loss
+    hypertoken_norms = torch.norm(model.hypertoken, p=2, dim=1)
+    loss_mse = F.mse_loss(hypertoken_norms, torch.ones_like(hypertoken_norms))
+
+    # print("hypertoken_norms.mean()", hypertoken_norms.mean().item(), hypertoken_norms.max().item(), hypertoken_norms.min().item())
+
+    # -- Spread penalty --
+    # 1) Normalize hypertokens
+    ht_norm = F.normalize(model.hypertoken, p=2, dim=1)  # shape [batch_size, hypertoken_size]
+
+    # # 2) Compute dot products
+    dot_matrix = ht_norm @ ht_norm.T  # shape [batch_size, batch_size]
+
+    # # 3) Create a mask that is True if targets differ, False if same
+    mask_diff = (target != target.unsqueeze(1)).any(-1)
+
+    # # 4) Spread loss is mean of squared dot products where targets differ
+    loss_spread = (dot_matrix[mask_diff] ** 2).mean()
+
+    # -- Combine total loss --
+    total_loss = loss_per_pos + hypertoken_weight * loss_mse + spread_weight * loss_spread
+
+    return total_loss
 
 
 def train_model(wandb, model, dataloader, val_dataloader, config: dict):
@@ -134,7 +162,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     count_parameters(model)
 
-    # optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.AdamW(model.parameters(), lr=lr)
 
     optimizer = Lion(
         model.parameters(),
@@ -142,7 +170,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
         weight_decay=1e-2,  # Lion typically works better with higher weight decay
     )
 
-    criterion = nn.CrossEntropyLoss()
+    evaluate_model(model, val_dataloader, device)
 
     total_steps = epochs * len(dataloader) * data_segments
 
@@ -178,11 +206,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
                 y = y.to(device)  # y is in int (char index)
 
                 logits = model(x)
-                loss_per_pos = criterion(
-                    logits.reshape(-1, vocab_size),
-                    y[:, -encode_last_n_length:].reshape(-1),
-                )
-                loss = loss_per_pos.mean()
+                loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, encode_last_n_length=encode_last_n_length)
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -213,7 +237,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
             avg_segment_loss = segment_loss / segment_batch_count
 
         # Log epoch metrics
-        eval_results = evaluate_model(model, val_dataloader, criterion, device)
+        eval_results = evaluate_model(model, val_dataloader, device)
         val_loss = eval_results["val_loss"]
         val_sequence_accuracy = eval_results["val_sequence_accuracy"]
         val_char_accuracy = eval_results["val_char_accuracy"]
@@ -229,7 +253,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
         )
 
         print(
-            f"Epoch {epoch} train_loss: {avg_segment_loss:.4f}, val_loss: {val_loss:.4f}, val_sequence_accuracy: {val_sequence_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}"
+            f"Epoch {epoch} train_loss: {avg_segment_loss:.6f}, val_loss: {val_loss:.6f}, val_sequence_accuracy: {val_sequence_accuracy:.6%}, val_char_accuracy: {val_char_accuracy:.6%}"
         )
 
     # After training loop ends, save the model
@@ -264,9 +288,7 @@ def verify_model_params(
         raise ValueError("hypertoken_size must be greater than or equal to seq_len")
 
     if hypertoken_size < encode_last_n_length:
-        raise ValueError(
-            "encode_last_n_length must be greater than or equal to hypertoken_size"
-        )
+        raise ValueError("encode_last_n_length must be greater than or equal to hypertoken_size")
 
     # Add check for embed_dim being multiple of seq_len
     if hypertoken_size % seq_len != 0:
@@ -325,23 +347,24 @@ if __name__ == "__main__":
     # Define experiments
     experiments: list[dict] = [
         {
-            "seq_len": 1,
-            "encode_last_n_length": 1,
+            "seq_len": 2,
+            "encode_last_n_length": 2,
             "hypertoken_size": hs,
-            "epochs": 3,
-            "batch_size": 512,
+            "epochs": 2,
+            "batch_size": bs,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
             "embed_dim": ed,
             "compress_factor": cf,
         }
-        for hs in [32]  # Varying hypertoken_size
-        for ed in [128]  # Varying embed_dim
+        for hs in [64]  # Varying hypertoken_size
+        for ed in [256]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
         for head_size in [16]  # Varying head_size
         for lr in [0.0001]
-        for cf in [2]
+        for cf in [4]
+        for bs in [256]
     ]
 
     enable_torch_optimizations()
@@ -358,13 +381,11 @@ if __name__ == "__main__":
         n_layers = experiment["n_layers"]
         head_size = experiment["head_size"]
         embed_dim = experiment["embed_dim"]
-        segments = 10
+        SEGMENTS = 10
 
         # model = load_model(model, "saved_models", "hypertoken_2025-01-10T00:21:59.914619_encode_last_n_length128_hypertoken_size512")
 
-        dataset = TinyShakespeareDataset(
-            encode_last_n_length, segments=segments, seq_len=seq_len
-        )
+        dataset = TinyShakespeareDataset(encode_last_n_length, segments=SEGMENTS, seq_len=seq_len)
         vocab_size = len(dataset.char2idx)
         dataloader = DataLoader(
             dataset,
@@ -376,9 +397,7 @@ if __name__ == "__main__":
             prefetch_factor=2,  # Number of batches loaded in advance per worker)
         )
 
-        val_dataset = TinyShakespeareDataset(
-            encode_last_n_length, segments=segments, seq_len=seq_len, type="validation"
-        )
+        val_dataset = TinyShakespeareDataset(encode_last_n_length, segments=SEGMENTS, seq_len=seq_len, type="validation")
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,

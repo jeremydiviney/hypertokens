@@ -48,6 +48,7 @@ def load_model(model: Model, load_dir: str, model_name: str, device: Optional[st
 # 2. Enable torch.backends optimizations
 def enable_torch_optimizations():
     if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
         # Enable TF32 for faster matrix multiplications
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -71,27 +72,3 @@ def setup_flash_attention():
         return flash_available
     print("CUDA not available, Flash Attention disabled")
     return False
-
-
-def batch_tensor_to_text(batch_tensor: torch.Tensor, idx2char: dict) -> list[str]:
-    """Convert batch of tensors to text efficiently by moving data to CPU once"""
-    # Move entire tensor to CPU at once and convert to numpy
-    sequences = batch_tensor.cpu().numpy()
-    pad_token = len(idx2char) - 1
-
-    # # Handle 1D array (single sequence)
-    # if sequences.ndim == 1:
-    #     return [idx2char[int(idx)] for idx in sequences if int(idx) != pad_token]
-
-    # # Handle batch of sequences
-    # return [
-    #     (idx2char[int(idx)] for idx in seq if int(idx) != pad_token)
-    #     for seq in sequences
-    # ]
-
-    # Handle 1D array (single sequence)
-    if sequences.ndim == 1:
-        return ["".join(idx2char[int(idx)] for idx in sequences if int(idx) != pad_token)]
-
-    # Handle batch of sequences
-    return ["".join(idx2char[int(idx)] for idx in seq if int(idx) != pad_token) for seq in sequences]
