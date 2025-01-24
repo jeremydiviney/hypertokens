@@ -37,7 +37,10 @@ from helpers.utilities import calculate_text_accuracy
 
 @typechecked
 def decode_text_from_hypertoken(
-    dataset: Dataset, hypertoken: TensorType["batch_size", "seq_len", "hypertoken_size"], decoder: nn.Module, temperature: float = 0
+    dataset: Dataset,
+    hypertoken: TensorType["batch_size", "seq_len", "hypertoken_size"],
+    decoder: nn.Module,
+    temperature: float = 0,
 ) -> np.ndarray[str]:  # --->["batch_size", "seq_len", "character"]:
 
     decoder.eval()
@@ -71,7 +74,9 @@ def decode_text_from_hypertoken(
         probs = probs / probs.sum(dim=-1, keepdim=True)
 
         # Sample from the filtered distribution
-        pred_indices = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1).view(probs.size(0), probs.size(1), 1)
+        pred_indices = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1).view(
+            probs.size(0), probs.size(1), probs.size(2)
+        )
     else:
         pred_indices = torch.argmax(decoder_output, dim=-1).cpu().unsqueeze(-1)
 
@@ -83,7 +88,9 @@ def decode_text_from_hypertoken(
     #     text = "".join([dataset.idx2char[idx.item()] for idx in indices])
     #     batch_texts.append(text)
 
-    batch_texts = decode_indices_to_text(pred_indices.view(batch_size, seq_len, hypertoken_seq_len), dataset.idx2char, dataset.pad_token)
+    batch_texts = decode_indices_to_text(
+        pred_indices.view(batch_size, seq_len, hypertoken_seq_len), dataset.idx2char, dataset.pad_token
+    )
 
     # end_time = time.time()
     # print(f"Time taken to decode: {end_time - start_time:.4f} seconds")
@@ -101,14 +108,23 @@ def evaluate_model(
     model.eval()
     decoder_model.eval()
 
+    dataset = dataloader.dataset
+
     total_loss = 0
     batch_count = 0
 
-    for x, y in dataloader:
-        x_chars = x
-        y_chars = y
+    char_matches_total = 0
+    token_matches_total = 0
+    char_total = 0
+    token_total = 0
 
-        jpt_output, loss = inference_and_loss_step(model, decoder_model, x_chars, y_chars)
+    for x, y in dataloader:
+        x_chars = x.to(device)
+        y_chars = y.to(device)
+
+        start_time = time.time()
+
+        jpt_output, loss = inference_and_loss_step(dataset, model, decoder_model, x_chars, y_chars)
 
         total_loss += loss.item()
         batch_count += 1
@@ -127,13 +143,6 @@ def evaluate_model(
 
             pred_texts = decode_indices_to_text(pred_indices, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
 
-        char_total = 0
-        token_total = 0
-        char_matches_total = 0
-        token_matches_total = 0
-
-        start_time = time.time()
-
         accuracy_metrics = calculate_text_accuracy(pred_texts, target_texts)
 
         char_matches_total += accuracy_metrics["char_matches"]
@@ -142,20 +151,19 @@ def evaluate_model(
         token_total += accuracy_metrics["token_count"]
 
         end_time = time.time()
-        # print(f"Time taken to calculate character/token accuracy: {end_time - start_time:.4f} seconds")
+        # print(f"Time taken to do evaluation step: {end_time - start_time:.4f} seconds")
 
-        if batch_count % 10 == 0:
-            print(f"\nSample {batch_count}:")
-            # print(f"Target: {target_texts[0]}")
-            # print(f"Pred:   {pred_texts[0]}")
-            print(f"Current sequence accuracy: {token_matches_total/token_total:.2%}")
-            print(f"Current character accuracy: {char_matches_total/char_total:.2%}")
+        print(f"\nSample {batch_count}:")
+        # print(f"Target: {target_texts[0]}")
+        # print(f"Pred:   {pred_texts[0]}")
+        print(f"Current token accuracy: {token_matches_total/token_total:.2%}")
+        print(f"Current character accuracy: {char_matches_total/char_total:.2%}")
 
     generate_text(model, decoder_model, " ", 500, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
-        "val_sequence_accuracy": token_matches_total / token_total,
+        "val_token_accuracy": token_matches_total / token_total,
         "val_char_accuracy": char_matches_total / char_total,
     }
 
@@ -183,7 +191,7 @@ def calculate_loss(model_output, target_chars):
     return loss
 
 
-def inference_and_loss_step(model, decoder_model, x_chars, y_chars):
+def inference_and_loss_step(dataset, model, decoder_model, x_chars, y_chars):
 
     decoder_device = next(decoder_model.parameters()).device
 
@@ -193,7 +201,7 @@ def inference_and_loss_step(model, decoder_model, x_chars, y_chars):
 
         all_chars = torch.cat([x_chars, y_chars[:, -1:]], dim=1)
 
-        hypertokens = dataset.encode_to_hypertokens(all_chars)
+        hypertokens = dataset.encode_to_hypertokens(all_chars, seq_len + 1)
         hypertokens = torch.stack(hypertokens)
         x_hypertokens = hypertokens[:, :-1]
         y_hypertokens = hypertokens[:, 1:]
@@ -205,18 +213,18 @@ def inference_and_loss_step(model, decoder_model, x_chars, y_chars):
         batch_size, seq_len, _ = jpt_output.shape
 
         # Reshape to decode one token at a time
-        hypertokens_output = jpt_output.reshape(batch_size * seq_len, 1, -1)
-        decoded = decoder_model(hypertokens_output)  # [batch_size * seq_len, 1, vocab_size]
+        # hypertokens_output = jpt_output.reshape(batch_size * seq_len, 1, -1)
+        # decoded = decoder_model(hypertokens_output)  # [batch_size * seq_len, 1, vocab_size]
 
         # Reshape targets
-        targets = y_chars.reshape(-1)
+        # targets = y_chars.reshape(-1)
 
         # Calculate losses
-        loss_ce = F.cross_entropy(decoded.view(-1, decoded.shape[-1]), targets.to(decoder_device))
+        # loss_ce = F.cross_entropy(decoded.view(-1, decoded.shape[-1]), targets.to(decoder_device))
         loss_ht = calculate_hypertoken_loss(jpt_output, y_hypertokens)
 
         # Maybe scale cross entropy loss down
-        loss = loss_ht + loss_ce * 0.01
+        loss = loss_ht  # + loss_ce * 0.01
 
     return jpt_output, loss
 
@@ -242,8 +250,8 @@ def train_model(
 
     # Create optimizer for both JPT1 and decoder model parameters
     optimizer = optim.AdamW(
-        list(model.parameters()) + list(decoder_model.parameters()),
-        # model.parameters(),
+        # list(model.parameters()) + list(decoder_model.parameters()),
+        model.parameters(),
         lr=config["lr"],
         fused=True,
     )
@@ -268,6 +276,8 @@ def train_model(
 
     # set hypertoken output mode
     hypertoken_output = True
+
+    dataset = train_dataloader.dataset
 
     current_lr = config["lr"]
     low_loss = 10000
@@ -304,12 +314,16 @@ def train_model(
             segment_loss = 0
             segment_batch_count = 0
 
+            train_step_start = time.time()
+
             for x, y in train_dataloader:
 
-                x_chars = x
-                y_chars = y
+                x_tokens = x
+                y_tokens = y
 
                 samples_since_eval += x.shape[0]
+
+                # print(f"Samples since eval: {samples_since_eval}")
 
                 if samples_since_eval >= eval_every_n_samples:
                     eval_results = evaluate_model(model, decoder_model, val_dataloader, device, hypertoken_output)
@@ -317,7 +331,7 @@ def train_model(
                     wandb.log(
                         {
                             "val_loss": eval_results["val_loss"],
-                            "val_sequence_accuracy": eval_results["val_sequence_accuracy"],
+                            "val_token_accuracy": eval_results["val_token_accuracy"],
                             "val_char_accuracy": eval_results["val_char_accuracy"],
                             "epoch": epoch,
                         }
@@ -328,7 +342,12 @@ def train_model(
 
                 total_training_examples += x.shape[0]
 
-                jpt_output, loss = inference_and_loss_step(model, decoder_model, x_chars, y_chars)
+                start_time = time.time()
+
+                jpt_output, loss = inference_and_loss_step(dataset, model, decoder_model, x_tokens, y_tokens)
+
+                end_time = time.time()
+                # print(f"Time taken to do inference and loss step: {end_time - start_time:.4f} seconds")
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -347,12 +366,20 @@ def train_model(
 
                 # Log batch metrics
 
+                start_time = time.time()
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 # scheduler.step()
+                end_time = time.time()
+                # print(f"Time taken to do optimizer step: {end_time - start_time:.4f} seconds")
 
                 tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
+
+                train_step_end = time.time()
+                # print(f"Time taken to do train step: {train_step_end - train_step_start:.4f} seconds")
+
                 if batch_count % 10 == 0:
                     train_epoch_time = time.time() - train_epoch_start
                     tokens_per_second = tokens_processed / train_epoch_time
@@ -365,10 +392,12 @@ def train_model(
                         }
                     )
 
+                train_step_start = time.time()
+
             avg_segment_loss = segment_loss / segment_batch_count
 
         val_loss = eval_results["val_loss"]
-        val_sequence_accuracy = eval_results["val_sequence_accuracy"]
+        val_token_accuracy = eval_results["val_token_accuracy"]
         val_char_accuracy = eval_results["val_char_accuracy"]
 
         wandb.log(
@@ -380,7 +409,7 @@ def train_model(
 
         print(
             f"Epoch {epoch} train_loss: {avg_segment_loss:.4f}, val_loss: {val_loss:.4f}, "
-            f"val_sequence_accuracy: {val_sequence_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}"
+            f"val_token_accuracy: {val_token_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}"
         )
 
     # Final Evaluation
@@ -398,7 +427,7 @@ def train_model(
         {
             "epoch_loss": epoch_loss / batch_count,
             "val_loss": eval_results["val_loss"],
-            "val_sequence_accuracy": eval_results["val_sequence_accuracy"],
+            "val_token": eval_results["val_token_accuracy"],
             "val_char_accuracy": eval_results["val_char_accuracy"],
             "epoch": epoch,
         }
@@ -429,10 +458,14 @@ def verify_model_params(config: dict):
     Verify model parameters meet requirements
     """
     if config["jpt_embed_dim"] <= config["hypertoken_size"]:
-        raise ValueError(f"embed_dim ({config['jpt_embed_dim']}) must be greater than hypertoken_size ({config['hypertoken_size']})")
+        raise ValueError(
+            f"embed_dim ({config['jpt_embed_dim']}) must be greater than hypertoken_size ({config['hypertoken_size']})"
+        )
 
     if config["jpt_embed_dim"] % config["hypertoken_size"] != 0:
-        raise ValueError(f"embed_dim ({config['jpt_embed_dim']}) must be a multiple of hypertoken_size ({config['hypertoken_size']})")
+        raise ValueError(
+            f"embed_dim ({config['jpt_embed_dim']}) must be a multiple of hypertoken_size ({config['hypertoken_size']})"
+        )
 
     multiple = config["jpt_embed_dim"] // config["hypertoken_size"]
     if multiple <= 1:
@@ -440,7 +473,9 @@ def verify_model_params(config: dict):
 
     # because we tile in the hypertoken into the jpt_embed_dim
     if config["jpt_embed_dim"] % config["hypertoken_size"] != 0:
-        raise ValueError(f"embed_dim ({config['jpt_embed_dim']}) must be a multiple of hypertoken_size ({config['hypertoken_size']})")
+        raise ValueError(
+            f"embed_dim ({config['jpt_embed_dim']}) must be a multiple of hypertoken_size ({config['hypertoken_size']})"
+        )
 
 
 def load_model(
@@ -557,7 +592,7 @@ def generate_text(
     jpt_model: nn.Module,
     decoder_model: nn.Module,
     prompt: str,
-    max_new_chars: int,
+    max_new_tokens: int,
     dataset: HyperTokenTinyShakespeareDataset,
     temperature: float = 0.5,
     from_hypertoken: bool = True,
@@ -576,7 +611,7 @@ def generate_text(
 
     result: [str] = list(prompt)
 
-    for i in range(max_new_chars):
+    for i in range(max_new_tokens):
 
         current_context = "".join(result)
         encoded_list = dataset.encode_to_hypertokens_from_text(current_context)
@@ -584,14 +619,13 @@ def generate_text(
 
         output = jpt_model(encoded)
 
-        logits = output[0, -1]  # get first batch and the final set of logits
-
         if from_hypertoken:
-            hypertoken = logits.unsqueeze(0)
+            hypertoken = output[0:1, -1:, :]
             pred_texts = decode_text_from_hypertoken(dataset, hypertoken, decoder_model, 0.3)
-            next_char = pred_texts[0][-1]
+
         else:
 
+            logits = output[0, -1]  # get first batch and the final set of logits
             # Get prediction from JPT1
             logits /= temperature
 
@@ -607,12 +641,17 @@ def generate_text(
 
             # Sample next character
             next_char_idx = torch.multinomial(probs, num_samples=1).item()
-            next_char = dataset.idx2char[next_char_idx]
+            next_token = dataset.idx2char[next_char_idx]
 
         # Print the generated character
-        print(next_char, end="", flush=True)
 
-        result.append(next_char if next_char != "<PAD>" else " ")
+        pred_text_chars = [char if char != "<PAD>" else "" for char in pred_texts[0][-1]]
+
+        next_token = "".join(pred_text_chars)
+
+        print(next_token, end="", flush=True)
+
+        result.append(next_token)
 
         if len(result) > jpt_model.seq_len:
             result.pop(0)
@@ -637,18 +676,17 @@ if __name__ == "__main__":
             "n_layers": n_layers,
             "hypertoken_embed_dim": 256,
             "jpt_embed_dim": jed,
-            "compress_factor": 4,
             "data_segments": 10,
             "dropout": dropout,
             "expand_method": expand_method,
         }
         for n_layers in [6]  # Varying n_layers
-        for head_size in [64]  # Varying head_size
-        for jed in [384]
+        for head_size in [32, 64]  # Varying head_size
+        for jed in [384, 512]
         for lr in [0.001]
-        for sl in [256]
-        for epochs in [2]
-        for dropout in [0.3]
+        for sl in [128, 256]
+        for epochs in [1]
+        for dropout in [0.2]
         for expand_method in [
             ExpandMethod.TILED,
         ]
@@ -671,7 +709,6 @@ if __name__ == "__main__":
         n_layers = experiment["n_layers"]
         head_size = experiment["head_size"]
         jpt_embed_dim = experiment["jpt_embed_dim"]
-        hypertoeken_compress_factor = experiment["compress_factor"]
         data_segments = experiment["data_segments"]
         dropout = experiment["dropout"]
         expand_method = experiment["expand_method"]
@@ -679,7 +716,7 @@ if __name__ == "__main__":
         if vocab_size == 0:
             tmp_dset = TinyShakespeareDataset(
                 seq_len=experiment["seq_len"],
-                encode_last_n_length=experiment["hypertoken_seq_len"],
+                token_len=experiment["token_len"],
                 segments=data_segments,
             )
             vocab_size = len(tmp_dset.char2idx)
@@ -689,10 +726,9 @@ if __name__ == "__main__":
 
         h_decoder_model = HyperTokenDecoder(
             vocab_size=vocab_size,
-            encode_last_n_length=hypertoken_seq_len,
+            token_len=token_len,
             hypertoken_size=hypertoken_size,
             head_size=16,
-            compress_factor=hypertoeken_compress_factor,
             n_layers=1,
             embed_dim=hypertoken_embed_dim,
         ).to(DEVICE)
@@ -700,10 +736,9 @@ if __name__ == "__main__":
         h_encoder_model = HyperTokenEncoder(
             vocab_size=vocab_size,
             seq_len=hypertoken_seq_len,
-            encode_last_n_length=hypertoken_seq_len,
+            token_len=token_len,
             hypertoken_size=hypertoken_size,
             head_size=16,
-            compress_factor=hypertoeken_compress_factor,
             n_layers=1,
             embed_dim=hypertoken_embed_dim,
         )

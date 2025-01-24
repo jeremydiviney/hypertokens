@@ -3,6 +3,8 @@ import os
 from datetime import datetime
 from typing import Optional, Any
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,6 +15,22 @@ from lion_pytorch import Lion
 
 from models.hypertoken_auto_encoder import (
     HyperTokenAutoencoder,
+)
+
+from models.conv_hypertoken_auto_encoder import (
+    ConvHyperTokenAutoencoder,
+)
+
+from models.rnn_hypertoken_auto_encoder import (
+    RNNHyperTokenAutoencoder,
+)
+
+from models.transformer_seq_reducer_hypertoken_auto_encoder import (
+    TransformerSequenceReduceHyperTokenAutoencoder,
+)
+
+from models.transformer_pyramid_hypertoken_auto_encoder import (
+    TransformerPyramidHyperTokenAutoencoder,
 )
 
 from helpers.experiments import run_experiment, count_parameters
@@ -69,7 +87,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
     char_total = 0
 
     vocab_size = len(dataloader.dataset.char2idx)
-    encode_last_n_length = dataloader.dataset.encode_last_n_length
+    token_len = dataloader.dataset.token_len
 
     dataset = dataloader.dataset
 
@@ -79,14 +97,14 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
             y = y.to(device)
             logits = model(x)
 
-            loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, encode_last_n_length=encode_last_n_length)
+            loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len)
             total_loss += loss.item()
             batch_count += 1
 
-            pred_logits = logits[:, -encode_last_n_length:]
+            pred_logits = logits[:, -token_len:]
             pred_indices = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
 
-            target_seqs = y[:, -encode_last_n_length:].unsqueeze(0)  # reshape to [1, seq_len, encode_last_n_length]
+            target_seqs = y[:, -token_len:].unsqueeze(0)
             target_texts = decode_indices_to_text(target_seqs, dataset.idx2char, dataset.pad_token)
             pred_texts = decode_indices_to_text(pred_indices, dataset.idx2char, dataset.pad_token)
 
@@ -100,26 +118,49 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
             char_accuracy = char_matches_total / char_total
             token_accuracy = token_matches_total / token_total
 
-            if batch_count % 10 == 0:
-                print(f"\nSample {batch_count}:")
-                print(f"Target: {target_texts.squeeze(0)[0]}")
-                print(f"Pred: {pred_texts.squeeze(0)[0]}")
-                print(f"Current sequence accuracy: {token_accuracy:.4%}")
-                print(f"Current character accuracy: {char_accuracy:.4%}")
+            # Print all incorrect predictions when accuracy is high
+            if token_accuracy >= 0.990:
+
+                pred_flat = pred_texts.squeeze(0)
+                target_flat = target_texts.squeeze(0)
+
+                target_texts_bads_indices = ~np.all(pred_flat == target_flat, axis=1)
+
+                if target_texts_bads_indices.any():
+                    target_texts_bads = target_flat[target_texts_bads_indices]
+                    pred_texts_bads = pred_flat[target_texts_bads_indices]
+
+                    print(f"\nMismatch found in batch {batch_count}:")
+                    for target, pred in zip(target_texts_bads, pred_texts_bads):
+                        print(f"Target: {target}")
+                        print(f"Pred  : {pred}")
+                        print("-" * 40)
+
+            print(f"\nSample {batch_count}:")
+            # print(f"Target: {target_texts.squeeze(0)[0]}")
+            # print(f"Pred: {pred_texts.squeeze(0)[0]}")
+            print(f"Current token accuracy: {token_accuracy:.4%}")
+            print(f"Current character accuracy: {char_accuracy:.4%}")
 
     model.train()
     return {
         "val_loss": total_loss / batch_count,
-        "val_sequence_accuracy": token_accuracy,
+        "val_token_accuracy": token_accuracy,
         "val_char_accuracy": char_accuracy,
     }
 
 
 def calculate_loss(
-    model: nn.Module, logits: torch.Tensor, target: torch.Tensor, vocab_size: int, encode_last_n_length: int, hypertoken_weight: float = 1, spread_weight: float = 1
+    model: nn.Module,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_size: int,
+    token_len: int,
+    hypertoken_weight: float = 0.001,
+    spread_weight: float = 1,
 ) -> tuple[torch.Tensor, dict]:
     # Calculate main loss
-    loss_per_pos = F.cross_entropy(logits.reshape(-1, vocab_size), target[:, -encode_last_n_length:].reshape(-1), reduction="mean")
+    loss_per_pos = F.cross_entropy(logits.reshape(-1, vocab_size), target[:, -token_len:].reshape(-1), reduction="mean")
 
     # Calculate hypertoken normalization loss
     hypertoken_norms = torch.norm(model.hypertoken, p=2, dim=1)
@@ -141,7 +182,7 @@ def calculate_loss(
     loss_spread = (dot_matrix[mask_diff] ** 2).mean()
 
     # -- Combine total loss --
-    total_loss = loss_per_pos + hypertoken_weight * loss_mse + spread_weight * loss_spread
+    total_loss = loss_per_pos  # + hypertoken_weight * loss_mse  # + spread_weight * loss_spread
 
     return total_loss
 
@@ -154,7 +195,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     lr = config["lr"]
     epochs = config["epochs"]
-    encode_last_n_length = config["encode_last_n_length"]
+    token_len = config["token_len"]
 
     # only if not debugging
     if sys.gettrace() is None:  # No debugger attached
@@ -162,15 +203,15 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     count_parameters(model)
 
-    # optimizer = optim.AdamW(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
 
-    optimizer = Lion(
-        model.parameters(),
-        lr=lr,  # Usually needs 3-10x smaller learning rate than Adam
-        weight_decay=1e-2,  # Lion typically works better with higher weight decay
-    )
+    # optimizer = Lion(
+    #     model.parameters(),
+    #     lr=lr,  # Usually needs 3-10x smaller learning rate than Adam
+    #     weight_decay=1e-2,  # Lion typically works better with higher weight decay
+    # )
 
-    evaluate_model(model, val_dataloader, device)
+    # evaluate_model(model, val_dataloader, device)
 
     total_steps = epochs * len(dataloader) * data_segments
 
@@ -206,7 +247,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
                 y = y.to(device)  # y is in int (char index)
 
                 logits = model(x)
-                loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, encode_last_n_length=encode_last_n_length)
+                loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len)
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -239,70 +280,48 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
         # Log epoch metrics
         eval_results = evaluate_model(model, val_dataloader, device)
         val_loss = eval_results["val_loss"]
-        val_sequence_accuracy = eval_results["val_sequence_accuracy"]
+        val_token_accuracy = eval_results["val_token_accuracy"]
         val_char_accuracy = eval_results["val_char_accuracy"]
 
         wandb.log(
             {
                 "epoch_loss": epoch_loss / batch_count,
                 "val_loss": val_loss,
-                "val_sequence_accuracy": val_sequence_accuracy,
+                "val_token_accuracy": val_token_accuracy,
                 "val_char_accuracy": val_char_accuracy,
                 "epoch": epoch,
             }
         )
 
         print(
-            f"Epoch {epoch} train_loss: {avg_segment_loss:.6f}, val_loss: {val_loss:.6f}, val_sequence_accuracy: {val_sequence_accuracy:.6%}, val_char_accuracy: {val_char_accuracy:.6%}"
+            f"Epoch {epoch} train_loss: {avg_segment_loss:.6f}, val_loss: {val_loss:.6f}, val_token_accuracy: {val_token_accuracy:.6%}, val_char_accuracy: {val_char_accuracy:.6%}"
         )
 
     # After training loop ends, save the model
     save_dir = "saved_models"
     timestamp = datetime.now().isoformat()
-    model_name = f"hypertoken_{timestamp}_encode_last_n_length{encode_last_n_length}_hypertoken_size{config['hypertoken_size']}"
+    model_name = f"hypertoken_{timestamp}_token_len_{token_len}_hypertoken_size{config['hypertoken_size']}"
     save_model(model, save_dir, model_name)
 
     return model
 
 
-def verify_model_params(
-    hs,
-    ed,
-    n_layers,
-    head_size,
-    lr,
-    seq_len,
-    hypertoken_size,
-    compress_factor,
-    encode_last_n_length,
-):
+def verify_model_params(experiment: dict):
+
+    hypertoken_size = experiment["hypertoken_size"]
+    token_len = experiment["token_len"]
+    embed_dim = experiment["embed_dim"]
+
+    if hypertoken_size < token_len:
+        raise ValueError(
+            f"Hypertoken_size ({hypertoken_size}) must be greater than or equal to token_len ({token_len})"
+        )
 
     print(
         f"Verifying hyperparameters \n\
             hypertoken_size: {hypertoken_size}, \n\
-            seq_len: {seq_len}, \n\
-            encode_last_n_length: {encode_last_n_length}"
+            token_len: {token_len}"
     )
-
-    if hypertoken_size < seq_len:
-        raise ValueError("hypertoken_size must be greater than or equal to seq_len")
-
-    if hypertoken_size < encode_last_n_length:
-        raise ValueError("encode_last_n_length must be greater than or equal to hypertoken_size")
-
-    # Add check for embed_dim being multiple of seq_len
-    if hypertoken_size % seq_len != 0:
-        raise ValueError(f"hypertoken_size must be a multiple of seq_len")
-
-    if hypertoken_size % encode_last_n_length != 0:
-        raise ValueError(f"hypertoken_size must be a multiple of encode_last_n_length")
-
-    # Check if embed_dim is a power of compress_factor
-    # if not (math.log(ed, compress_factor).is_integer()):
-    #     raise ValueError(f"Embed_dim ({ed}) must be a power of compress_factor ({compress_factor})")
-
-    if encode_last_n_length > seq_len:
-        raise ValueError("encode_last_n_length must be less than or equal to seq_len")
 
 
 def load_model(
@@ -347,24 +366,22 @@ if __name__ == "__main__":
     # Define experiments
     experiments: list[dict] = [
         {
-            "seq_len": 2,
-            "encode_last_n_length": 2,
+            "token_len": 16,
             "hypertoken_size": hs,
-            "epochs": 2,
+            "epochs": 6,
             "batch_size": bs,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
             "embed_dim": ed,
-            "compress_factor": cf,
+            "compress_factor": 2,
         }
-        for hs in [64]  # Varying hypertoken_size
-        for ed in [256]  # Varying embed_dim
-        for n_layers in [1]  # Varying n_layers
+        for hs in [32]  # Varying hypertoken_size
+        for ed in [128]  # Varying embed_dim
+        for n_layers in [1, 2]  # Varying n_layers
         for head_size in [16]  # Varying head_size
-        for lr in [0.0001]
-        for cf in [4]
-        for bs in [256]
+        for lr in [0.001]
+        for bs in [512]
     ]
 
     enable_torch_optimizations()
@@ -373,19 +390,16 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for experiment in experiments:
-        seq_len = experiment["seq_len"]
-        encode_last_n_length = experiment["encode_last_n_length"]
+        token_len = experiment["token_len"]
         hypertoken_size = experiment["hypertoken_size"]
         batch_size = experiment["batch_size"]
-        compress_factor = experiment["compress_factor"]
         n_layers = experiment["n_layers"]
         head_size = experiment["head_size"]
         embed_dim = experiment["embed_dim"]
+        compress_factor = experiment["compress_factor"]
         SEGMENTS = 10
 
-        # model = load_model(model, "saved_models", "hypertoken_2025-01-10T00:21:59.914619_encode_last_n_length128_hypertoken_size512")
-
-        dataset = TinyShakespeareDataset(encode_last_n_length, segments=SEGMENTS, seq_len=seq_len)
+        dataset = TinyShakespeareDataset(token_len=token_len, segments=SEGMENTS)
         vocab_size = len(dataset.char2idx)
         dataloader = DataLoader(
             dataset,
@@ -397,7 +411,7 @@ if __name__ == "__main__":
             prefetch_factor=2,  # Number of batches loaded in advance per worker)
         )
 
-        val_dataset = TinyShakespeareDataset(encode_last_n_length, segments=SEGMENTS, seq_len=seq_len, type="validation")
+        val_dataset = TinyShakespeareDataset(token_len=token_len, segments=SEGMENTS, type="validation")
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -408,27 +422,42 @@ if __name__ == "__main__":
             prefetch_factor=2,  # Number of batches loaded in advance per worker)
         )
 
-        verify_model_params(
-            experiment["hypertoken_size"],
-            experiment["embed_dim"],
-            experiment["n_layers"],
-            experiment["head_size"],
-            experiment["lr"],
-            experiment["seq_len"],
-            experiment["hypertoken_size"],
-            experiment["compress_factor"],
-            experiment["encode_last_n_length"],
-        )
+        verify_model_params(experiment)
 
-        model = HyperTokenAutoencoder(
+        # model = HyperTokenAutoencoder(
+        #     vocab_size=vocab_size,
+        #     token_len=token_len,
+        #     hypertoken_size=hypertoken_size,
+        #     head_size=head_size,
+        #     n_layers=n_layers,
+        #     embed_dim=embed_dim,
+        # ).to(device)
+
+        # model = RNNHyperTokenAutoencoder(
+        #     vocab_size=vocab_size,
+        #     token_len=token_len,
+        #     hypertoken_size=hypertoken_size,
+        #     embed_dim=embed_dim,
+        # ).to(device)
+
+        # model = TransformerPyramidHyperTokenAutoencoder(
+        #     vocab_size=vocab_size,
+        #     token_len=token_len,
+        #     hypertoken_size=hypertoken_size,
+        #     embed_dim=embed_dim,
+        #     head_size=head_size,
+        #     n_layers=n_layers,
+        #     compress_factor=compress_factor,
+        # ).to(device)
+
+        model = TransformerSequenceReduceHyperTokenAutoencoder(
             vocab_size=vocab_size,
-            seq_len=seq_len,
-            encode_last_n_length=encode_last_n_length,
+            token_len=token_len,
             hypertoken_size=hypertoken_size,
-            head_size=head_size,
-            compress_factor=compress_factor,
-            n_layers=n_layers,
             embed_dim=embed_dim,
+            head_size=head_size,
+            n_layers=n_layers,
+            compress_factor=compress_factor,
         ).to(device)
 
         # create wrapper function for train_model
@@ -436,7 +465,7 @@ if __name__ == "__main__":
             return train_model(wandb, model, dataloader, val_dataloader, experiment)
 
         project_name = "HyperTokens"
-        exp_name = f"{project_name}-sl:{experiment['seq_len']}-elnl:{experiment['encode_last_n_length']}-hts:{experiment['hypertoken_size']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['embed_dim']}-cf:{experiment['compress_factor']}"
+        exp_name = f"{project_name}-sl:{token_len}-hts:{hypertoken_size}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['embed_dim']}"
 
         run_experiment(project_name, train_model_lambda, exp_name, experiment)
 
