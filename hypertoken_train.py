@@ -13,6 +13,10 @@ from datasources.tinyshakespeare import TinyShakespeareDataset, decode_indices_t
 import torch.nn.functional as F
 from lion_pytorch import Lion
 
+from adabelief_pytorch import AdaBelief
+
+from torch.amp import autocast
+
 from models.hypertoken_auto_encoder import (
     HyperTokenAutoencoder,
 )
@@ -95,9 +99,11 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
         for x, y in dataloader:
             x = x.to(device)
             y = y.to(device)
-            logits = model(x)
 
-            loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len)
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(x)
+                loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len)
+
             total_loss += loss.item()
             batch_count += 1
 
@@ -156,7 +162,7 @@ def calculate_loss(
     target: torch.Tensor,
     vocab_size: int,
     token_len: int,
-    hypertoken_weight: float = 0.001,
+    hypertoken_weight: float = 0.01,
     spread_weight: float = 1,
 ) -> tuple[torch.Tensor, dict]:
     # Calculate main loss
@@ -182,7 +188,7 @@ def calculate_loss(
     loss_spread = (dot_matrix[mask_diff] ** 2).mean()
 
     # -- Combine total loss --
-    total_loss = loss_per_pos  # + hypertoken_weight * loss_mse  # + spread_weight * loss_spread
+    total_loss = loss_per_pos + hypertoken_weight * loss_mse + spread_weight * loss_spread
 
     return total_loss
 
@@ -203,7 +209,14 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     count_parameters(model)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    # optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.99, weight_decay=0.1)
+
+    # optimizer = AdaBelief(param_groups, eps=1e-8)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=lr,
+    )
 
     # optimizer = Lion(
     #     model.parameters(),
@@ -246,8 +259,12 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
                 x = x.to(device)  # x is in int (char index)
                 y = y.to(device)  # y is in int (char index)
 
-                logits = model(x)
-                loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len)
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+
+                    logits = model(x)
+                    loss = calculate_loss(
+                        model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len
+                    )
 
                 # Update metrics
                 segment_loss += loss.item()
@@ -269,6 +286,20 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
+                max_grad_norm = 0.1
+                # Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+                # total_norm = torch.norm(
+                #     torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None])
+                # )
+
+                # # Normalize gradients to unit norm
+                # if total_norm > 0:  # Avoid division by zero
+                #     for p in model.parameters():
+                #         if p.grad is not None:
+                #             p.grad.data.mul_(grad_norm / total_norm)
 
                 optimizer.step()
 
@@ -374,13 +405,14 @@ if __name__ == "__main__":
             "head_size": head_size,
             "n_layers": n_layers,
             "embed_dim": ed,
-            "compress_factor": 2,
+            "compress_factor": compress_factor,
         }
-        for hs in [32]  # Varying hypertoken_size
-        for ed in [128]  # Varying embed_dim
+        for hs in [32, 64]  # Varying hypertoken_size
+        for ed in [256]  # Varying embed_dim
         for n_layers in [1, 2]  # Varying n_layers
-        for head_size in [16]  # Varying head_size
-        for lr in [0.001]
+        for head_size in [32]  # Varying head_size
+        for compress_factor in [2, 4]
+        for lr in [0.0006]
         for bs in [512]
     ]
 
@@ -440,17 +472,7 @@ if __name__ == "__main__":
         #     embed_dim=embed_dim,
         # ).to(device)
 
-        # model = TransformerPyramidHyperTokenAutoencoder(
-        #     vocab_size=vocab_size,
-        #     token_len=token_len,
-        #     hypertoken_size=hypertoken_size,
-        #     embed_dim=embed_dim,
-        #     head_size=head_size,
-        #     n_layers=n_layers,
-        #     compress_factor=compress_factor,
-        # ).to(device)
-
-        model = TransformerSequenceReduceHyperTokenAutoencoder(
+        model = TransformerPyramidHyperTokenAutoencoder(
             vocab_size=vocab_size,
             token_len=token_len,
             hypertoken_size=hypertoken_size,
@@ -459,6 +481,16 @@ if __name__ == "__main__":
             n_layers=n_layers,
             compress_factor=compress_factor,
         ).to(device)
+
+        # model = TransformerSequenceReduceHyperTokenAutoencoder(
+        #     vocab_size=vocab_size,
+        #     token_len=token_len,
+        #     hypertoken_size=hypertoken_size,
+        #     embed_dim=embed_dim,
+        #     head_size=head_size,
+        #     n_layers=n_layers,
+        #     compress_factor=compress_factor,
+        # ).to(device)
 
         # create wrapper function for train_model
         def train_model_lambda(wandb):

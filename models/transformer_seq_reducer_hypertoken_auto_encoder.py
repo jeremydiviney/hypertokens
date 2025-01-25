@@ -27,51 +27,47 @@ class TransformerSequenceReduceHyperTokenEncoder(nn.Module):
         self.embed = nn.Embedding(vocab_size, embed_dim).to(torch.bfloat16)
         self.pos_embed = nn.Embedding(token_len, embed_dim).to(torch.bfloat16)
 
-        self.COMPRESS_FACTOR = compress_factor  # Sequence compress factor
-        self.MIN_SEQ_LEN = target_seq_len  # Target sequence length for compression
+        self.compress_factor = compress_factor  # Sequence compress factor
+        self.min_seq_len = target_seq_len  # Target sequence length for compression
 
         self.register_buffer("positions", torch.arange(token_len).unsqueeze(0))
 
-        self.reduction_steps = []
-        current_seq_len = self.token_len
-        while current_seq_len > self.MIN_SEQ_LEN:
-            self.reduction_steps.append(current_seq_len)
-            current_seq_len //= self.COMPRESS_FACTOR  # Integer division for sequence length
+        compression_sizes = []
+        current_size = self.token_len
+        while (current_size // self.compress_factor) >= self.min_seq_len:
+            compression_sizes.append(current_size)
+            current_size //= self.compress_factor
 
-        if self.reduction_steps and self.reduction_steps[-1] != self.MIN_SEQ_LEN:
-            self.reduction_steps.append(self.MIN_SEQ_LEN * self.COMPRESS_FACTOR)  # Add a step to get closer if needed
+        if compression_sizes[-1] != hypertoken_size // self.token_len:
+            compression_sizes.append(self.min_seq_len)
 
-        self.reduction_seq_lens = sorted(list(set(self.reduction_steps)), reverse=True)  # Ensure unique and ordered
+        self.compression_sizes = list(zip(compression_sizes[:-1], compression_sizes[1:]))
         self.compression_layers = nn.ModuleList([])
 
-        prev_seq_len = self.token_len  # Keep track of previous sequence length
-        for seq_len in self.reduction_seq_lens:
-            nh = max(2, embed_dim // head_size)
-            nh = max(2, nh) if nh >= 2 else 1
+        nh = max(2, self.embed_dim // head_size)
 
-            t_layer = nn.TransformerEncoderLayer(
-                d_model=embed_dim,  # Constant embed_dim
-                nhead=nh,
-                dim_feedforward=embed_dim * 4,
-                batch_first=True,
-                dtype=torch.bfloat16,
-                dropout=0.025,
-                norm_first=True,
-            )
-            self.compression_layers.append(
-                nn.ModuleList(
-                    [
-                        nn.TransformerEncoder(t_layer, num_layers=n_layers),
-                        nn.Linear(prev_seq_len * embed_dim, seq_len * embed_dim).to(
-                            torch.bfloat16
-                        ),  # Linear for sequence length change if needed
-                    ]
-                )
-            )
-            prev_seq_len = seq_len  # Update previous seq len
+        t_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim,  # Constant embed_dim
+            nhead=nh,
+            dim_feedforward=self.embed_dim * 4,
+            batch_first=True,
+            dtype=torch.bfloat16,
+            dropout=0.00,
+            norm_first=True,
+        )
+
+        for in_dim, out_dim in self.compression_sizes:
+            self.compression_layers.append(nn.TransformerEncoder(t_layer, num_layers=n_layers))
+
+        self.compression_layer = nn.TransformerEncoder(t_layer, num_layers=n_layers)
 
         # Final compression to hypertoken size after sequence reduction
-        self.final_compress = nn.Linear(self.MIN_SEQ_LEN * embed_dim, hypertoken_size).to(torch.bfloat16)
+        self.final_compress = nn.Sequential(
+            nn.Linear(self.min_seq_len * embed_dim, hypertoken_size * 2),
+            nn.LayerNorm(hypertoken_size * 2),
+            nn.GELU(),
+            nn.Linear(hypertoken_size * 2, hypertoken_size),
+        )
 
         self.to(torch.bfloat16)
 
@@ -83,23 +79,18 @@ class TransformerSequenceReduceHyperTokenEncoder(nn.Module):
         compressed = embedded
 
         current_seq_len = self.token_len
-        for i in range(len(self.reduction_seq_lens)):
-            transformer_layer, linear_resize = self.compression_layers[i]
-            compressed = transformer_layer(compressed)
 
-            target_seq_len = self.reduction_seq_lens[i]
-            if current_seq_len != target_seq_len:  # Only resize if lengths are different
-                compressed = compressed.reshape(
-                    batch_size, current_seq_len * self.embed_dim
-                )  # Flatten for linear layer
-                compressed = linear_resize(compressed)  # Linear layer to change sequence length
-                compressed = compressed.reshape(batch_size, target_seq_len, self.embed_dim)  # Reshape back
+        for i, (in_len, out_len) in enumerate(self.compression_sizes):
+            compressed = self.compression_layers[i](compressed)
+            compress_factor = in_len // out_len
+            compressed = compressed.reshape(batch_size, out_len, compress_factor, self.embed_dim)
+            compressed = compressed.mean(dim=2)
 
-            current_seq_len = target_seq_len
+            current_seq_len = out_len
 
-        compressed = compressed.reshape(
-            batch_size, self.MIN_SEQ_LEN * self.embed_dim
-        )  # Flatten sequence and embed dims for final compression
+        # Flatten sequence and embed dims for final compression
+        compressed = compressed.reshape(batch_size, self.min_seq_len * self.embed_dim)
+
         compressed = self.final_compress(compressed)  # Project to hypertoken size
 
         return compressed
@@ -120,59 +111,52 @@ class TransformerSequenceExpandHyperTokenDecoder(nn.Module):
         super().__init__()
         self.token_len = token_len
         self.embed_dim = embed_dim
+        self.head_size = head_size
         self.hypertoken_size = hypertoken_size
         self.target_seq_len = target_seq_len  # Match encoder's target
 
-        self.COMPRESS_FACTOR = compress_factor  # Sequence compress factor
-        self.MIN_SEQ_LEN = target_seq_len  # Target sequence length
+        self.compress_factor = compress_factor  # Sequence compress factor
+        self.min_seq_len = target_seq_len  # Target sequence length
 
         self.hypertoken = None
         self.fc_out = nn.Linear(embed_dim, vocab_size).to(torch.bfloat16)
 
-        self.expansion_steps = []
-        current_seq_len = self.MIN_SEQ_LEN
-        while current_seq_len < self.token_len:
-            self.expansion_steps.append(current_seq_len)
-            current_seq_len *= self.COMPRESS_FACTOR
+        expansion_sizes = []
+        current_size = self.min_seq_len
+        while (current_size * self.compress_factor) <= self.token_len:
+            expansion_sizes.append(current_size)
+            current_size *= self.compress_factor
 
-        if self.expansion_steps and self.expansion_steps[-1] != self.token_len:
-            self.expansion_steps.append(self.token_len)  # Ensure final step is token_len
+        if expansion_sizes[-1] != self.token_len:
+            expansion_sizes.append(self.token_len)
 
-        self.expansion_seq_lens = sorted(list(set(self.expansion_steps)))  # Ensure unique and ordered
+        self.expansion_sizes = list(zip(expansion_sizes[:-1], expansion_sizes[1:]))
         self.expansion_layers = nn.ModuleList([])
 
         # Initial expansion from hypertoken to sequence of length MIN_SEQ_LEN
-        self.initial_expand = nn.Linear(hypertoken_size, self.MIN_SEQ_LEN * embed_dim).to(torch.bfloat16)
+        self.initial_expand = nn.Sequential(
+            nn.Linear(hypertoken_size, hypertoken_size * 2),
+            nn.LayerNorm(hypertoken_size * 2),
+            nn.GELU(),
+            nn.Linear(hypertoken_size * 2, self.min_seq_len * embed_dim),
+        )
 
-        prev_seq_len = self.MIN_SEQ_LEN  # Track previous sequence length
-        for seq_len in self.expansion_seq_lens:
-            nh = max(2, embed_dim // head_size)
+        nh = max(2, self.embed_dim // head_size)
 
-            t_layer = nn.TransformerEncoderLayer(  # Using EncoderLayer in Decoder is intentional as per original design
-                d_model=embed_dim,
-                nhead=nh,
-                dim_feedforward=embed_dim * 4,
-                batch_first=True,
-                dtype=torch.bfloat16,
-                dropout=0.025,
-                norm_first=True,
-            )
-            self.expansion_layers.append(
-                nn.ModuleList(
-                    [
-                        nn.TransformerEncoder(t_layer, num_layers=n_layers),
-                        nn.Linear(prev_seq_len * embed_dim, seq_len * embed_dim).to(
-                            torch.bfloat16
-                        ),  # Linear for sequence length change
-                    ]
-                )
-            )
-            prev_seq_len = seq_len  # Update previous sequence length
+        t_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim,  # Constant embed_dim
+            nhead=nh,
+            dim_feedforward=self.embed_dim * 4,
+            batch_first=True,
+            dtype=torch.bfloat16,
+            dropout=0.00,
+            norm_first=True,
+        )
 
-        self.pos_embed = nn.Embedding(self.token_len, embed_dim).to(
-            torch.bfloat16
-        )  # Positional embedding for full token_len
-        self.register_buffer("positions", torch.arange(self.token_len).unsqueeze(0))
+        for in_dim, out_dim in self.expansion_sizes:
+            self.expansion_layers.append(nn.TransformerEncoder(t_layer, num_layers=n_layers))
+
+        self.compression_layer = nn.TransformerEncoder(t_layer, num_layers=n_layers)
 
         self.to(torch.bfloat16)
 
@@ -183,22 +167,16 @@ class TransformerSequenceExpandHyperTokenDecoder(nn.Module):
         batch_size = x.size(0)
 
         expanded = self.initial_expand(x)  # Project from hypertoken
-        expanded = expanded.reshape(batch_size, self.MIN_SEQ_LEN, self.embed_dim)  # Reshape to initial sequence length
+        expanded = expanded.reshape(batch_size, self.min_seq_len, self.embed_dim)  # Reshape to initial sequence length
 
-        current_seq_len = self.MIN_SEQ_LEN
-        for i in range(len(self.expansion_seq_lens)):
-            transformer_layer, linear_resize = self.expansion_layers[i]
-            expanded = transformer_layer(expanded)
+        for i, (in_len, out_len) in enumerate(self.expansion_sizes):
+            in_len, out_len = self.expansion_sizes[i]
+            expand_factor = out_len // in_len
 
-            target_seq_len = self.expansion_seq_lens[i]
-            if current_seq_len != target_seq_len:  # Only resize if lengths are different
-                expanded = expanded.reshape(batch_size, current_seq_len * self.embed_dim)  # Flatten for linear layer
-                expanded = linear_resize(expanded)  # Linear layer to change sequence length
-                expanded = expanded.reshape(batch_size, target_seq_len, self.embed_dim)  # Reshape back
-            current_seq_len = target_seq_len
+            expanded = expanded.repeat_interleave(expand_factor, dim=1)
+            expanded = expanded / expand_factor
 
-        # Add positional embeddings at the very end, for the full token_len sequence
-        expanded = expanded + self.pos_embed(self.positions[:, : self.token_len])  # Ensure correct position indices
+            expanded = self.expansion_layers[i](expanded)
 
         fc_out = self.fc_out(expanded)
         return fc_out
