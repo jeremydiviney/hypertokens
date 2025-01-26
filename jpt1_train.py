@@ -17,7 +17,10 @@ from torch.utils.data.dataset import Dataset
 from torchtyping import TensorType, patch_typeguard
 from typeguard import typechecked
 
-from models.hypertoken_auto_encoder import HyperTokenEncoder, HyperTokenDecoder
+from models.transformer_pyramid_hypertoken_auto_encoder import (
+    TransformerPyramidHyperTokenEncoder,
+    TransformerPyramidHyperTokenDecoder,
+)
 
 from models.jpt1 import JPT1, ExpandMethod
 from datasources.tinyshakespeare import HyperTokenTinyShakespeareDataset, TinyShakespeareDataset, decode_indices_to_text
@@ -40,18 +43,18 @@ def decode_text_from_hypertoken(
     dataset: Dataset,
     hypertoken: TensorType["batch_size", "seq_len", "hypertoken_size"],
     decoder: nn.Module,
+    token_len: int,
     temperature: float = 0,
 ) -> np.ndarray[str]:  # --->["batch_size", "seq_len", "character"]:
 
     decoder.eval()
 
     batch_size, seq_len, hypertoken_size = hypertoken.shape
-    hypertoken_seq_len = dataset.hypertoken_seq_len
 
     with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.bfloat16):
         hypertoken = hypertoken.reshape(-1, hypertoken_size)
         decoder_output = decoder(hypertoken)  # [batch_size, seq_len, vocab_size]
-        decoder_output = decoder_output.reshape(batch_size, seq_len, hypertoken_seq_len, -1)
+        decoder_output = decoder_output.reshape(batch_size, seq_len, token_len, -1)
 
     # Get predicted indices for each position in the sequence
     if temperature > 0:
@@ -89,7 +92,7 @@ def decode_text_from_hypertoken(
     #     batch_texts.append(text)
 
     batch_texts = decode_indices_to_text(
-        pred_indices.view(batch_size, seq_len, hypertoken_seq_len), dataset.idx2char, dataset.pad_token
+        pred_indices.view(batch_size, seq_len, token_len), dataset.idx2char, dataset.pad_token
     )
 
     # end_time = time.time()
@@ -100,6 +103,7 @@ def decode_text_from_hypertoken(
 
 def evaluate_model(
     model: nn.Module,
+    encoder_model: nn.Module,
     decoder_model: nn.Module,
     dataloader: DataLoader,
     device: str,
@@ -119,23 +123,25 @@ def evaluate_model(
     token_total = 0
 
     for x, y in dataloader:
-        x_chars = x.to(device)
-        y_chars = y.to(device)
+        x_tokens = x.to(device)
+        y_tokens = y.to(device)
 
         start_time = time.time()
 
-        jpt_output, loss = inference_and_loss_step(dataset, model, decoder_model, x_chars, y_chars)
+        jpt_output, loss = inference_and_loss_step(dataset, model, encoder_model, decoder_model, x_tokens, y_tokens)
 
         total_loss += loss.item()
         batch_count += 1
 
-        target_texts = decode_indices_to_text(y_chars, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
+        target_texts = decode_indices_to_text(y_tokens, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
 
         if from_hypertoken:
 
             # we are actually dealing with hypertokens not characters and character probabilities
             final_hypertoken_pred = jpt_output
-            pred_texts = decode_text_from_hypertoken(dataloader.dataset, final_hypertoken_pred, decoder_model)
+            pred_texts = decode_text_from_hypertoken(
+                dataloader.dataset, final_hypertoken_pred, decoder_model, encoder_model.token_len
+            )
 
         else:
 
@@ -159,7 +165,7 @@ def evaluate_model(
         print(f"Current token accuracy: {token_matches_total/token_total:.2%}")
         print(f"Current character accuracy: {char_matches_total/char_total:.2%}")
 
-    generate_text(model, decoder_model, " ", 500, dataloader.dataset)
+    generate_text(model, encoder_model, decoder_model, " ", 500, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
@@ -176,9 +182,11 @@ def calculate_hypertoken_loss(model_output, target_hypertokens):
     cos_similarity = nn.CosineSimilarity(dim=-1)
     cos_loss = 1 - cos_similarity(model_output, target_hypertokens).mean()
 
-    loss_mse = F.mse_loss(model_output, target_hypertokens)
+    hypertoken_norms = torch.norm(model_output, dim=-1)
 
-    return cos_loss + loss_mse * 0.1
+    norm_loss = F.mse_loss(hypertoken_norms, torch.ones_like(hypertoken_norms))
+
+    return cos_loss + norm_loss * 0.1
 
     # return huber_loss
 
@@ -191,17 +199,18 @@ def calculate_loss(model_output, target_chars):
     return loss
 
 
-def inference_and_loss_step(dataset, model, decoder_model, x_chars, y_chars):
+def inference_and_loss_step(dataset, model, encoder_model, decoder_model, x_tokens, y_tokens):
 
     decoder_device = next(decoder_model.parameters()).device
 
-    seq_len = x_chars.shape[1]
+    seq_len = x_tokens.shape[1]
+    token_len = x_tokens.shape[2]
 
     with autocast(device_type="cuda", dtype=torch.bfloat16):
 
-        all_chars = torch.cat([x_chars, y_chars[:, -1:]], dim=1)
+        all_tokens = torch.cat([x_tokens, y_tokens[:, -1:]], dim=1)
 
-        hypertokens = dataset.encode_to_hypertokens(all_chars, seq_len + 1)
+        hypertokens = dataset.encode_to_hypertokens(encoder_model, all_tokens, token_len)
         hypertokens = torch.stack(hypertokens)
         x_hypertokens = hypertokens[:, :-1]
         y_hypertokens = hypertokens[:, 1:]
@@ -232,6 +241,7 @@ def inference_and_loss_step(dataset, model, decoder_model, x_chars, y_chars):
 def train_model(
     wandb,
     model,
+    encoder_model,
     decoder_model,
     train_dataloader,
     val_dataloader,
@@ -296,6 +306,7 @@ def train_model(
 
     eval_results = evaluate_model(
         model,
+        encoder_model,
         decoder_model,
         val_dataloader,
         device,
@@ -344,7 +355,9 @@ def train_model(
 
                 start_time = time.time()
 
-                jpt_output, loss = inference_and_loss_step(dataset, model, decoder_model, x_tokens, y_tokens)
+                jpt_output, loss = inference_and_loss_step(
+                    dataset, model, encoder_model, decoder_model, x_tokens, y_tokens
+                )
 
                 end_time = time.time()
                 # print(f"Time taken to do inference and loss step: {end_time - start_time:.4f} seconds")
@@ -415,6 +428,7 @@ def train_model(
     # Final Evaluation
     eval_results = evaluate_model(
         model,
+        encoder_model,
         decoder_model,
         val_dataloader,
         device,
@@ -556,8 +570,8 @@ def validate_hypertoken_models(
     good_count = 0
 
     for i in range(num_samples):
-        input_chunk = dataset.get_batch_item(i, chunk_count=1, chunk_size=hypertoken_seq_len)
-        input_chunk = input_chunk.view(-1).to(device)
+        input_chunk = dataset.get_batch_item(i, seq_len=1)
+        input_chunk = torch.tensor(input_chunk).view(-1).to(device)
 
         # Convert to text for display
         input_text = "".join([dataset.idx2char[idx.item()] for idx in input_chunk])
@@ -590,6 +604,7 @@ def validate_hypertoken_models(
 
 def generate_text(
     jpt_model: nn.Module,
+    encoder_model: nn.Module,
     decoder_model: nn.Module,
     prompt: str,
     max_new_tokens: int,
@@ -614,14 +629,14 @@ def generate_text(
     for i in range(max_new_tokens):
 
         current_context = "".join(result)
-        encoded_list = dataset.encode_to_hypertokens_from_text(current_context)
+        encoded_list = dataset.encode_to_hypertokens_from_text(encoder_model, current_context)
         encoded = torch.stack(encoded_list).to(device)
 
         output = jpt_model(encoded)
 
         if from_hypertoken:
             hypertoken = output[0:1, -1:, :]
-            pred_texts = decode_text_from_hypertoken(dataset, hypertoken, decoder_model, 0.3)
+            pred_texts = decode_text_from_hypertoken(dataset, hypertoken, decoder_model, encoder_model.token_len, 0.3)
 
         else:
 
@@ -667,8 +682,11 @@ if __name__ == "__main__":
     experiments: list[dict] = [
         {
             "seq_len": sl,
-            "hypertoken_seq_len": 2,
+            "token_len": 16,
             "hypertoken_size": 64,
+            "autoencoder_head_size": 32,
+            "autoencoder_n_layers": 1,
+            "compress_factor": 2,
             "epochs": epochs,
             "batch_size": 64,
             "lr": lr,
@@ -681,10 +699,10 @@ if __name__ == "__main__":
             "expand_method": expand_method,
         }
         for n_layers in [6]  # Varying n_layers
-        for head_size in [32, 64]  # Varying head_size
-        for jed in [384, 512]
+        for head_size in [32]  # Varying head_size
+        for jed in [384]
         for lr in [0.001]
-        for sl in [128, 256]
+        for sl in [128]
         for epochs in [1]
         for dropout in [0.2]
         for expand_method in [
@@ -702,8 +720,11 @@ if __name__ == "__main__":
 
     for experiment in experiments:
         seq_len = experiment["seq_len"]
-        hypertoken_seq_len = experiment["hypertoken_seq_len"]
+        token_len = experiment["token_len"]
         hypertoken_size = experiment["hypertoken_size"]
+        autoencoder_head_size = experiment["autoencoder_head_size"]
+        autoencoder_n_layers = experiment["autoencoder_n_layers"]
+        compress_factor = experiment["compress_factor"]
         hypertoken_embed_dim = experiment["hypertoken_embed_dim"]
         batch_size = experiment["batch_size"]
         n_layers = experiment["n_layers"]
@@ -715,7 +736,6 @@ if __name__ == "__main__":
         # load this just to get the vocab size
         if vocab_size == 0:
             tmp_dset = TinyShakespeareDataset(
-                seq_len=experiment["seq_len"],
                 token_len=experiment["token_len"],
                 segments=data_segments,
             )
@@ -724,42 +744,42 @@ if __name__ == "__main__":
 
         # delete the tmp dataset
 
-        h_decoder_model = HyperTokenDecoder(
+        h_encoder_model = TransformerPyramidHyperTokenEncoder(
             vocab_size=vocab_size,
             token_len=token_len,
-            hypertoken_size=hypertoken_size,
-            head_size=16,
-            n_layers=1,
             embed_dim=hypertoken_embed_dim,
+            head_size=autoencoder_head_size,
+            n_layers=autoencoder_n_layers,
+            hypertoken_size=hypertoken_size,
+            compress_factor=compress_factor,
         ).to(DEVICE)
 
-        h_encoder_model = HyperTokenEncoder(
+        h_decoder_model = TransformerPyramidHyperTokenDecoder(
             vocab_size=vocab_size,
-            seq_len=hypertoken_seq_len,
             token_len=token_len,
-            hypertoken_size=hypertoken_size,
-            head_size=16,
-            n_layers=1,
             embed_dim=hypertoken_embed_dim,
-        )
+            head_size=autoencoder_head_size,
+            n_layers=autoencoder_n_layers,
+            hypertoken_size=hypertoken_size,
+            compress_factor=compress_factor,
+        ).to(DEVICE)
 
         h_encoder_model = load_model(
             h_encoder_model,
             "saved_models",
-            "hypertoken_2025-01-21T01:10:39.914403_encode_last_n_length2_hypertoken_size64",
+            "hypertoken_2025-01-25T17:08:09.542668_token_len_16_hypertoken_size64",
             encoder_only=True,
         )
 
         h_model = load_model(
             h_decoder_model,
             "saved_models",
-            "hypertoken_2025-01-21T01:10:39.914403_encode_last_n_length2_hypertoken_size64",
+            "hypertoken_2025-01-25T17:08:09.542668_token_len_16_hypertoken_size64",
             decoder_only=True,
         )
 
         dataset = HyperTokenTinyShakespeareDataset(
-            h_encoder_model,
-            hypertoken_seq_len=hypertoken_seq_len,
+            token_len=token_len,
             segments=data_segments,
             seq_len=seq_len,
             batch_size=batch_size,
@@ -784,8 +804,7 @@ if __name__ == "__main__":
         )
 
         val_dataset = HyperTokenTinyShakespeareDataset(
-            h_encoder_model,
-            hypertoken_seq_len=hypertoken_seq_len,
+            token_len=token_len,
             segments=data_segments,
             seq_len=seq_len,
             batch_size=batch_size,
@@ -807,15 +826,23 @@ if __name__ == "__main__":
 
         verify_model_params(experiment)
 
-        validate_hypertoken_models(h_encoder_model, h_decoder_model, dataset, hypertoken_seq_len)
+        validate_hypertoken_models(h_encoder_model, h_decoder_model, dataset, token_len)
 
         # create wrapper function for train_model
         def train_model_lambda(wandb):
-            model = train_model(wandb, gpt_model, h_decoder_model, dataloader, val_dataloader, experiment)
+            model = train_model(
+                wandb,
+                gpt_model,
+                h_encoder_model,
+                h_decoder_model,
+                dataloader,
+                val_dataloader,
+                experiment,
+            )
             return model[0]
 
         project_name = "jpt1"
-        exp_name = f"{project_name}-sl:{experiment['seq_len']}-htsl:{experiment['hypertoken_seq_len']}-hts:{experiment['hypertoken_size']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}"
+        exp_name = f"{project_name}-sl:{experiment['seq_len']}-tl:{experiment['token_len']}-hts:{experiment['hypertoken_size']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}"
 
         run_experiment(project_name, train_model_lambda, exp_name, experiment)
 

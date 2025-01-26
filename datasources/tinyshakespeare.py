@@ -42,7 +42,8 @@ def decode_indices_to_text(
     char_sequence: TensorType["batch_size", "seq_len", "token_char_len"], idx2char: [int], pad_token_idx: int
 ) -> np.ndarray:
     # Convert indices to numpy array once
-    indices_array = char_sequence.cpu().numpy()
+
+    indices_array = char_sequence if isinstance(char_sequence, np.ndarray) else char_sequence.cpu().numpy()
     # Create mask for non-pad tokens
     mask = indices_array == pad_token_idx
     # Create a lookup array with the character mapping
@@ -120,7 +121,7 @@ class TinyShakespeareDataset(Dataset):
         all_text = train_text + val_text + test_text
         val_text = val_text + test_text
 
-        text = train_text if type == "train" else val_text if type == "validation" else test_text
+        text = train_text if type == "train" else val_text
 
         self.token_len = token_len
 
@@ -190,6 +191,8 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         self.type = type
         self.batch_size = batch_size
 
+        self.validation_stride = self.seq_len // 8
+
         self.data_tile_length = 16
 
         # Load TinyShakespeare from Hugging Face
@@ -201,7 +204,9 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         all_text = train_text + val_text + test_text
 
-        text = train_text if type == "train" else val_text if type == "validation" else test_text
+        val_text = val_text + test_text
+
+        text = train_text if type == "train" else val_text
 
         # Build vocabulary
         chars = sorted(list(set(all_text)))
@@ -218,70 +223,64 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         self.text_tokens = tokenize(text)
 
-        # Convert text to indices
-        self.data = torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
+        self.tokens = []
+
+        for token in self.text_tokens:
+            self.tokens.append(np.array([self.char2idx[ch] for ch in token], dtype=np.int64))
+
+        padded_tokens = [
+            np.pad(token, (0, self.token_len - len(token)), constant_values=self.pad_token) for token in self.tokens
+        ]
+        self.tokens = np.stack(padded_tokens)
 
     def __len__(self) -> int:
 
         if self.type == "train":
-            return math.floor(len(self.data) / self.segments)
+            return math.floor(len(self.tokens) / self.segments)
         else:
-            return len(self.data) // self.data_tile_length
+            return len(self.tokens) // self.validation_stride
 
-    def get_batch_item(
-        self, idx: int, chunk_count: int = None, chunk_size: int = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_batch_item(self, idx: int, seq_len: int = None) -> np.ndarray:
+        """Get input-target sequence pair from tokens array without padding."""
+        # Get sequence length parameters from instance
 
-        if chunk_count is None:
-            chunk_count = self.seq_len + 1
+        final_seq_len = None
 
-        if chunk_size is None:
-            chunk_size = self.token_len
+        if seq_len is None:
+            final_seq_len = self.seq_len + 1
+        else:
+            final_seq_len = seq_len
 
         if self.type == "train":
-            idx = random.randint(0, len(self.data) - 1)
+            # Random sampling with available context
+            start_idx = random.randint(0, len(self.tokens) - 1)
+            end_idx = min(start_idx + final_seq_len, len(self.tokens))
         else:
-            idx = idx * self.data_tile_length
+            # Sequential validation access
+            start_idx = idx * self.validation_stride
+            end_idx = min(start_idx + final_seq_len, len(self.tokens))
 
-        # Get sequence that will fit jpt_seq_len hypertokens
-        total_chars_needed = chunk_size * (chunk_count)
+        # Get sequence of up to seq_len+1 tokens (or whatever remains)
+        token_sequence = self.tokens[start_idx:end_idx]
 
-        # Ensure we have enough characters
-        if total_chars_needed >= len(self.data) - idx:
-            idx = len(self.data) - total_chars_needed
+        padding_needed = final_seq_len - len(token_sequence)
 
-        # Get the full sequence
-        char_sequence = self.data[idx : idx + total_chars_needed]
+        if padding_needed > 0:
+            # Create padding array filled with pad_token
+            padding = np.full((padding_needed, self.token_len), self.pad_token, dtype=np.int64)
+            # Concatenate the token sequence with padding
+            token_sequence = np.concatenate([token_sequence, padding], axis=0)
 
-        # Pad if needed
-        if len(char_sequence) < total_chars_needed:
-            padding = torch.full(
-                (total_chars_needed - len(char_sequence),),
-                self.pad_token,
-            )
-            char_sequence = torch.cat([padding, char_sequence])
+        return token_sequence
 
-        # Reshape to get hypertoken chunks
-        char_chunks = char_sequence.view(chunk_count, chunk_size)
-
-        if char_chunks.shape[0] != chunk_count:
-            print("char_chunks.device.shape[0] != chunk_count")
-            raise Exception("char_chunks.device.shape[0] != chunk_count")
-
-        if char_chunks.shape[1] != chunk_size:
-            print("char_chunks.device.shape[1] != chunk_size")
-            raise Exception("char_chunks.device.shape[1] != chunk_size")
-
-        return char_chunks
-
-    def encode_to_hypertokens_from_text(self, text: str) -> torch.Tensor:
-        device = next(self.encoder.parameters()).device
+    def encode_to_hypertokens_from_text(self, encoder: nn.Module, text: str) -> torch.Tensor:
+        device = next(encoder.parameters()).device
 
         # Convert text to character indices
         char_sequence_indexes = torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
 
         # Calculate padding needed to make length a multiple of hypertoken_seq_len
-        remainder = len(char_sequence_indexes) % self.hypertoken_seq_len
+        remainder = len(char_sequence_indexes) % self.token_len
 
         # Create left padding tensor
         padding = torch.full((remainder,), self.pad_token, dtype=torch.long)
@@ -289,46 +288,31 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         # Concatenate padding with character sequence
         padded_sequence = torch.cat([padding, char_sequence_indexes]).to(device)
 
-        return self.encode_to_hypertokens(padded_sequence.reshape(1, -1, self.hypertoken_seq_len))
+        return self.encode_to_hypertokens(encoder, padded_sequence.reshape(1, -1, self.seq_len), self.token_len)
 
     def encode_characters_to_indexes(self, text: str) -> torch.Tensor:
         return torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
 
-    def encode_to_hypertokens(self, char_sequence: torch.Tensor, seq_len: int = None) -> List[torch.Tensor]:
+    def encode_to_hypertokens(
+        self,
+        encoder: nn.Module,
+        sequence_batch: torch.Tensor,
+        token_len,
+    ) -> List[torch.Tensor]:
         # Calculate batch sizes to process
-        device = next(self.encoder.parameters()).device
+        device = next(encoder.parameters()).device
 
-        # If seq_len is not provided, use the default sequence length
-        cur_seq_len = seq_len
+        actual_batch_size = sequence_batch.size(0)
+        cur_seq_len = sequence_batch.size(1)
 
-        if cur_seq_len is None:
-            cur_seq_len = self.seq_len
+        batches_per_iter = 4096 // cur_seq_len
 
-        # Take up to sequence length and pad if needed
-        if char_sequence.size(1) < cur_seq_len:
-            padding = torch.full(
-                (
-                    char_sequence.size(0),
-                    cur_seq_len - char_sequence.size(1),
-                    char_sequence.size(2),
-                ),
-                self.pad_token,
-                device=device,
-            )
-            char_sequence = torch.cat([padding, char_sequence], dim=1)
-        else:
-            char_sequence = char_sequence[:, -cur_seq_len:]
-
-        chunks_per_item = cur_seq_len
-        items_per_batch = 4096 // chunks_per_item
-
-        actual_batch_size = char_sequence.size(0)
         remaining = actual_batch_size
 
         batch_sizes = []
 
         while remaining > 0:
-            current_batch = min(items_per_batch, remaining)
+            current_batch = min(batches_per_iter, remaining)
             batch_sizes.append(current_batch)
             remaining -= current_batch
 
@@ -338,15 +322,14 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         start_idx = 0
         for size in batch_sizes:
             end_idx = start_idx + size
-            batch_slice = slice(start_idx, end_idx)
 
-            current_input = char_sequence[batch_slice]
+            current_input = sequence_batch[start_idx:end_idx, :, :].view(-1, token_len)
+            cur_batch_slice_size = end_idx - start_idx
 
-            current_input_flat = current_input.reshape(-1, self.token_len)
             # Encode current batch
-            encoded = self.encoder(current_input_flat.to(device))
+            encoded = encoder(current_input.to(device))
 
-            encoded = encoded.reshape(current_input.size(0), cur_seq_len, -1)
+            encoded = encoded.view(cur_batch_slice_size, cur_seq_len, -1)
             encoded_list.extend(encoded)
 
             start_idx = end_idx
@@ -357,7 +340,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         pre_batch_items = [self.get_batch_item(idx) for idx in batch_indices]
 
-        all_chunks = torch.stack(pre_batch_items)
+        all_chunks = np.stack(pre_batch_items)
 
         batch_items: List[Tuple[torch.Tensor, torch.Tensor]] = []
 

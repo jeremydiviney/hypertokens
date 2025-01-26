@@ -9,29 +9,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from datasources.tinyshakespeare import TinyShakespeareDataset, decode_indices_to_text
+
+from torch.amp import autocast
+
 import torch.nn.functional as F
+
 from lion_pytorch import Lion
 
 from adabelief_pytorch import AdaBelief
 
-from torch.amp import autocast
-
-from models.hypertoken_auto_encoder import (
-    HyperTokenAutoencoder,
-)
-
-from models.conv_hypertoken_auto_encoder import (
-    ConvHyperTokenAutoencoder,
-)
-
-from models.rnn_hypertoken_auto_encoder import (
-    RNNHyperTokenAutoencoder,
-)
-
-from models.transformer_seq_reducer_hypertoken_auto_encoder import (
-    TransformerSequenceReduceHyperTokenAutoencoder,
-)
+from datasources.tinyshakespeare import TinyShakespeareDataset, decode_indices_to_text
 
 from models.transformer_pyramid_hypertoken_auto_encoder import (
     TransformerPyramidHyperTokenAutoencoder,
@@ -73,6 +60,48 @@ def save_model(model: Any, save_dir: str, model_name: str, save_separate: bool =
         torch.save(model.decoder.state_dict(), decoder_path)
 
 
+def generate_latent_variations(
+    model: nn.Module,
+    hypertoken: torch.Tensor,
+    dataset: TinyShakespeareDataset,
+    num_samples: int = 5,
+    noise_scale: float = 0.025,
+) -> None:
+    """
+    Generates textual variations using argmax decoding
+
+    Args:
+        model: Trained autoencoder model
+        hypertoken: Latent representation to sample around
+        dataset: Dataset object for text decoding
+        num_samples: Number of variations to generate
+        noise_scale: Magnitude of noise to add (controls diversity)
+    """
+    model.eval()
+    with torch.no_grad():
+        # Ensure input has batch dimension
+        if hypertoken.dim() == 1:
+            hypertoken = hypertoken.unsqueeze(0)
+
+        for i in range(num_samples):
+            # Add controlled noise
+            noisy_hypertoken = hypertoken + torch.randn_like(hypertoken) * noise_scale
+
+            # Generate logits and get argmax indices
+            with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model.decoder(noisy_hypertoken)
+
+            pred_indices = torch.argmax(logits, dim=-1)
+            # Convert indices to text
+            text = decode_indices_to_text(pred_indices.cpu().numpy(), dataset.idx2char, dataset.pad_token)
+
+            print(f"Variation {i+1}:")
+            print(text)
+            print("-" * 50)
+
+    model.train()
+
+
 # --------------------------------------------------
 # 2. Model Definition
 # --------------------------------------------------
@@ -102,7 +131,13 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = model(x)
-                loss = calculate_loss(model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len)
+                loss = calculate_loss(
+                    model=model,
+                    logits=logits,
+                    target=y,
+                    vocab_size=vocab_size,
+                    token_len=token_len,
+                )
 
             total_loss += loss.item()
             batch_count += 1
@@ -125,7 +160,8 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
             token_accuracy = token_matches_total / token_total
 
             # Print all incorrect predictions when accuracy is high
-            if token_accuracy >= 0.990:
+            if token_accuracy >= 0.99:
+                # generate_latent_variations(model, model.hypertoken[0], dataset)
 
                 pred_flat = pred_texts.squeeze(0)
                 target_flat = target_texts.squeeze(0)
@@ -162,33 +198,20 @@ def calculate_loss(
     target: torch.Tensor,
     vocab_size: int,
     token_len: int,
-    hypertoken_weight: float = 0.01,
-    spread_weight: float = 1,
-) -> tuple[torch.Tensor, dict]:
-    # Calculate main loss
-    loss_per_pos = F.cross_entropy(logits.reshape(-1, vocab_size), target[:, -token_len:].reshape(-1), reduction="mean")
+    hypertoken_weight: float = 0.05,
+    spread_weight: float = 0.1,
+    vae_beta: float = 0.1,
+) -> torch.Tensor:
+    # Reconstruction loss
+    recon_loss = F.cross_entropy(logits.view(-1, vocab_size), target[:, -token_len:].contiguous().view(-1))
 
-    # Calculate hypertoken normalization loss
+    # Original regularization terms
     hypertoken_norms = torch.norm(model.hypertoken, p=2, dim=1)
-    loss_mse = F.mse_loss(hypertoken_norms, torch.ones_like(hypertoken_norms))
 
-    # print("hypertoken_norms.mean()", hypertoken_norms.mean().item(), hypertoken_norms.max().item(), hypertoken_norms.min().item())
+    norm_loss = F.mse_loss(hypertoken_norms, torch.ones_like(hypertoken_norms))
 
-    # -- Spread penalty --
-    # 1) Normalize hypertokens
-    ht_norm = F.normalize(model.hypertoken, p=2, dim=1)  # shape [batch_size, hypertoken_size]
-
-    # # 2) Compute dot products
-    dot_matrix = ht_norm @ ht_norm.T  # shape [batch_size, batch_size]
-
-    # # 3) Create a mask that is True if targets differ, False if same
-    mask_diff = (target != target.unsqueeze(1)).any(-1)
-
-    # # 4) Spread loss is mean of squared dot products where targets differ
-    loss_spread = (dot_matrix[mask_diff] ** 2).mean()
-
-    # -- Combine total loss --
-    total_loss = loss_per_pos + hypertoken_weight * loss_mse + spread_weight * loss_spread
+    # Combined loss
+    total_loss = recon_loss + hypertoken_weight * norm_loss
 
     return total_loss
 
@@ -263,7 +286,11 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
                     logits = model(x)
                     loss = calculate_loss(
-                        model=model, logits=logits, target=y, vocab_size=vocab_size, token_len=token_len
+                        model=model,
+                        logits=logits,
+                        target=y,
+                        vocab_size=vocab_size,
+                        token_len=token_len,
                     )
 
                 # Update metrics
@@ -356,11 +383,11 @@ def verify_model_params(experiment: dict):
 
 
 def load_model(
-    model: HyperTokenAutoencoder,
+    model: nn.Module,
     load_dir: str,
     model_name: str,
     device: Optional[str] = None,
-) -> HyperTokenAutoencoder:
+) -> nn.Module:
     """
     Load a saved model state.
 
@@ -407,12 +434,12 @@ if __name__ == "__main__":
             "embed_dim": ed,
             "compress_factor": compress_factor,
         }
-        for hs in [32, 64]  # Varying hypertoken_size
+        for hs in [64]  # Varying hypertoken_size
         for ed in [256]  # Varying embed_dim
-        for n_layers in [1, 2]  # Varying n_layers
-        for head_size in [32]  # Varying head_size
-        for compress_factor in [2, 4]
-        for lr in [0.0006]
+        for n_layers in [1]  # Varying n_layers
+        for head_size in [16, 32]  # Varying head_size
+        for compress_factor in [2]
+        for lr in [0.001]
         for bs in [512]
     ]
 

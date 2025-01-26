@@ -69,6 +69,9 @@ class TransformerPyramidHyperTokenEncoder(nn.Module):
             nn.Linear(embed_dim, hypertoken_size // self.token_len),
         )
 
+        self.fc_mu = nn.Linear(embed_dim, hypertoken_size)
+        self.fc_logvar = nn.Linear(embed_dim, hypertoken_size)
+
     @typechecked
     def forward(self, x: TensorType["batch_size", "token_len"]) -> TensorType["batch_size", "hypertoken_size"]:
         batch_size, token_len = x.size()
