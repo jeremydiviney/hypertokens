@@ -329,10 +329,10 @@ def train_model(
 
             for x, y in train_dataloader:
 
-                x_tokens = x
-                y_tokens = y
+                x_tokens = x.to(device)
+                y_tokens = y.to(device)
 
-                samples_since_eval += x.shape[0]
+                samples_since_eval += x.shape[0] * x.shape[1]
 
                 # print(f"Samples since eval: {samples_since_eval}")
 
@@ -629,7 +629,7 @@ def generate_text(
     for i in range(max_new_tokens):
 
         current_context = "".join(result)
-        encoded_list = dataset.encode_to_hypertokens_from_text(encoder_model, current_context)
+        encoded_list = dataset.encode_to_hypertokens_from_text(encoder_model, current_context, jpt_model.seq_len)
         encoded = torch.stack(encoded_list).to(device)
 
         output = jpt_model(encoded)

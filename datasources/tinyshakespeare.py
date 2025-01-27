@@ -16,6 +16,9 @@ from torch.utils.data.dataset import Dataset
 from datasets import load_dataset
 
 
+TOKEN_PATTERN = re.compile(r"(\s+|\w+|[^\w\s])")
+
+
 def process_character_sequence(dataset: Dataset, sequence: torch.Tensor) -> str:
     # try and take whole words
     # test test tes
@@ -54,48 +57,74 @@ def decode_indices_to_text(
     return chars_array
 
 
-def tokenize(text: str) -> List[str]:
+def tokenize(text: str, token_len: int, silent: bool = True) -> List[str]:
     # Split text while preserving whitespace groups
-    pattern = r"(\s+|\w+|[^\w\s])"
-    tokens = re.findall(pattern, text)
 
-    # Convert to numpy array for analysis
-    token_lengths = np.array([len(token) for token in tokens])
-    unique_tokens = np.unique(tokens)
+    pre_tokens = re.findall(TOKEN_PATTERN, text)
+
+    # Split long tokens into chunks of maximum size token_len
+    tokens = []
+    for token in pre_tokens:
+        if len(token) <= token_len:
+            tokens.append(token)
+        else:
+            # Split into chunks of token_len characters
+            for i in range(0, len(token), token_len):
+                tokens.append(token[i : i + token_len])
 
     # Calculate statistics
-    stats = {
-        "min_len": np.min(token_lengths),
-        "max_len": np.max(token_lengths),
-        "mean_len": np.mean(token_lengths),
-        "median_len": np.median(token_lengths),
-        "total_tokens": len(tokens),
-        "unique_tokens": len(unique_tokens),
-    }
 
-    # Create histogram data
-    length_counts = np.bincount(token_lengths)
+    if not silent:
+        # Convert to numpy array for analysis
+        token_lengths = np.array([len(token) for token in tokens])
+        unique_tokens = np.unique(tokens)
 
-    print("\nToken Statistics:")
-    print(f"Min length: {stats['min_len']}")
-    print(f"Max length: {stats['max_len']}")
-    print(f"Mean length: {stats['mean_len']:.2f}")
-    print(f"Median length: {stats['median_len']:.1f}")
-    print(f"Total tokens: {stats['total_tokens']:,}")
-    print(f"Unique tokens: {stats['unique_tokens']:,}")
+        stats = {
+            "min_len": np.min(token_lengths),
+            "max_len": np.max(token_lengths),
+            "mean_len": np.mean(token_lengths),
+            "median_len": np.median(token_lengths),
+            "total_tokens": len(tokens),
+            "unique_tokens": len(unique_tokens),
+        }
 
-    print("\nLength Distribution:")
-    for length, count in enumerate(length_counts):
-        if count > 0:
-            print(f"{length}: {'#' * (count // 1000)} ({count:,})")
+        # Create histogram data
+        length_counts = np.bincount(token_lengths)
 
-    # Find and print longest tokens
-    max_len = stats["max_len"]
-    longest_tokens = [t for t in tokens if len(t) == max_len]
-    unique_longest = np.unique(longest_tokens)[:5]  # Get up to 5 unique examples
-    print(f"\nSample of longest tokens (length {max_len}):")
-    for token in unique_longest:
-        print(f"'{token}'")
+        print("\nToken Statistics:")
+        print(f"Min length: {stats['min_len']}")
+        print(f"Max length: {stats['max_len']}")
+        print(f"Mean length: {stats['mean_len']:.2f}")
+        print(f"Median length: {stats['median_len']:.1f}")
+        print(f"Total tokens: {stats['total_tokens']:,}")
+        print(f"Unique tokens: {stats['unique_tokens']:,}")
+
+        print("\nLength Distribution:")
+
+        for length, count in enumerate(length_counts):
+            if count > 0:
+                print(f"{length}: {'#' * (count // 1000)} ({count:,})")
+
+        # Find and print longest tokens
+        max_len = stats["max_len"]
+        longest_tokens = [t for t in tokens if len(t) == max_len]
+        unique_longest = np.unique(longest_tokens)[:5]  # Get up to 5 unique examples
+        print(f"\nSample of longest tokens (length {max_len}):")
+
+        for token in unique_longest:
+            print(f"'{token}'")
+
+    return tokens
+
+
+def finalize_tokens(text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int) -> np.ndarray:
+    tokens = []
+
+    for token in text_tokens:
+        tokens.append(np.array([char2idx[ch] for ch in token], dtype=np.int64))
+
+    padded_tokens = [np.pad(token, (0, token_len - len(token)), constant_values=pad_token) for token in tokens]
+    tokens = np.stack(padded_tokens)
 
     return tokens
 
@@ -138,17 +167,9 @@ class TinyShakespeareDataset(Dataset):
         # Create numpy versions of the mappings
         self.idx2char_np = np.array([self.idx2char[i] for i in range(len(self.idx2char))])
 
-        self.text_tokens = tokenize(text)
+        self.text_tokens = tokenize(text, self.token_len, False)
 
-        self.tokens = []
-
-        for token in self.text_tokens:
-            self.tokens.append(np.array([self.char2idx[ch] for ch in token], dtype=np.int64))
-
-        padded_tokens = [
-            np.pad(token, (0, self.token_len - len(token)), constant_values=self.pad_token) for token in self.tokens
-        ]
-        self.tokens = np.stack(padded_tokens)
+        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token)
 
         self.segments = segments
         self.type = type
@@ -221,17 +242,9 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         self.batch_item_buffer_x = []
         self.batch_item_buffer_y = []
 
-        self.text_tokens = tokenize(text)
+        self.text_tokens = tokenize(text, self.token_len, False)
 
-        self.tokens = []
-
-        for token in self.text_tokens:
-            self.tokens.append(np.array([self.char2idx[ch] for ch in token], dtype=np.int64))
-
-        padded_tokens = [
-            np.pad(token, (0, self.token_len - len(token)), constant_values=self.pad_token) for token in self.tokens
-        ]
-        self.tokens = np.stack(padded_tokens)
+        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token)
 
     def __len__(self) -> int:
 
@@ -273,22 +286,18 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         return token_sequence
 
-    def encode_to_hypertokens_from_text(self, encoder: nn.Module, text: str) -> torch.Tensor:
+    def encode_to_hypertokens_from_text(self, encoder: nn.Module, text: str, max_seq_len: int) -> torch.Tensor:
         device = next(encoder.parameters()).device
 
         # Convert text to character indices
-        char_sequence_indexes = torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
+        text_tokens = tokenize(text, self.token_len)
 
-        # Calculate padding needed to make length a multiple of hypertoken_seq_len
-        remainder = len(char_sequence_indexes) % self.token_len
+        text_tokens = text_tokens[-max_seq_len:]
 
-        # Create left padding tensor
-        padding = torch.full((remainder,), self.pad_token, dtype=torch.long)
+        tokens = finalize_tokens(text_tokens, self.char2idx, self.token_len, self.pad_token)
+        tokens = torch.tensor(tokens).to(device)
 
-        # Concatenate padding with character sequence
-        padded_sequence = torch.cat([padding, char_sequence_indexes]).to(device)
-
-        return self.encode_to_hypertokens(encoder, padded_sequence.reshape(1, -1, self.seq_len), self.token_len)
+        return self.encode_to_hypertokens(encoder, tokens.reshape(1, -1, self.token_len), self.token_len)
 
     def encode_characters_to_indexes(self, text: str) -> torch.Tensor:
         return torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
