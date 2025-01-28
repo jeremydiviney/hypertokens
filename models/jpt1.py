@@ -16,6 +16,7 @@ class JPT1(nn.Module):
         self,
         vocab_size: int,
         seq_len: int,
+        token_len: int,
         embed_dim: int,
         num_heads: int,
         num_layers: int,
@@ -29,6 +30,8 @@ class JPT1(nn.Module):
         self.expand_method = expand_method
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
+        self.vocab_size = vocab_size
+        self.token_len = token_len
 
         # Use PyTorch's TransformerEncoder -- since we are only trying to predict the next sequence after the final input sequence we can just use the encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -49,7 +52,8 @@ class JPT1(nn.Module):
         # self.transformer = nn.TransformerDecoder(encoder_layer, num_layers=num_layers)
 
         self.ln_final = nn.LayerNorm(embed_dim)
-        self.fc_out = nn.Linear(embed_dim, hypertoken_size)
+        # self.fc_out = nn.Linear(embed_dim, hypertoken_size)
+        self.fc_out = nn.Linear(embed_dim, token_len * vocab_size)
 
     def generate_square_subsequent_mask(self, sz):
         """Generate a causal mask to prevent attending to future tokens."""
@@ -93,7 +97,8 @@ class JPT1(nn.Module):
 
         x = self.ln_final(x)
 
-        x = self.fc_out(x)
+        x = self.fc_out(x)  # Shape: [batch_size, seq_len, hypertoken_size * vocab_size]
+        x = x.reshape(batch_size, seq_len, self.token_len, self.vocab_size)
 
         # x = F.normalize(x, p=2, dim=2)
         return x

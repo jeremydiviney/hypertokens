@@ -69,9 +69,6 @@ class TransformerPyramidHyperTokenEncoder(nn.Module):
             nn.Linear(embed_dim, hypertoken_size // self.token_len),
         )
 
-        self.fc_mu = nn.Linear(embed_dim, hypertoken_size)
-        self.fc_logvar = nn.Linear(embed_dim, hypertoken_size)
-
     @typechecked
     def forward(self, x: TensorType["batch_size", "token_len"]) -> TensorType["batch_size", "hypertoken_size"]:
         batch_size, token_len = x.size()
@@ -108,7 +105,7 @@ class TransformerPyramidHyperTokenDecoder(nn.Module):
         compress_factor: int,
     ) -> None:
         super().__init__()
-        self.encode_last_n_length = token_len
+        self.token_len = token_len
         self.embed_dim = embed_dim
 
         self.COMPRESS_FACTOR = compress_factor
@@ -160,14 +157,14 @@ class TransformerPyramidHyperTokenDecoder(nn.Module):
     ) -> TensorType["batch_size", "token_len", "vocab_size"]:
         batch_size = x.size(0)
         hypertoken = x
-        expanded = x.reshape(batch_size, self.encode_last_n_length, -1)
+        expanded = x.reshape(batch_size, self.token_len, -1)
         # expanded = F.normalize(expanded, p=2, dim=2)
 
         for i, (dim_in, dim_out) in enumerate(self.expansion_sizes):
             res_input = expanded  # Preserve pre-expansion state
             expand_factor = dim_out // dim_in
             expanded = expanded.unsqueeze(-1).expand(-1, -1, -1, expand_factor).reshape(
-                batch_size, self.encode_last_n_length, dim_out
+                batch_size, self.token_len, dim_out
             ) * (1.0 / expand_factor)
 
             expanded = self.expansion_layers[i](expanded)
@@ -217,7 +214,10 @@ class TransformerPyramidHyperTokenAutoencoder(nn.Module):
     @typechecked
     def forward(self, x: TensorType["batch_size", "token_len"]) -> TensorType["batch_size", "vocab_size"]:
         hypertoken = self.encoder(x)
+        hypertoken = hypertoken + torch.randn_like(hypertoken) * 0.02
         self.hypertoken = hypertoken  # used for some loss stuff later
+        # add some noise to the hypertoken
+
         decoded = self.decoder(hypertoken)
 
         return decoded

@@ -137,6 +137,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
                     target=y,
                     vocab_size=vocab_size,
                     token_len=token_len,
+                    pad_token=dataloader.dataset.pad_token,
                 )
 
             total_loss += loss.item()
@@ -149,7 +150,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
             target_texts = decode_indices_to_text(target_seqs, dataset.idx2char, dataset.pad_token)
             pred_texts = decode_indices_to_text(pred_indices, dataset.idx2char, dataset.pad_token)
 
-            accuracy_metrics = calculate_text_accuracy(pred_texts, target_texts)
+            accuracy_metrics = calculate_text_accuracy(pred_texts, target_texts, dataset.idx2char[dataset.pad_token])
 
             char_matches_total += accuracy_metrics["char_matches"]
             token_matches_total += accuracy_metrics["token_matches"]
@@ -162,6 +163,10 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
             # Print all incorrect predictions when accuracy is high
             if token_accuracy >= 0.99:
                 # generate_latent_variations(model, model.hypertoken[0], dataset)
+
+                mask = (target_texts == dataset.idx2char[dataset.pad_token]) | (target_texts == "")
+                pred_texts[mask] = ""
+                target_texts[mask] = ""
 
                 pred_flat = pred_texts.squeeze(0)
                 target_flat = target_texts.squeeze(0)
@@ -198,17 +203,24 @@ def calculate_loss(
     target: torch.Tensor,
     vocab_size: int,
     token_len: int,
+    pad_token: int,
     hypertoken_weight: float = 0.05,
     spread_weight: float = 0.1,
-    vae_beta: float = 0.1,
 ) -> torch.Tensor:
+
+    non_pad_mask = target != pad_token
+
+    # Flatten and filter logits and targets
+    flat_logits = logits[non_pad_mask]
+    flat_targets = target[non_pad_mask]
+
     # Reconstruction loss
-    recon_loss = F.cross_entropy(logits.view(-1, vocab_size), target[:, -token_len:].contiguous().view(-1))
+    recon_loss = F.cross_entropy(flat_logits, flat_targets)
 
     # Original regularization terms
     hypertoken_norms = torch.norm(model.hypertoken, p=2, dim=1)
 
-    norm_loss = F.mse_loss(hypertoken_norms, torch.ones_like(hypertoken_norms))
+    norm_loss = F.l1_loss(hypertoken_norms, torch.ones_like(hypertoken_norms))
 
     # Combined loss
     total_loss = recon_loss + hypertoken_weight * norm_loss
@@ -264,6 +276,8 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     low_loss = 10000
 
+    loss_history = []
+
     vocab_size = len(dataloader.dataset.char2idx)
 
     for epoch in range(epochs):
@@ -291,14 +305,22 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
                         target=y,
                         vocab_size=vocab_size,
                         token_len=token_len,
+                        pad_token=dataloader.dataset.pad_token,
                     )
 
                 # Update metrics
                 segment_loss += loss.item()
                 epoch_loss += loss.item()
 
-                if loss.item() < low_loss:
-                    low_loss = loss.item()
+                loss_history.append(loss.item())
+
+                if len(loss_history) > 20:
+                    loss_history.pop(0)
+
+                current_mean_loss = sum(loss_history) / len(loss_history)
+
+                if current_mean_loss < low_loss:
+                    low_loss = current_mean_loss
                     print(f"New low loss: {low_loss:.7f}")
 
                 # Log batch metrics
@@ -317,16 +339,6 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
                 max_grad_norm = 0.1
                 # Add gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
-                # total_norm = torch.norm(
-                #     torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None])
-                # )
-
-                # # Normalize gradients to unit norm
-                # if total_norm > 0:  # Avoid division by zero
-                #     for p in model.parameters():
-                #         if p.grad is not None:
-                #             p.grad.data.mul_(grad_norm / total_norm)
 
                 optimizer.step()
 
@@ -426,7 +438,7 @@ if __name__ == "__main__":
         {
             "token_len": 16,
             "hypertoken_size": hs,
-            "epochs": 6,
+            "epochs": 8,
             "batch_size": bs,
             "lr": lr,
             "head_size": head_size,
@@ -437,10 +449,10 @@ if __name__ == "__main__":
         for hs in [64]  # Varying hypertoken_size
         for ed in [256]  # Varying embed_dim
         for n_layers in [1]  # Varying n_layers
-        for head_size in [16, 32]  # Varying head_size
-        for compress_factor in [2]
-        for lr in [0.001]
-        for bs in [512]
+        for head_size in [32]  # Varying head_size
+        for compress_factor in [4]
+        for lr in [0.00033333]
+        for bs in [256]
     ]
 
     enable_torch_optimizations()

@@ -117,16 +117,29 @@ def tokenize(text: str, token_len: int, silent: bool = True) -> List[str]:
     return tokens
 
 
-def finalize_tokens(text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int) -> np.ndarray:
+def finalize_tokens(
+    text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int, eot_token: int
+) -> np.ndarray:
     tokens = []
 
-    for token in text_tokens:
-        tokens.append(np.array([char2idx[ch] for ch in token], dtype=np.int64))
+    try:
 
-    padded_tokens = [np.pad(token, (0, token_len - len(token)), constant_values=pad_token) for token in tokens]
-    tokens = np.stack(padded_tokens)
+        for token in text_tokens:
+            # Create array of character indices with an extra space for EOT
+            char_indices = [char2idx[ch] for ch in token]
+            # Append EOT token
+            char_indices.append(eot_token)
+            char_indices = char_indices[:token_len]
+            tokens.append(np.array(char_indices, dtype=np.int64))
 
-    return tokens
+        padded_tokens = [np.pad(token, (0, token_len - len(token)), constant_values=pad_token) for token in tokens]
+        tokens = np.stack(padded_tokens)
+
+        return tokens
+
+    except Exception as e:
+        print(f"Error finalizing tokens: {e}")
+        raise e
 
 
 # --------------------------------------------------
@@ -164,12 +177,17 @@ class TinyShakespeareDataset(Dataset):
         self.char2idx["<PAD>"] = self.pad_token
         self.idx2char[self.pad_token] = "<PAD>"
 
+        # Add end of text token
+        self.eot_token = len(chars) + 1
+        self.char2idx["<EOT>"] = self.eot_token
+        self.idx2char[self.eot_token] = "<EOT>"
+
         # Create numpy versions of the mappings
         self.idx2char_np = np.array([self.idx2char[i] for i in range(len(self.idx2char))])
 
         self.text_tokens = tokenize(text, self.token_len, False)
 
-        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token)
+        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token, self.eot_token)
 
         self.segments = segments
         self.type = type
@@ -239,12 +257,17 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         self.char2idx["<PAD>"] = self.pad_token
         self.idx2char[self.pad_token] = "<PAD>"
 
+        # Add end of text token
+        self.eot_token = len(chars) + 1
+        self.char2idx["<EOT>"] = self.eot_token
+        self.idx2char[self.eot_token] = "<EOT>"
+
         self.batch_item_buffer_x = []
         self.batch_item_buffer_y = []
 
         self.text_tokens = tokenize(text, self.token_len, False)
 
-        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token)
+        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token, self.eot_token)
 
     def __len__(self) -> int:
 
@@ -289,15 +312,21 @@ class HyperTokenTinyShakespeareDataset(Dataset):
     def encode_to_hypertokens_from_text(self, encoder: nn.Module, text: str, max_seq_len: int) -> torch.Tensor:
         device = next(encoder.parameters()).device
 
-        # Convert text to character indices
-        text_tokens = tokenize(text, self.token_len)
+        try:
+            # Convert text to character indices
+            text_tokens = tokenize(text, self.token_len)
 
-        text_tokens = text_tokens[-max_seq_len:]
+            text_tokens = text_tokens[-max_seq_len:]
 
-        tokens = finalize_tokens(text_tokens, self.char2idx, self.token_len, self.pad_token)
-        tokens = torch.tensor(tokens).to(device)
+            tokens = finalize_tokens(text_tokens, self.char2idx, self.token_len, self.pad_token, self.eot_token)
+            tokens = torch.tensor(tokens).to(device)
 
-        return self.encode_to_hypertokens(encoder, tokens.reshape(1, -1, self.token_len), self.token_len)
+            return self.encode_to_hypertokens(encoder, tokens.reshape(1, -1, self.token_len), self.token_len)
+        except Exception as e:
+            print(f"Error encoding: {e}")
+            print(f"Text: {text}")
+            print(f"Max seq len: {max_seq_len}")
+            raise e
 
     def encode_characters_to_indexes(self, text: str) -> torch.Tensor:
         return torch.tensor([self.char2idx[ch] for ch in text], dtype=torch.long)
