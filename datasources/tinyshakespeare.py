@@ -15,6 +15,7 @@ from torch.utils.data.dataset import Dataset
 
 from datasets import load_dataset
 
+from models.jpt1_quantizer import TokenCodebook
 
 TOKEN_PATTERN = re.compile(r"(\s+|\w+|[^\w\s])")
 
@@ -163,7 +164,12 @@ class TinyShakespeareDataset(Dataset):
         all_text = train_text + val_text + test_text
         val_text = val_text + test_text
 
-        text = train_text if type == "train" else val_text
+        if type == "train":
+            text = train_text
+        elif type == "all":
+            text = all_text
+        else:
+            text = val_text
 
         self.token_len = token_len
 
@@ -389,3 +395,94 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         batch_items = list(zip(input_chars, target_chars))
 
         return batch_items
+
+
+class TinyShakespeareDatasetQuantized(Dataset):
+    def __init__(
+        self,
+        segments: int,
+        token_len: int,
+        seq_len: int,
+        codebook: TokenCodebook,
+        type: str = "train",
+    ):
+        # Load TinyShakespeare from Hugging Face
+        dataset = load_dataset("tiny_shakespeare")
+
+        self.seq_len = seq_len
+        self.codebook = codebook
+        train_text = dataset["train"]["text"][0]
+        val_text = dataset["validation"]["text"][0]
+        test_text = dataset["test"]["text"][0]
+
+        all_text = train_text + val_text + test_text
+        val_text = val_text + test_text
+
+        if type == "train":
+            text = train_text
+        elif type == "all":
+            text = all_text
+        else:
+            text = val_text
+
+        self.token_len = token_len
+
+        # Build vocabulary
+        chars = sorted(list(set(all_text)))
+        self.char2idx = {ch: i for i, ch in enumerate(chars)}
+        self.idx2char = {i: ch for ch, i in self.char2idx.items()}
+
+        # Add padding token
+        self.pad_token = len(chars)
+        self.char2idx["<PAD>"] = self.pad_token
+        self.idx2char[self.pad_token] = "<PAD>"
+
+        # Add end of text token
+        self.eot_token = len(chars) + 1
+        self.char2idx["<EOT>"] = self.eot_token
+        self.idx2char[self.eot_token] = "<EOT>"
+
+        # Create numpy versions of the mappings
+        self.idx2char_np = np.array([self.idx2char[i] for i in range(len(self.idx2char))])
+
+        self.text_tokens = np.array(tokenize(text, self.token_len, False))
+
+        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token, self.eot_token)
+
+        self.segments = segments
+        self.type = type
+
+    def __len__(self) -> int:
+
+        if self.type == "train":
+            return math.floor(len(self.tokens) / self.segments)
+        else:
+            return len(self.tokens)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        final_index = 0
+
+        if self.type == "train":
+            final_index = random.randint(0, len(self.tokens) - 1)
+        else:
+            final_index = idx
+
+        # Get sequence of tokens up to seq_len
+        token_sequence = self.text_tokens[final_index : (final_index + self.seq_len + 1)]
+
+        # Calculate padding needed
+        padding_needed = (self.seq_len + 1) - len(token_sequence)
+
+        if padding_needed > 0:
+            # Create padding array filled with pad_token
+            padding = np.full((padding_needed, self.token_len), self.pad_token, dtype=np.int64)
+            # Concatenate the token sequence with padding
+            token_sequence = np.concatenate([token_sequence, padding], axis=0)
+
+        x = token_sequence[:-1]
+        y = token_sequence[1:]
+
+        x = np.array(self.codebook.get_token_indices(x))
+        y = np.array(self.codebook.get_token_indices(y))
+
+        return x, y
