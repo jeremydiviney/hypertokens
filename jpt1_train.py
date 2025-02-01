@@ -629,7 +629,7 @@ def get_text_token_from_prediction_text(prediction_text: str) -> str:
     for char in prediction_text:
         if char == "<EOT>":
             break
-        pred_text_chars.append("" if char == "<PAD>" else char)
+        pred_text_chars.append("" if char == "[PAD]" else char)
 
     return "".join(pred_text_chars)
 

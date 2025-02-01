@@ -1,6 +1,8 @@
 import random
 import math
 import re
+import os
+import json
 
 from typing import List, Tuple
 from torchtyping import TensorType, patch_typeguard
@@ -143,6 +145,39 @@ def finalize_tokens(
         raise e
 
 
+def load_cached_dataset():
+    cache_path = "data_cache/tiny_shakespeare"
+    try:
+        # Try to load from cache first
+        dataset = load_dataset("tiny_shakespeare", cache_dir=cache_path)
+    except Exception as e:
+        print(f"Warning: Could not load dataset from Hugging Face: {e}")
+        # Fallback to local backup if it exists
+        try:
+            dataset = load_dataset(
+                "json",
+                data_files={
+                    "train": f"{cache_path}/train.json",
+                    "validation": f"{cache_path}/validation.json",
+                    "test": f"{cache_path}/test.json",
+                },
+            )
+        except Exception as backup_e:
+            print(f"Error: Could not load from backup: {backup_e}")
+            raise RuntimeError("Failed to load dataset from both HF and local cache")
+
+    # Save a local backup after successful HF download
+    try:
+        os.makedirs(cache_path, exist_ok=True)
+        for split in ["train", "validation", "test"]:
+            with open(f"{cache_path}/{split}.json", "w") as f:
+                json.dump({"text": dataset[split]["text"]}, f)
+    except Exception as e:
+        print(f"Warning: Could not save backup: {e}")
+
+    return dataset
+
+
 # --------------------------------------------------
 # --------------------------------------------------
 # 1. Data Preparation
@@ -154,8 +189,8 @@ class TinyShakespeareDataset(Dataset):
         token_len: int,
         type: str = "train",
     ):
-        # Load TinyShakespeare from Hugging Face
-        dataset = load_dataset("tiny_shakespeare")
+        # Load TinyShakespeare with caching
+        dataset = load_cached_dataset()
 
         train_text = dataset["train"]["text"][0]
         val_text = dataset["validation"]["text"][0]
@@ -180,8 +215,8 @@ class TinyShakespeareDataset(Dataset):
 
         # Add padding token
         self.pad_token = len(chars)
-        self.char2idx["<PAD>"] = self.pad_token
-        self.idx2char[self.pad_token] = "<PAD>"
+        self.char2idx["[PAD]"] = self.pad_token
+        self.idx2char[self.pad_token] = "[PAD]"
 
         # Add end of text token
         self.eot_token = len(chars) + 1
@@ -241,7 +276,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
         self.data_tile_length = 16
 
         # Load TinyShakespeare from Hugging Face
-        dataset = load_dataset("tiny_shakespeare")
+        dataset = load_cached_dataset()
 
         train_text = dataset["train"]["text"][0]
         val_text = dataset["validation"]["text"][0]
@@ -260,8 +295,8 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 
         # Add padding token
         self.pad_token = len(chars)
-        self.char2idx["<PAD>"] = self.pad_token
-        self.idx2char[self.pad_token] = "<PAD>"
+        self.char2idx["[PAD]"] = self.pad_token
+        self.idx2char[self.pad_token] = "[PAD]"
 
         # Add end of text token
         self.eot_token = len(chars) + 1
@@ -404,13 +439,14 @@ class TinyShakespeareDatasetQuantized(Dataset):
         token_len: int,
         seq_len: int,
         codebook: TokenCodebook,
+        data_stride: int,
         type: str = "train",
     ):
         # Load TinyShakespeare from Hugging Face
-        dataset = load_dataset("tiny_shakespeare")
-
+        dataset = load_cached_dataset()
         self.seq_len = seq_len
         self.codebook = codebook
+        self.data_stride = data_stride
         train_text = dataset["train"]["text"][0]
         val_text = dataset["validation"]["text"][0]
         test_text = dataset["test"]["text"][0]
@@ -427,27 +463,7 @@ class TinyShakespeareDatasetQuantized(Dataset):
 
         self.token_len = token_len
 
-        # Build vocabulary
-        chars = sorted(list(set(all_text)))
-        self.char2idx = {ch: i for i, ch in enumerate(chars)}
-        self.idx2char = {i: ch for ch, i in self.char2idx.items()}
-
-        # Add padding token
-        self.pad_token = len(chars)
-        self.char2idx["<PAD>"] = self.pad_token
-        self.idx2char[self.pad_token] = "<PAD>"
-
-        # Add end of text token
-        self.eot_token = len(chars) + 1
-        self.char2idx["<EOT>"] = self.eot_token
-        self.idx2char[self.eot_token] = "<EOT>"
-
-        # Create numpy versions of the mappings
-        self.idx2char_np = np.array([self.idx2char[i] for i in range(len(self.idx2char))])
-
         self.text_tokens = np.array(tokenize(text, self.token_len, False))
-
-        self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token, self.eot_token)
 
         self.segments = segments
         self.type = type
@@ -455,17 +471,17 @@ class TinyShakespeareDatasetQuantized(Dataset):
     def __len__(self) -> int:
 
         if self.type == "train":
-            return math.floor(len(self.tokens) / self.segments)
+            return math.floor(len(self.codebook.tokens) / self.segments)
         else:
-            return len(self.tokens)
+            return len(self.text_tokens) // self.data_stride
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         final_index = 0
 
         if self.type == "train":
-            final_index = random.randint(0, len(self.tokens) - 1)
+            final_index = random.randint(0, len(self.text_tokens) - 1)
         else:
-            final_index = idx
+            final_index = idx * self.data_stride
 
         # Get sequence of tokens up to seq_len
         token_sequence = self.text_tokens[final_index : (final_index + self.seq_len + 1)]
@@ -475,9 +491,9 @@ class TinyShakespeareDatasetQuantized(Dataset):
 
         if padding_needed > 0:
             # Create padding array filled with pad_token
-            padding = np.full((padding_needed, self.token_len), self.pad_token, dtype=np.int64)
+            padding = np.full((padding_needed), "[PAD]")
             # Concatenate the token sequence with padding
-            token_sequence = np.concatenate([token_sequence, padding], axis=0)
+            token_sequence = np.concatenate([padding, token_sequence], axis=0)
 
         x = token_sequence[:-1]
         y = token_sequence[1:]

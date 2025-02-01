@@ -76,6 +76,8 @@ logging/
 
 # Data
 data/
+data_cache/
+tokenizer_cache/
 *.pkl
 *.h5
 *.pt

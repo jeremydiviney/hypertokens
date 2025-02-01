@@ -13,15 +13,13 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 import torch.nn.functional as F
 from torch.utils.data.dataset import Dataset
+from tokenizers import Tokenizer
 
 from sklearn.neighbors import KDTree
 
-from models.jpt1_quantizer import JPT1Quantized, TokenCodebook
+from models.jpt1_quantizer import JPT1Quantized, TokenCodebook, compute_logits
 
-from datasources.tinyshakespeare import (
-    TinyShakespeareDatasetQuantized,
-    decode_indices_to_text,
-)
+from datasources.booksum import BooksumDataset, get_or_train_tokenizer
 from helpers.experiments import run_experiment, count_parameters
 from helpers.training import (
     save_model,
@@ -29,7 +27,9 @@ from helpers.training import (
     setup_flash_attention,
 )
 
-from helpers.utilities import calculate_text_accuracy
+from models.jpt1_quantizer import JPT1QuantModelType
+
+from helpers.utilities import calculate_token_accuracy
 
 # --------------------------------------------------
 # 2. Model Definition
@@ -55,88 +55,106 @@ def evaluate_model(
     token_total = 0
 
     for x, y in dataloader:
+
         x = x.to(device)
         y = y.to(device)
 
-        start_time = time.time()
-
         current_batch_size = x.shape[0]
 
-        jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
+        with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
+            jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
 
-        total_loss += loss.item()
-        batch_count += 1
+            total_loss += loss.item()
+            batch_count += 1
 
-        target_texts = decode_indices_to_text(y, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
+            if model.modelType == JPT1QuantModelType.COS_SIM:
+                pred_token_indices = dataset.codebook.get_nearest_token_indices(jpt_output)
+            else:
+                pred_token_indices = jpt_output.argmax(dim=-1)
 
-        pred_indices = torch.argmax(decoder_output, dim=-1)
+            pred_token_indices = pred_token_indices.detach().cpu().numpy()
 
-        pred_texts = decode_indices_to_text(pred_indices, dataloader.dataset.idx2char, dataloader.dataset.pad_token)
+        pred_tokens = dataset.codebook.get_text_token_from_indices(pred_token_indices)
 
-        accuracy_metrics = calculate_text_accuracy(pred_texts, target_texts, dataset.idx2char[dataset.pad_token])
+        target_tokens = dataset.codebook.get_text_token_from_indices(y.detach().cpu().numpy())
 
-        char_matches_total += accuracy_metrics["char_matches"]
+        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.codebook.token_list["[PAD]"])
+
         token_matches_total += accuracy_metrics["token_matches"]
-        char_total += accuracy_metrics["char_count"]
         token_total += accuracy_metrics["token_count"]
 
-        end_time = time.time()
         # print(f"Time taken to do evaluation step: {end_time - start_time:.4f} seconds")
 
         print(f"\nSample {batch_count}:")
         # print(f"Target: {target_texts[0]}")
         # print(f"Pred:   {pred_texts[0]}")
         print(f"Current token accuracy: {token_matches_total/token_total:.2%}")
-        print(f"Current character accuracy: {char_matches_total/char_total:.2%}")
 
-    generate_text(
-        model, encoder_model, decoder_model, "KING:", 250, dataloader.dataset, from_hypertoken=from_hypertoken
-    )
+    generate_text(model, "The", 250, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
         "val_token_accuracy": token_matches_total / token_total,
-        "val_char_accuracy": char_matches_total / char_total,
     }
 
     model.train()
-    decoder_model.train()
     return result
 
 
-def calculate_loss(model_output, target_chars, pad_token: int):
-    # model_output is [batch_size, seq_len, token_len, vocab_size]
-    # target_chars is [batch_size, seq_len, token_len]
+def inference_step(model, x):
 
-    batch_size, seq_len, token_len, vocab_size = model_output.shape
+    model_output = model(x)
+    return model_output
 
-    mask = target_chars != pad_token
 
-    target_chars = target_chars[mask]
-    model_output = model_output[mask]
+def analyze_embedding_clustering(model):
+    with torch.no_grad():
+        embeddings = model.codebook.lookup_embeddings.weight
+        normalized_emb = F.normalize(embeddings, p=2, dim=1)
 
-    loss = F.cross_entropy(model_output, target_chars).mean()
+        # Get pairwise similarities
+        sim_matrix = torch.matmul(normalized_emb, normalized_emb.t())
 
-    return loss
+        # For each embedding, count how many others are "close"
+        similarity_thresholds = [0.5, 0.7, 0.9]
+        for thresh in similarity_thresholds:
+            close_count = (sim_matrix > thresh).sum(dim=1)
+            print(f"\nTokens with similarity > {thresh}:")
+            print(f"Mean neighbors: {close_count.float().mean():.2f}")
+            print(f"Max neighbors: {close_count.max().item()}")
+
+            # Find most clustered embeddings
+            most_clustered = torch.topk(close_count, 5)
+            print(f"Most clustered token indices: {most_clustered.indices.tolist()}")
 
 
 def inference_and_loss_step(dataset, model, x, y):
 
-    device = next(model.parameters()).device
+    # Forward pass to get output embeddings
+    model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
 
-    seq_len = x.shape[1]
+    if model.modelType == JPT1QuantModelType.COS_SIM:
 
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
+        lookup_embeddings = model.codebook.lookup_embeddings.weight
 
-        embeddings = model.codebook.embeddings(x)
-        embed_dim = embeddings[2]
-        model_output = model(embeddings)
+        logits = compute_logits(model, model_output)
 
-        # Calculate loss
-        target_embeddings = model.codebook.get_embeddings_for_indeces(y)
-        loss = F.mse_loss(model_output, target_embeddings)
+        # Calculate cross entropy loss
+        loss_fn = nn.CrossEntropyLoss()
+        ce_loss = loss_fn(logits.view(-1, lookup_embeddings.size(0)), y.view(-1))
 
-    return model_output, loss
+        loss = ce_loss
+
+        return model_output, loss
+
+    else:
+        # For standard model types, compute logits normally and apply cross entropy over the vocab.
+        logits = model_output
+        loss_fn = nn.CrossEntropyLoss()
+        # logits shape is assumed to be [batch, seq_len, vocab_size]
+        ce_loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+        loss = ce_loss
+        return model_output, loss
 
 
 def train_model(
@@ -186,7 +204,7 @@ def train_model(
 
     loss_history = []
 
-    eval_every_n_tokens = 1000000
+    eval_every_n_tokens = 1000000 * 15
     tokens_since_eval = 0
 
     batches_per_epoch = 100000 // config["batch_size"]
@@ -230,7 +248,6 @@ def train_model(
                         {
                             "val_loss": eval_results["val_loss"],
                             "val_token_accuracy": eval_results["val_token_accuracy"],
-                            "val_char_accuracy": eval_results["val_char_accuracy"],
                             "epoch": epoch,
                         }
                     )
@@ -242,7 +259,8 @@ def train_model(
 
                 start_time = time.time()
 
-                jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
 
                 end_time = time.time()
                 # print(f"Time taken to do inference and loss step: {end_time - start_time:.4f} seconds")
@@ -267,6 +285,11 @@ def train_model(
                 start_time = time.time()
 
                 optimizer.zero_grad(set_to_none=True)
+
+                max_grad_norm = 0.1
+                # Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
                 loss.backward()
                 optimizer.step()
                 # scheduler.step()
@@ -298,7 +321,6 @@ def train_model(
 
         val_loss = eval_results["val_loss"]
         val_token_accuracy = eval_results["val_token_accuracy"]
-        val_char_accuracy = eval_results["val_char_accuracy"]
 
         wandb.log(
             {
@@ -308,8 +330,7 @@ def train_model(
         )
 
         print(
-            f"Epoch {epoch} train_loss: {avg_segment_loss:.4f}, val_loss: {val_loss:.4f}, "
-            f"val_token_accuracy: {val_token_accuracy:.2%}, val_char_accuracy: {val_char_accuracy:.2%}"
+            f"Epoch {epoch} train_loss: {avg_segment_loss:.4f}, val_loss: {val_loss:.4f}, " f"val_token_accuracy: {val_token_accuracy:.2%}"
         )
 
     # Final Evaluation
@@ -323,8 +344,7 @@ def train_model(
         {
             "epoch_loss": epoch_loss / batch_count,
             "val_loss": eval_results["val_loss"],
-            "val_token": eval_results["val_token_accuracy"],
-            "val_char_accuracy": eval_results["val_char_accuracy"],
+            "val_token_accuracy": eval_results["val_token_accuracy"],
             "epoch": epoch,
         }
     )
@@ -408,43 +428,30 @@ def get_text_token_from_prediction_text(prediction_text: str) -> str:
     for char in prediction_text:
         if char == "<EOT>":
             break
-        pred_text_chars.append("" if char == "<PAD>" else char)
+        pred_text_chars.append("" if char == "[PAD]" else char)
 
     return "".join(pred_text_chars)
 
 
-def get_codebook(dataset: TinyShakespeareDatasetQuantized, embed_dim: int):
+def get_codebook(tokenizer: Tokenizer, embed_dim: int):
 
-    unique_tokens = set()
+    codebook = TokenCodebook(tokenizer=tokenizer, embed_dim=embed_dim)
 
-    # Use similar iteration pattern as training loop
-    for token in dataset.text_tokens:
-        if token not in unique_tokens:
-            unique_tokens.add(token)
-
-    unique_tokens = list(unique_tokens)
-
-    codebook = TokenCodebook(unique_tokens, embed_dim=embed_dim)
-
-    print(f"Populated codebook with {len(codebook.token_array)} unique tokens")
+    print(f"Populated codebook with {len(codebook.token_list)} unique tokens")
 
     return codebook
 
 
 def generate_text(
     jpt_model: nn.Module,
-    encoder_model: nn.Module,
-    decoder_model: nn.Module,
     prompt: str,
     max_new_tokens: int,
-    dataset: TinyShakespeareDatasetQuantized,
+    dataset: BooksumDataset,
     temperature: float = 0.5,
-    from_hypertoken: bool = True,
     device: str = "cuda",
 ) -> str:
     # Set models to eval mode
     jpt_model.eval()
-    decoder_model.eval()
 
     print("Generating...\n")
 
@@ -453,41 +460,39 @@ def generate_text(
     if len(prompt) == 0:
         raise ValueError("Prompt must be at least one character long")
 
-    result: [str] = list(prompt)
+    result: [str] = [prompt]
 
-    for i in range(max_new_tokens):
+    for _ in range(max_new_tokens):
 
         current_context = "".join(result)
         # make sure the context is not empty
         current_context = " " if current_context == "" else current_context
 
-        encoded_list = dataset.encode_to_hypertokens_from_text(encoder_model, current_context, jpt_model.seq_len)
-        encoded = torch.stack(encoded_list).to(device)
+        tokens = dataset.codebook.tokenizer.encode(current_context).tokens
+        tokens = tokens[-jpt_model.seq_len :]
 
-        jpt_output = jpt_model(encoded)
+        x = torch.tensor(dataset.codebook.get_token_indices(tokens)).to(device)
+        x = x.unsqueeze(0)
+
+        jpt_output = inference_step(jpt_model, x)
 
         cur_batch_size = jpt_output.shape[0]
         cur_seq_len = jpt_output.shape[1]
 
-        if from_hypertoken:
-            hypertoken = jpt_output[0:1, -1:, :]
-            pred_texts = decode_text_from_hypertoken(dataset, hypertoken, decoder_model, encoder_model.token_len, 0)
-
-        else:
-
-            # decoder_output = decoder_model(jpt_output.reshape(-1, jpt_output.shape[-1]))
-
-            # decoder_output = decoder_output.reshape(cur_batch_size, cur_seq_len, token_len, -1)
-
-            decoder_output = jpt_output
-
-            pred_indices = torch.argmax(decoder_output, dim=-1)
-
-            pred_texts = decode_indices_to_text(pred_indices, dataset.idx2char, dataset.pad_token)
-
         # Print the generated character
 
-        next_token = get_text_token_from_prediction_text(pred_texts[0][-1])
+        last_token = jpt_output[0:1, -1:, :]
+
+        with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
+            if jpt_model.modelType == JPT1QuantModelType.COS_SIM:
+                pred_token_indices = dataset.codebook.get_nearest_token_indices(last_token, top_k=1, temperature=0.1)
+            else:
+                pred_token_indices = last_token.argmax(dim=-1)
+
+        next_token = dataset.codebook.get_text_token_from_indices(pred_token_indices.cpu().numpy())
+        next_token = next_token.item()
+
+        next_token = "" if next_token == "[UNK]" or next_token == "[PAD]" else next_token
 
         print(next_token, end="", flush=True)
 
@@ -507,8 +512,8 @@ if __name__ == "__main__":
     experiments: list[dict] = [
         {
             "seq_len": sl,
-            "token_len": 16,
-            "token_space_dim": 128,
+            "token_len": 8,
+            "token_space_dim": token_space_dim,
             "epochs": epochs,
             "batch_size": 32,
             "lr": lr,
@@ -518,13 +523,14 @@ if __name__ == "__main__":
             "data_segments": 10,
             "dropout": dropout,
         }
-        for n_layers in [4]  # Varying n_layers
+        for n_layers in [6]  # Varying n_layers
         for head_size in [32]  # Varying head_size
-        for jed in [128]
-        for lr in [0.003]
-        for sl in [128]
-        for epochs in [3]
-        for dropout in [0.2]
+        for jed in [384]
+        for lr in [0.0007]
+        for sl in [256]
+        for epochs in [10]
+        for dropout in [0.1]
+        for token_space_dim in [8, 16, 32, 64, 128, 256, 384]
     ]
 
     enable_torch_optimizations()
@@ -547,15 +553,33 @@ if __name__ == "__main__":
         token_space_dim = experiment["token_space_dim"]
         # load this just to get the vocab size
 
-        dataset = TinyShakespeareDatasetQuantized(
-            token_len=experiment["token_len"], seq_len=seq_len, segments=data_segments, type="all", codebook=None
+        dataset_all = BooksumDataset(
+            token_len=experiment["token_len"],
+            seq_len=seq_len,
+            segments=data_segments,
+            type="all",
+            codebook=None,
+            data_stride=1,
+            tokenizer=None,
         )
 
-        codebook = get_codebook(dataset, token_space_dim)
+        tokenizer = get_or_train_tokenizer(dataset_all.all_text, 30000, "tokenizer_cache/booksum_tokenizer.json")
 
-        dataset.codebook = codebook.to(DEVICE)
+        codebook = get_codebook(tokenizer, token_space_dim)
 
-        vocab_size = len(dataset.char2idx)
+        dataset_train = BooksumDataset(
+            token_len=experiment["token_len"],
+            seq_len=seq_len,
+            segments=data_segments,
+            type="train",
+            codebook=None,
+            data_stride=1,
+            tokenizer=tokenizer,
+        )
+
+        dataset_train.codebook = codebook.to(DEVICE)
+
+        vocab_size = len(dataset_train.codebook.token_list)
 
         gpt_model = JPT1Quantized(
             token_space_dim=token_space_dim,
@@ -566,20 +590,23 @@ if __name__ == "__main__":
             num_layers=n_layers,
             dropout=dropout,
             codebook=codebook,
+            modelType=JPT1QuantModelType.COS_SIM,
         ).to(DEVICE)
 
         dataloader = DataLoader(
-            dataset,
+            dataset_train,
             batch_size=batch_size,
             shuffle=True,
         )
 
-        val_dataset = TinyShakespeareDatasetQuantized(
+        val_dataset = BooksumDataset(
             token_len=token_len,
             seq_len=seq_len,
             segments=data_segments,
             type="validation",
             codebook=codebook,
+            data_stride=seq_len,
+            tokenizer=tokenizer,
         )
 
         val_dataloader = DataLoader(
@@ -606,7 +633,7 @@ if __name__ == "__main__":
                 val_dataloader,
                 experiment,
             )
-            return model[0]
+            return model
 
         project_name = "jpt1"
         exp_name = f"{project_name}-sl:{experiment['seq_len']}-tl:{experiment['token_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"

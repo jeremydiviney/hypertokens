@@ -1,3 +1,5 @@
+import time
+import os
 from enum import Enum
 import torch
 import torch.nn as nn
@@ -5,63 +7,101 @@ import torch.nn.functional as F
 
 import numpy as np
 
-from sklearn.neighbors import KDTree
+from tokenizers import Tokenizer
+
+
+def compute_logits(model, hidden_states):
+    """
+    Convert hidden states to similarity scores over vocab.
+    hidden_states shape: [batch_size, seq_len, embed_dim]
+    Returns logits of shape [batch_size, seq_len, vocab_size]
+    """
+    # Normalize
+    hidden_norm = F.normalize(hidden_states, p=2, dim=-1)
+    output_norm = F.normalize(model.codebook.lookup_embeddings.weight, p=2, dim=-1)  # [vocab_size, embed_dim]
+
+    # Compute cosine similarities (batch x seq x vocab)
+    # (hidden_norm: bsz, seq, embed) x (output_norm: vocab, embed) -> bsz, seq, vocab
+    logits = torch.einsum("bse,ve->bsv", hidden_norm, output_norm)
+    logits = logits / model.temperature
+    return logits
 
 
 class TokenCodebook(nn.Module):
-    def __init__(self, token_list, embed_dim):
+    def __init__(self, embed_dim, tokenizer: Tokenizer):
         super().__init__()
         self.embed_dim = embed_dim
-        self.embeddings = nn.Embedding(len(token_list), embed_dim)
+        self.tokenizer = tokenizer
 
-        # Create mappings
-        self.token_to_idx = {token: i for i, token in enumerate(token_list)}
-        self.idx_to_token = {i: token for i, token in enumerate(token_list)}
+        self.token_list = tokenizer.get_vocab()
 
-        self.token_array = np.array(token_list)
-        self.tree = KDTree((self.embeddings.weight).detach().cpu().numpy())
+        self.text_token_to_idx = {token: self.token_list[token] for token in self.token_list}
 
-        # Store raw tokens
-        self.token_array = np.array(token_list)
+        self.lookup_embeddings = nn.Embedding(len(self.token_list), embed_dim)
 
-    def forward(self, token_indices):
-        """Get embeddings for token indices"""
-        return self.embeddings(token_indices)
+    def get_nearest_token_indices(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
+        """
+        Find the nearest tokens using pure PyTorch cosine similarity.
+        projections shape: [batch_size, seq_len, embed_dim]
+        lookup_embeddings shape: [vocab_size, embed_dim]
+        Returns a [batch_size, seq_len] tensor of token indices.
+        """
 
-    def update_tree(self):
-        """Update the KDTree with current embeddings"""
-        self.tree = KDTree((self.embeddings.weight).detach().cpu().numpy())
+        # 1. Normalize the projections
+        proj_norm = F.normalize(projections, p=2, dim=-1)  # [B, S, E]
 
-    def get_nearest_tokens(self, projections):
-        """Find nearest tokens for given projections"""
-        projections_np = projections.detach().cpu().numpy()
-        _, indices = self.tree.query(projections_np, k=1)
-        return [self.idx_to_token[idx] for idx in indices.flatten()]
+        # 2. Normalize the codebook embeddings
+        emb_norm = F.normalize(self.lookup_embeddings.weight, p=2, dim=-1)  # [V, E]
 
-    def get_token_indices(self, text_tokens):
-        """Get embeddings for text tokens"""
-        device = self.embeddings.weight.device
-        indices = [self.token_to_idx[token] for token in text_tokens]
-        return indices
+        # 3. Compute pairwise similarity: shape [B, S, V]
+        similarity = torch.einsum("bse,ve->bsv", proj_norm, emb_norm)
 
-    def get_embeddings_for_indeces(self, indices: torch.Tensor) -> torch.Tensor:
-        # Handle batched input of shape [batch_size, sequence_length]
+        if top_k == 1:
+            # do_sample doesn't really apply when top_k=1, so we just pick argmax
+            indices = similarity.argmax(dim=-1)  # [B, S]
+            return indices
 
-        batch_size, seq_length = indices.shape
-        # Reshape to 1D for conversion
-        flat_indices = indices.reshape(-1)
+        # -- Otherwise, select top_k candidates along the vocab dimension --
+        # topk_values, topk_indices both => [B, S, top_k]
+        topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)
 
-        # Get embeddings
-        embeddings = self.embeddings(flat_indices)
-        # Reshape back to [batch_size, sequence_length, embed_dim]
-        return embeddings.reshape(batch_size, seq_length, self.embed_dim)
+        # Sample from a softmax distribution over the top_k
+        # 1) Convert topk_values => probabilities via softmax
+        probs = F.softmax(topk_values / temperature, dim=-1)  # [B, S, top_k]
+
+        # 2) Flatten batch and sequence dims for multinomial
+        bsz, seq_len, k = probs.shape
+        probs_flat = probs.view(-1, k)  # [B*S, top_k]
+
+        # 3) Sample an index in [0..top_k-1] for each position in the batch
+        chosen_in_topk = torch.multinomial(probs_flat, 1).squeeze(-1)  # [B*S]
+
+        # 4) Map chosen_in_topk back to the actual token IDs
+        topk_indices_flat = topk_indices.view(-1, k)  # [B*S, top_k]
+        final_indices_flat = torch.gather(topk_indices_flat, dim=1, index=chosen_in_topk.unsqueeze(-1)).squeeze(-1)  # [B*S]
+
+        # 5) Reshape to [B, S]
+        final_indices = final_indices_flat.view(bsz, seq_len)
+        return final_indices
+
+    def get_token_indices(self, text_tokens: list[str]) -> list[int]:
+        """
+        Convert a list of text tokens to their corresponding indices.
+        """
+        return [self.text_token_to_idx[token] for token in text_tokens]
+
+    def get_text_token_from_indices(self, indices: np.ndarray) -> np.ndarray:
+        shape = indices.shape
+        # reshape so we have have a giant batch of 1 token each so the decode_batch will return a bit array as we don't just want a blob of text yet.
+        indices = indices.reshape(-1, 1)
+        decoded_tokens = self.tokenizer.decode_batch(indices)
+        decoded_tokens = np.array(decoded_tokens)
+        return decoded_tokens.reshape(shape)
 
 
-class ExpandMethod(Enum):
-    LINEAR = "linear"
-    REPEAT = "repeat"
-    TILED = "tiled"
-    ZERO_PAD = "zero_pad"
+class JPT1QuantModelType(Enum):
+    COS_SIM = "cossim"
+    STANDARD = "standard"
 
 
 class JPT1Quantized(nn.Module):
@@ -75,12 +115,17 @@ class JPT1Quantized(nn.Module):
         num_layers: int,
         dropout: float,
         codebook: TokenCodebook,
+        modelType: JPT1QuantModelType,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
+        self.modelType = modelType
+
+        self.embeddings = nn.Embedding(len(codebook.token_list), embed_dim)
+
         self.token_len = token_len
         self.codebook = codebook
         self.token_space_dim = token_space_dim
@@ -99,8 +144,15 @@ class JPT1Quantized(nn.Module):
         # self.transformer = nn.TransformerDecoder(encoder_layer, num_layers=num_layers)
 
         # self.ln_final = nn.LayerNorm(embed_dim)
-        # self.fc_out = nn.Linear(embed_dim, hypertoken_size)
-        self.fc_out = nn.Linear(embed_dim, token_space_dim)
+
+        if modelType == JPT1QuantModelType.COS_SIM:
+            self.fc_out = nn.Linear(embed_dim, token_space_dim)
+        else:
+            self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
+
+        self.temperature = nn.Parameter(torch.tensor(1.0))
+
+        # self.fc_out = nn.Linear(embed_dim, len(self.codebook.tokens))
 
     def generate_square_subsequent_mask(self, sz):
         """Generate a causal mask to prevent attending to future tokens."""
@@ -108,32 +160,18 @@ class JPT1Quantized(nn.Module):
         mask = mask.masked_fill(mask == 1, float("-inf"))  # Mask future tokens with -inf
         return mask
 
-    def quantize(self, x: torch.Tensor) -> torch.Tensor:
-        # Detach for nearest neighbor search
-        projected_np = x.detach().cpu().numpy()
-
-        # Find nearest neighbors
-        _, indices = self.codebook.tree.query(projected_np, k=1)
-        indices = indices.squeeze(-1)
-
-        # Get tokens and embeddings
-        tokens = self.codebook.token_array[indices]
-        quantized_embeddings = torch.tensor(self.codebook.embeddings[indices], device=x.device)
-
-        # Straight-through estimator
-        quantized_embeddings = x + (quantized_embeddings - x).detach()
-
-        return tokens, quantized_embeddings
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hypertoken_size = x.shape
+
+        batch_size, seq_len = x.shape
+
+        embedded = self.embeddings(x)
 
         # Create causal mask to prevent attending to future tokens
         causal_mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
 
         position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
 
-        embedded = x + self.position_embedding(position_ids)
+        embedded = embedded + self.position_embedding(position_ids)
 
         # For TransformerDecoder, we need memory (encoder output) and target (decoder input)
         # Using a zero memory tensor of the same size as input

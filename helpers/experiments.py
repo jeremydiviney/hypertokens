@@ -61,7 +61,9 @@ def save_project_files_as_artifact(wandb_run):
     ]
 
     # Get all Python files then filter out excluded paths
-    python_files = set(glob.glob(include_pattern, recursive=True)) - set(file for pattern in exclude_patterns for file in glob.glob(pattern, recursive=True))
+    python_files = set(glob.glob(include_pattern, recursive=True)) - set(
+        file for pattern in exclude_patterns for file in glob.glob(pattern, recursive=True)
+    )
 
     # Add files to artifact
     for file_path in python_files:

@@ -28,3 +28,28 @@ def calculate_text_accuracy(pred_texts, target_texts, pad_token_char):
         "char_matches": char_matches,
         "token_matches": token_matches,
     }
+
+
+def calculate_token_accuracy(pred_tokens, target_tokens, pad_token):
+    pred_tokens = np.array(pred_tokens)
+    target_tokens = np.array(target_tokens)
+    # Create mask to ignore pad tokens
+    mask = (target_tokens == pad_token) | (target_tokens == "")
+
+    # Apply mask for counting
+    valid_tokens = np.sum(~mask).item()
+
+    adjusted_pred_tokens = pred_tokens.copy()
+    adjusted_target_tokens = target_tokens.copy()
+
+    # set all pad tokens to "" to make the match comparison easier
+    adjusted_pred_tokens[mask] = ""
+    adjusted_target_tokens[mask] = ""
+
+    # Count matches only for non-pad positions
+    token_matches = np.sum(adjusted_target_tokens == adjusted_pred_tokens).item()
+
+    return {
+        "token_count": valid_tokens,
+        "token_matches": token_matches,
+    }
