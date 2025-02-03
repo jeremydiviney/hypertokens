@@ -39,49 +39,45 @@ class TokenCodebook(nn.Module):
 
         self.lookup_embeddings = nn.Embedding(len(self.token_list), embed_dim)
 
-    def get_nearest_token_indices(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
+    def get_nearest_token_indices_cossim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
         """
-        Find the nearest tokens using pure PyTorch cosine similarity.
-        projections shape: [batch_size, seq_len, embed_dim]
-        lookup_embeddings shape: [vocab_size, embed_dim]
-        Returns a [batch_size, seq_len] tensor of token indices.
-        """
+        Return the nearest token indices based on cosine similarity.
 
-        # 1. Normalize the projections
+        Args:
+            projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
+            top_k (int): Number of candidates to sample from. If 1, returns argmax.
+            temperature (float): Softmax temperature for sampling from the top_k candidates.
+
+        Returns:
+            torch.Tensor: [B, S] tensor of token indices.
+        """
+        # Normalize the projections and codebook embeddings.
         proj_norm = F.normalize(projections, p=2, dim=-1)  # [B, S, E]
-
-        # 2. Normalize the codebook embeddings
         emb_norm = F.normalize(self.lookup_embeddings.weight, p=2, dim=-1)  # [V, E]
 
-        # 3. Compute pairwise similarity: shape [B, S, V]
-        similarity = torch.einsum("bse,ve->bsv", proj_norm, emb_norm)
+        # Compute cosine similarity using matmul.
+        similarity = torch.matmul(proj_norm, emb_norm.T)  # [B, S, V]
 
         if top_k == 1:
-            # do_sample doesn't really apply when top_k=1, so we just pick argmax
-            indices = similarity.argmax(dim=-1)  # [B, S]
-            return indices
+            return similarity.argmax(dim=-1)  # [B, S]
 
-        # -- Otherwise, select top_k candidates along the vocab dimension --
-        # topk_values, topk_indices both => [B, S, top_k]
-        topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)
+        # For top_k > 1, retrieve top_k candidates.
+        topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)  # Both are [B, S, top_k]
 
-        # Sample from a softmax distribution over the top_k
-        # 1) Convert topk_values => probabilities via softmax
+        # Convert the top_k scores to probabilities using softmax.
         probs = F.softmax(topk_values / temperature, dim=-1)  # [B, S, top_k]
 
-        # 2) Flatten batch and sequence dims for multinomial
+        # Flatten batch and sequence dimensions for sampling.
         bsz, seq_len, k = probs.shape
-        probs_flat = probs.view(-1, k)  # [B*S, top_k]
+        probs_flat = probs.reshape(-1, k)  # [B*S, top_k]
 
-        # 3) Sample an index in [0..top_k-1] for each position in the batch
-        chosen_in_topk = torch.multinomial(probs_flat, 1).squeeze(-1)  # [B*S]
+        # Sample one candidate index per position.
+        chosen = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)  # [B*S]
 
-        # 4) Map chosen_in_topk back to the actual token IDs
-        topk_indices_flat = topk_indices.view(-1, k)  # [B*S, top_k]
-        final_indices_flat = torch.gather(topk_indices_flat, dim=1, index=chosen_in_topk.unsqueeze(-1)).squeeze(-1)  # [B*S]
+        # Map the sampled indices back to the original token indices.
+        topk_indices_flat = topk_indices.reshape(-1, k)  # [B*S, top_k]
+        final_indices = torch.gather(topk_indices_flat, dim=1, index=chosen.unsqueeze(-1)).view(bsz, seq_len)
 
-        # 5) Reshape to [B, S]
-        final_indices = final_indices_flat.view(bsz, seq_len)
         return final_indices
 
     def get_token_indices(self, text_tokens: list[str]) -> list[int]:
@@ -124,11 +120,13 @@ class JPT1Quantized(nn.Module):
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
         self.modelType = modelType
 
-        self.embeddings = nn.Embedding(len(codebook.token_list), embed_dim)
+        # self.embeddings = nn.Embedding(len(codebook.token_list), embed_dim)
+        self.embeddings = codebook.lookup_embeddings
+        self.lookup_embeddings = codebook.lookup_embeddings
 
         self.token_len = token_len
         self.codebook = codebook
-        self.token_space_dim = token_space_dim
+        self.token_space_dim = self.lookup_embeddings.weight.shape[1]
 
         # Use PyTorch's TransformerEncoder -- since we are only trying to predict the next sequence after the final input sequence we can just use the encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -146,7 +144,8 @@ class JPT1Quantized(nn.Module):
         # self.ln_final = nn.LayerNorm(embed_dim)
 
         if modelType == JPT1QuantModelType.COS_SIM:
-            self.fc_out = nn.Linear(embed_dim, token_space_dim)
+            # self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
+            self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
         else:
             self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
 

@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import datetime
 import time
 import sys
+import random
 
 import numpy as np
 
@@ -68,7 +69,7 @@ def evaluate_model(
             batch_count += 1
 
             if model.modelType == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = dataset.codebook.get_nearest_token_indices(jpt_output)
+                pred_token_indices = dataset.codebook.get_nearest_token_indices_cossim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
@@ -128,23 +129,81 @@ def analyze_embedding_clustering(model):
             print(f"Most clustered token indices: {most_clustered.indices.tolist()}")
 
 
+def compute_logits_with_extras(model, hidden_states, target_indices, extra_negatives):
+    # Step 1: Flatten the target indices.
+    target_flat = target_indices.view(-1)
+
+    # Step 2: Get unique targets from the batch.
+    unique_targets = target_flat.unique()
+
+    lookup_embeddings = model.codebook.lookup_embeddings
+    # lookup_embeddings = model.embeddings
+
+    # Step 3: If extra negatives are requested, sample tokens not in unique_targets.
+    if extra_negatives > 0:
+        vocab_size = lookup_embeddings.weight.size(0)
+        all_tokens = torch.arange(vocab_size, device=hidden_states.device)
+        # Filter out tokens that are in unique_targets.
+        non_target_tokens = all_tokens[~torch.isin(all_tokens, unique_targets)]
+        # Randomly select extra negatives.
+        perm = torch.randperm(non_target_tokens.size(0), device=hidden_states.device)
+        extra_candidates = non_target_tokens[perm[:extra_negatives]]
+        # Combine unique targets and extra negatives, then sort.
+        candidate_set = torch.sort(torch.cat([unique_targets, extra_candidates]))[0]
+    else:
+        candidate_set = unique_targets
+
+    # Step 4: Retrieve and normalize candidate embeddings.
+    candidate_embeds = lookup_embeddings(candidate_set)
+    candidate_embeds = F.normalize(candidate_embeds, p=2, dim=1)
+
+    # Step 5: Flatten and normalize hidden states.
+    N, D = target_flat.shape[0], hidden_states.shape[-1]
+    hidden_norm = F.normalize(hidden_states.view(N, D), p=2, dim=1)
+
+    # Step 6: Compute logits as cosine similarities scaled by temperature.
+    logits = torch.mm(hidden_norm, candidate_embeds.t()) / model.temperature
+
+    # Step 7: Remap each original target to its position in candidate_set.
+    new_targets = torch.searchsorted(candidate_set, target_flat)
+
+    return logits, new_targets
+
+
+def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_indices: torch.Tensor, extra_negatives=6000) -> torch.Tensor:
+    """
+    Computes cross entropy loss where logits are based on negative MSE distances.
+    """
+    logits, new_targets = compute_logits_with_extras(model, pred, target_indices, extra_negatives)
+    loss = F.cross_entropy(logits, new_targets)
+
+    return loss
+
+
+def compute_cos_sim_loss(pred: torch.Tensor, target_indices: torch.Tensor, codebook: TokenCodebook) -> torch.Tensor:
+    # Retrieve the target embeddings from the codebook
+    target_embeds = codebook.lookup_embeddings(target_indices)
+
+    # Normalize the predicted embeddings and the target embeddings along the embedding dimension
+    pred_norm = F.normalize(pred, p=2, dim=-1)
+    target_norm = F.normalize(target_embeds, p=2, dim=-1)
+
+    # Compute the cosine similarity for each token across the last dimension
+    cos_sim = torch.sum(pred_norm * target_norm, dim=-1)
+
+    # The loss is defined as 1 minus the cosine similarity (we want a similarity of 1)
+    loss = torch.mean(1 - cos_sim)
+
+    return loss
+
+
 def inference_and_loss_step(dataset, model, x, y):
 
     # Forward pass to get output embeddings
     model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
 
     if model.modelType == JPT1QuantModelType.COS_SIM:
-
-        lookup_embeddings = model.codebook.lookup_embeddings.weight
-
-        logits = compute_logits(model, model_output)
-
-        # Calculate cross entropy loss
-        loss_fn = nn.CrossEntropyLoss()
-        ce_loss = loss_fn(logits.view(-1, lookup_embeddings.size(0)), y.view(-1))
-
-        loss = ce_loss
-
+        loss = unique_batch_cosine_ce_loss(model, model_output, y)
         return model_output, loss
 
     else:
@@ -197,7 +256,7 @@ def train_model(
     dataset = train_dataloader.dataset
 
     current_lr = config["lr"]
-    low_loss = 10000
+    low_loss = 10e10
 
     train_time_start = time.time()
     total_training_examples = 0
@@ -485,7 +544,7 @@ def generate_text(
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if jpt_model.modelType == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = dataset.codebook.get_nearest_token_indices(last_token, top_k=1, temperature=0.1)
+                pred_token_indices = dataset.codebook.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
             else:
                 pred_token_indices = last_token.argmax(dim=-1)
 
@@ -524,13 +583,13 @@ if __name__ == "__main__":
             "dropout": dropout,
         }
         for n_layers in [6]  # Varying n_layers
-        for head_size in [32]  # Varying head_size
-        for jed in [384]
-        for lr in [0.0007]
+        for jed in [384, 512, 768]
+        for head_size in [32, 64]  # Varying head_size
+        for lr in [0.00025]
         for sl in [256]
-        for epochs in [10]
+        for epochs in [14]
         for dropout in [0.1]
-        for token_space_dim in [8, 16, 32, 64, 128, 256, 384]
+        for token_space_dim in [jed]
     ]
 
     enable_torch_optimizations()
