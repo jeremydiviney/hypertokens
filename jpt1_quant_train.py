@@ -18,7 +18,7 @@ from tokenizers import Tokenizer
 
 from sklearn.neighbors import KDTree
 
-from models.jpt1_quantizer import JPT1Quantized, TokenCodebook, compute_logits
+from models.jpt1_quantizer import JPT1Quantized, TokenCodebook
 
 from datasources.booksum import BooksumDataset, get_or_train_tokenizer
 from helpers.experiments import run_experiment, count_parameters
@@ -180,6 +180,21 @@ def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_ind
     return loss
 
 
+def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float = 2) -> torch.Tensor:
+
+    num_experts = gate_weights.shape[-1]
+
+    expert_usage = gate_weights.sum(dim=(0, 1))  # shape [num_experts]
+    total = expert_usage.sum()  # total "token mass"
+    usage_dist = expert_usage / total  # shape [num_experts]
+
+    alpha = num_experts / 3
+
+    uniform_dist = torch.full_like(usage_dist, 1.0 / num_experts)
+    balancing_loss = alpha * F.mse_loss(usage_dist, uniform_dist)
+    return balancing_loss
+
+
 def compute_cos_sim_loss(pred: torch.Tensor, target_indices: torch.Tensor, codebook: TokenCodebook) -> torch.Tensor:
     # Retrieve the target embeddings from the codebook
     target_embeds = codebook.lookup_embeddings(target_indices)
@@ -200,10 +215,12 @@ def compute_cos_sim_loss(pred: torch.Tensor, target_indices: torch.Tensor, codeb
 def inference_and_loss_step(dataset, model, x, y):
 
     # Forward pass to get output embeddings
-    model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
+    model_output, gate_weights = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
 
     if model.modelType == JPT1QuantModelType.COS_SIM:
         loss = unique_batch_cosine_ce_loss(model, model_output, y)
+        gate_loss = compute_gate_loss(model, gate_weights)
+        loss += gate_loss
         return model_output, loss
 
     else:
@@ -533,7 +550,7 @@ def generate_text(
         x = torch.tensor(dataset.codebook.get_token_indices(tokens)).to(device)
         x = x.unsqueeze(0)
 
-        jpt_output = inference_step(jpt_model, x)
+        jpt_output, _ = inference_step(jpt_model, x)
 
         cur_batch_size = jpt_output.shape[0]
         cur_seq_len = jpt_output.shape[1]
@@ -581,15 +598,17 @@ if __name__ == "__main__":
             "jpt_embed_dim": jed,
             "data_segments": 10,
             "dropout": dropout,
+            "num_experts": num_experts,
         }
         for n_layers in [6]  # Varying n_layers
-        for jed in [384, 512, 768]
-        for head_size in [32, 64]  # Varying head_size
-        for lr in [0.00025]
+        for jed in [512]
+        for head_size in [32]  # Varying head_size
+        for lr in [0.0007]
         for sl in [256]
         for epochs in [14]
         for dropout in [0.1]
         for token_space_dim in [jed]
+        for num_experts in [8]
     ]
 
     enable_torch_optimizations()
@@ -608,6 +627,7 @@ if __name__ == "__main__":
         jpt_embed_dim = experiment["jpt_embed_dim"]
         data_segments = experiment["data_segments"]
         dropout = experiment["dropout"]
+        num_experts = experiment["num_experts"]
 
         token_space_dim = experiment["token_space_dim"]
         # load this just to get the vocab size
@@ -649,6 +669,7 @@ if __name__ == "__main__":
             num_layers=n_layers,
             dropout=dropout,
             codebook=codebook,
+            num_experts=num_experts,
             modelType=JPT1QuantModelType.COS_SIM,
         ).to(DEVICE)
 

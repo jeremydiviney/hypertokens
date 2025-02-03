@@ -10,23 +10,6 @@ import numpy as np
 from tokenizers import Tokenizer
 
 
-def compute_logits(model, hidden_states):
-    """
-    Convert hidden states to similarity scores over vocab.
-    hidden_states shape: [batch_size, seq_len, embed_dim]
-    Returns logits of shape [batch_size, seq_len, vocab_size]
-    """
-    # Normalize
-    hidden_norm = F.normalize(hidden_states, p=2, dim=-1)
-    output_norm = F.normalize(model.codebook.lookup_embeddings.weight, p=2, dim=-1)  # [vocab_size, embed_dim]
-
-    # Compute cosine similarities (batch x seq x vocab)
-    # (hidden_norm: bsz, seq, embed) x (output_norm: vocab, embed) -> bsz, seq, vocab
-    logits = torch.einsum("bse,ve->bsv", hidden_norm, output_norm)
-    logits = logits / model.temperature
-    return logits
-
-
 class TokenCodebook(nn.Module):
     def __init__(self, embed_dim, tokenizer: Tokenizer):
         super().__init__()
@@ -109,6 +92,7 @@ class JPT1Quantized(nn.Module):
         token_space_dim: int,
         num_heads: int,
         num_layers: int,
+        num_experts: int,
         dropout: float,
         codebook: TokenCodebook,
         modelType: JPT1QuantModelType,
@@ -119,6 +103,7 @@ class JPT1Quantized(nn.Module):
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
         self.modelType = modelType
+        self.num_experts = num_experts
 
         # self.embeddings = nn.Embedding(len(codebook.token_list), embed_dim)
         self.embeddings = codebook.lookup_embeddings
@@ -145,7 +130,8 @@ class JPT1Quantized(nn.Module):
 
         if modelType == JPT1QuantModelType.COS_SIM:
             # self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
-            self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
+            self.fc_out_experts = nn.Linear(embed_dim, token_space_dim * num_experts)
+            self.gate = nn.Linear(embed_dim, num_experts)
         else:
             self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
 
@@ -160,28 +146,19 @@ class JPT1Quantized(nn.Module):
         return mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         batch_size, seq_len = x.shape
-
         embedded = self.embeddings(x)
-
-        # Create causal mask to prevent attending to future tokens
         causal_mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
-
         position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
-
         embedded = embedded + self.position_embedding(position_ids)
 
-        # For TransformerDecoder, we need memory (encoder output) and target (decoder input)
-        # Using a zero memory tensor of the same size as input
-        # memory = torch.zeros_like(x)
+        x = self.transformer(embedded, mask=causal_mask)  # [batch, seq_len, embed_dim]
 
-        # Transformer blocks - note we're passing memory as the first argument
-        x = self.transformer(embedded, mask=causal_mask)
-        # x = self.transformer(tgt=x, memory=memory, tgt_mask=causal_mask)
+        expert_outputs = self.fc_out_experts(x).view(batch_size, seq_len, self.token_space_dim, self.num_experts)
 
-        # Add residual connection from embeddings
+        # Compute gating weights as [B, S, N]
+        gate_weights = F.softmax(self.gate(x), dim=-1).unsqueeze(2)  # [B, S, 1, N]
 
-        x = self.fc_out(x)  # Shape: [batch_size, seq_len, output_dim]
-
-        return x
+        # Weighted sum across experts => [B, S, token_space_dim]
+        output = (expert_outputs * gate_weights).sum(dim=-1)
+        return output, gate_weights
