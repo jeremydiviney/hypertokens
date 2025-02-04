@@ -11,11 +11,11 @@
             "internalConsoleOptions": "openOnSessionStart"
         },
         {
-            "name": "JPT1 Quant main",
+            "name": "JPT1 Train Main",
             "type": "debugpy",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "program": "jpt1_quant_train.py",
+            "program": "jpt1_train.py",
             "console": "internalConsole",
             "internalConsoleOptions": "openOnSessionStart"
         },

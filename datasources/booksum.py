@@ -152,7 +152,7 @@ def get_or_train_tokenizer(text_corpus: str, vocab_size: int, tokenizer_path: st
 
         # Define special tokens; these will be added to the vocabulary
         special_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
-        trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
+        trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens, min_frequency=2)
 
         # Train the tokenizer on the corpus iterator
         tokenizer.train_from_iterator(corpus, trainer=trainer)
@@ -168,9 +168,7 @@ def get_or_train_tokenizer(text_corpus: str, vocab_size: int, tokenizer_path: st
     return tokenizer
 
 
-def finalize_tokens(
-    text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int, eot_token: int
-) -> np.ndarray:
+def finalize_tokens(text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int, eot_token: int) -> np.ndarray:
     tokens = []
 
     try:
@@ -229,7 +227,6 @@ def load_cached_dataset():
 class BooksumDataset(Dataset):
     def __init__(
         self,
-        segments: int,
         token_len: int,
         seq_len: int,
         codebook: TokenCodebook,
@@ -242,9 +239,9 @@ class BooksumDataset(Dataset):
         self.seq_len = seq_len
         self.codebook = codebook
         self.data_stride = data_stride
-        train_text = "\n".join([dataset["train"][i]["text"] for i in range(50)])
-        val_text = "\n".join([dataset["validation"][i]["text"] for i in range(2)])
-        test_text = "\n".join([dataset["test"][i]["text"] for i in range(1)])
+        train_text = "\n".join([dataset["train"][i]["text"] for i in range(75)])
+        val_text = "\n".join([dataset["validation"][i]["text"] for i in range(3)])
+        test_text = "\n".join([dataset["test"][i]["text"] for i in range(3)])
 
         all_text = train_text + val_text + test_text
         val_text = val_text + test_text
@@ -266,13 +263,12 @@ class BooksumDataset(Dataset):
         else:
             self.text_tokens = None
 
-        self.segments = segments
         self.type = type
 
     def __len__(self) -> int:
 
         if self.type == "train":
-            return math.floor(len(self.codebook.token_list) / self.segments)
+            return len(self.text_tokens)
         else:
             return len(self.text_tokens) // self.data_stride
 

@@ -232,8 +232,6 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    data_segments = dataloader.dataset.segments
-
     lr = config["lr"]
     epochs = config["epochs"]
     token_len = config["token_len"]
@@ -261,7 +259,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
 
     # evaluate_model(model, val_dataloader, device)
 
-    total_steps = epochs * len(dataloader) * data_segments
+    total_steps = epochs * len(dataloader)
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -285,67 +283,59 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
         batch_count = 0
         optimizer.param_groups[0]["lr"] = current_lr
 
-        for segment in range(data_segments):
-            segment_loss = 0
-            segment_batch_count = 0
+        for x, y in dataloader:
 
-            for x, y in dataloader:
+            batch_count += 1
+            x = x.to(device)  # x is in int (char index)
+            y = y.to(device)  # y is in int (char index)
 
-                batch_count += 1
-                segment_batch_count += 1
-                x = x.to(device)  # x is in int (char index)
-                y = y.to(device)  # y is in int (char index)
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
 
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(x)
+                loss = calculate_loss(
+                    model=model,
+                    logits=logits,
+                    target=y,
+                    vocab_size=vocab_size,
+                    token_len=token_len,
+                    pad_token=dataloader.dataset.pad_token,
+                )
 
-                    logits = model(x)
-                    loss = calculate_loss(
-                        model=model,
-                        logits=logits,
-                        target=y,
-                        vocab_size=vocab_size,
-                        token_len=token_len,
-                        pad_token=dataloader.dataset.pad_token,
-                    )
+            # Update metrics
+            step_loss += loss.item()
+            epoch_loss += loss.item()
 
-                # Update metrics
-                segment_loss += loss.item()
-                epoch_loss += loss.item()
+            loss_history.append(loss.item())
 
-                loss_history.append(loss.item())
+            if len(loss_history) > 20:
+                loss_history.pop(0)
 
-                if len(loss_history) > 20:
-                    loss_history.pop(0)
+            current_mean_loss = sum(loss_history) / len(loss_history)
 
-                current_mean_loss = sum(loss_history) / len(loss_history)
+            if current_mean_loss < low_loss:
+                low_loss = current_mean_loss
+                print(f"New low loss: {low_loss:.7f}")
 
-                if current_mean_loss < low_loss:
-                    low_loss = current_mean_loss
-                    print(f"New low loss: {low_loss:.7f}")
+            # Log batch metrics
+            if batch_count % 10 == 0:
+                wandb.log(
+                    {
+                        "batch_loss": loss.item(),
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                        "epoch": epoch,
+                    }
+                )
 
-                # Log batch metrics
-                if batch_count % 10 == 0:
-                    wandb.log(
-                        {
-                            "batch_loss": loss.item(),
-                            "learning_rate": optimizer.param_groups[0]["lr"],
-                            "epoch": epoch,
-                        }
-                    )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+            max_grad_norm = 0.1
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-                max_grad_norm = 0.1
-                # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
 
-                optimizer.step()
-
-                scheduler.step()
-
-            # Log segment metrics
-            avg_segment_loss = segment_loss / segment_batch_count
+            scheduler.step()
 
         # Log epoch metrics
         eval_results = evaluate_model(model, val_dataloader, device)
@@ -364,7 +354,7 @@ def train_model(wandb, model, dataloader, val_dataloader, config: dict):
         )
 
         print(
-            f"Epoch {epoch} train_loss: {avg_segment_loss:.6f}, val_loss: {val_loss:.6f}, val_token_accuracy: {val_token_accuracy:.6%}, val_char_accuracy: {val_char_accuracy:.6%}"
+            f"Epoch {epoch} train_loss: {avg_step_loss:.6f}, val_loss: {val_loss:.6f}, val_token_accuracy: {val_token_accuracy:.6%}, val_char_accuracy: {val_char_accuracy:.6%}"
         )
 
     # After training loop ends, save the model
@@ -383,9 +373,7 @@ def verify_model_params(experiment: dict):
     embed_dim = experiment["embed_dim"]
 
     if hypertoken_size < token_len:
-        raise ValueError(
-            f"Hypertoken_size ({hypertoken_size}) must be greater than or equal to token_len ({token_len})"
-        )
+        raise ValueError(f"Hypertoken_size ({hypertoken_size}) must be greater than or equal to token_len ({token_len})")
 
     print(
         f"Verifying hyperparameters \n\
@@ -468,9 +456,8 @@ if __name__ == "__main__":
         head_size = experiment["head_size"]
         embed_dim = experiment["embed_dim"]
         compress_factor = experiment["compress_factor"]
-        SEGMENTS = 10
 
-        dataset = TinyShakespeareDataset(token_len=token_len, segments=SEGMENTS)
+        dataset = TinyShakespeareDataset(token_len=token_len)
         vocab_size = len(dataset.char2idx)
         dataloader = DataLoader(
             dataset,
@@ -482,7 +469,7 @@ if __name__ == "__main__":
             prefetch_factor=2,  # Number of batches loaded in advance per worker)
         )
 
-        val_dataset = TinyShakespeareDataset(token_len=token_len, segments=SEGMENTS, type="validation")
+        val_dataset = TinyShakespeareDataset(token_len=token_len, type="validation")
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,

@@ -120,9 +120,7 @@ def tokenize(text: str, token_len: int, silent: bool = True) -> List[str]:
     return tokens
 
 
-def finalize_tokens(
-    text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int, eot_token: int
-) -> np.ndarray:
+def finalize_tokens(text_tokens: List[str], char2idx: dict, token_len: int, pad_token: int, eot_token: int) -> np.ndarray:
     tokens = []
 
     try:
@@ -185,7 +183,6 @@ def load_cached_dataset():
 class TinyShakespeareDataset(Dataset):
     def __init__(
         self,
-        segments: int,
         token_len: int,
         type: str = "train",
     ):
@@ -230,13 +227,12 @@ class TinyShakespeareDataset(Dataset):
 
         self.tokens = finalize_tokens(self.text_tokens, self.char2idx, self.token_len, self.pad_token, self.eot_token)
 
-        self.segments = segments
         self.type = type
 
     def __len__(self) -> int:
 
         if self.type == "train":
-            return math.floor(len(self.tokens) / self.segments)
+            return math.floor(len(self.tokens))
         else:
             return len(self.tokens)
 
@@ -259,7 +255,6 @@ class TinyShakespeareDataset(Dataset):
 class HyperTokenTinyShakespeareDataset(Dataset):
     def __init__(
         self,
-        segments: int,
         token_len: int,
         seq_len: int,
         batch_size: int,
@@ -267,7 +262,6 @@ class HyperTokenTinyShakespeareDataset(Dataset):
     ):
         self.token_len = token_len  # hypertoken sequence length
         self.seq_len = seq_len  # JPT1 sequence length
-        self.segments = segments
         self.type = type
         self.batch_size = batch_size
 
@@ -313,7 +307,7 @@ class HyperTokenTinyShakespeareDataset(Dataset):
     def __len__(self) -> int:
 
         if self.type == "train":
-            return math.floor(len(self.tokens) / self.segments)
+            return math.floor(len(self.tokens))
         else:
             return len(self.tokens) // self.validation_stride
 
@@ -435,7 +429,6 @@ class HyperTokenTinyShakespeareDataset(Dataset):
 class TinyShakespeareDatasetQuantized(Dataset):
     def __init__(
         self,
-        segments: int,
         token_len: int,
         seq_len: int,
         codebook: TokenCodebook,
@@ -465,13 +458,12 @@ class TinyShakespeareDatasetQuantized(Dataset):
 
         self.text_tokens = np.array(tokenize(text, self.token_len, False))
 
-        self.segments = segments
         self.type = type
 
     def __len__(self) -> int:
 
         if self.type == "train":
-            return math.floor(len(self.codebook.tokens) / self.segments)
+            return math.floor(len(self.codebook.tokens))
         else:
             return len(self.text_tokens) // self.data_stride
 
