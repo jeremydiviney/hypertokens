@@ -268,7 +268,7 @@ class BooksumDataset(Dataset):
     def __len__(self) -> int:
 
         if self.type == "train":
-            return len(self.text_tokens)
+            return len(self.text_tokens) // self.data_stride
         else:
             return len(self.text_tokens) // self.data_stride
 

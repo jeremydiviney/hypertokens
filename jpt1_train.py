@@ -271,7 +271,7 @@ def train_model(
     step_count = 0
     step_size = 1_000_000
 
-    total_steps = (config["epochs"] * len(train_dataloader)) // step_size
+    total_steps = (config["epochs"] * len(train_dataloader.dataset.text_tokens)) // step_size
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -288,12 +288,10 @@ def train_model(
     low_loss = 10e10
 
     train_time_start = time.time()
-    total_training_examples = 0
 
     loss_history = []
 
-    eval_every_n_tokens = 1000000 * 15
-    tokens_since_eval = 0
+    tokens_since_step = 0
 
     batches_per_epoch = 100000 // config["batch_size"]
 
@@ -328,9 +326,9 @@ def train_model(
                 jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
 
             # Update metrics
-            current_loss += loss.item()
+            current_loss = loss.item()
 
-            loss_history.append(loss.item())
+            loss_history.append(current_loss)
 
             if len(loss_history) > 50:
                 loss_history.pop(0)
@@ -371,19 +369,17 @@ def train_model(
                     }
                 )
 
-                if step_count % 25 == 0:
+                if step_count % 10 == 0:
                     eval_results = evaluate_model(model, val_dataloader, device)
-                    tokens_since_eval = 0
+                    val_loss = eval_results["val_loss"]
+                    val_token_accuracy = eval_results["val_token_accuracy"]
                     wandb.log(
                         {
-                            "val_loss": eval_results["val_loss"],
+                            "val_loss": val_loss,
                             "val_token_accuracy": eval_results["val_token_accuracy"],
                             "epoch": epoch,
                         }
                     )
-
-        val_loss = eval_results["val_loss"]
-        val_token_accuracy = eval_results["val_token_accuracy"]
 
         print(
             f"Epoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, " f"val_token_accuracy: {val_token_accuracy:.2%}"
@@ -624,7 +620,7 @@ if __name__ == "__main__":
             seq_len=seq_len,
             type="train",
             codebook=None,
-            data_stride=1,
+            data_stride=seq_len,
             tokenizer=tokenizer,
         )
 
