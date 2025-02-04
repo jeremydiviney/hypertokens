@@ -104,8 +104,8 @@ def evaluate_model(
 
 def inference_step(model, x):
 
-    model_output, lookup_out = model(x)
-    return model_output, lookup_out
+    model_output = model(x)
+    return model_output
 
 
 def analyze_embedding_clustering(model):
