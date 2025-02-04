@@ -104,8 +104,8 @@ def evaluate_model(
 
 def inference_step(model, x):
 
-    model_output = model(x)
-    return model_output
+    model_output, lookup_out = model(x)
+    return model_output, lookup_out
 
 
 def analyze_embedding_clustering(model):
@@ -337,7 +337,7 @@ def train_model(
 
             if current_mean_loss < low_loss:
                 low_loss = current_mean_loss
-                print(f"New low loss: {low_loss:.7f}")
+                print(f"\nNew low loss: {low_loss:.7f}")
 
             # Log batch metrics
 
@@ -382,7 +382,8 @@ def train_model(
                     )
 
         print(
-            f"Epoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, " f"val_token_accuracy: {val_token_accuracy:.2%}"
+            f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
+            f"val_token_accuracy: {val_token_accuracy:.2%}"
         )
 
     # Final Evaluation
@@ -574,7 +575,7 @@ if __name__ == "__main__":
         for head_size in [32]  # Varying head_size
         for lr in [0.0005]
         for sl in [256]
-        for epochs in [20]
+        for epochs in [15]
         for dropout in [0.15]
         for token_space_dim in [jed]
         for num_experts in [1]

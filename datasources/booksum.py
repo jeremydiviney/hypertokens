@@ -152,7 +152,7 @@ def get_or_train_tokenizer(text_corpus: str, vocab_size: int, tokenizer_path: st
 
         # Define special tokens; these will be added to the vocabulary
         special_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
-        trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens, min_frequency=2)
+        trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens, min_frequency=1)
 
         # Train the tokenizer on the corpus iterator
         tokenizer.train_from_iterator(corpus, trainer=trainer)
