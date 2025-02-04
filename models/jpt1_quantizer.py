@@ -129,15 +129,13 @@ class JPT1Quantized(nn.Module):
         # self.ln_final = nn.LayerNorm(embed_dim)
 
         if modelType == JPT1QuantModelType.COS_SIM:
-            # self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
-            self.fc_out_experts = nn.Linear(embed_dim, token_space_dim * num_experts)
-            self.gate = nn.Linear(embed_dim, num_experts)
+            self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
+            # self.fc_out_experts = nn.Linear(embed_dim, token_space_dim * num_experts)
+            # self.gate = nn.Linear(embed_dim, num_experts)
         else:
             self.fc_out = nn.Linear(embed_dim, len(self.codebook.token_list))
 
         self.temperature = nn.Parameter(torch.tensor(1.0))
-
-        # self.fc_out = nn.Linear(embed_dim, len(self.codebook.tokens))
 
     def generate_square_subsequent_mask(self, sz):
         """Generate a causal mask to prevent attending to future tokens."""
@@ -145,20 +143,48 @@ class JPT1Quantized(nn.Module):
         mask = mask.masked_fill(mask == 1, float("-inf"))  # Mask future tokens with -inf
         return mask
 
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     batch_size, seq_len = x.shape
+    #     embedded = self.embeddings(x)
+    #     causal_mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
+    #     position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
+    #     embedded = embedded + self.position_embedding(position_ids)
+
+    #     x = self.transformer(embedded, mask=causal_mask)  # [batch, seq_len, embed_dim]
+
+    #     expert_outputs = self.fc_out_experts(x).view(batch_size, seq_len, self.token_space_dim, self.num_experts)
+
+    #     # Compute gating weights as [B, S, N]
+    #     gate_weights = F.softmax(self.gate(x), dim=-1).unsqueeze(2)  # [B, S, 1, N]
+
+    #     # Weighted sum across experts => [B, S, token_space_dim]
+    #     output = (expert_outputs * gate_weights).sum(dim=-1)
+    #     return output, gate_weights
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.shape
         embedded = self.embeddings(x)
         causal_mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
         position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
         embedded = embedded + self.position_embedding(position_ids)
+        x = self.transformer(embedded, mask=causal_mask)  # [B, S, embed_dim]
 
-        x = self.transformer(embedded, mask=causal_mask)  # [batch, seq_len, embed_dim]
+        # expert_outputs = self.fc_out_experts(x).view(batch_size, seq_len, self.token_space_dim, self.num_experts)
+        # expert_outputs = F.normalize(expert_outputs, p=2, dim=2)
 
-        expert_outputs = self.fc_out_experts(x).view(batch_size, seq_len, self.token_space_dim, self.num_experts)
+        # # Compute gating logits and soft probabilities.
+        # gate_logits = self.gate(x)  # [B, S, num_experts]
+        # gate_soft = F.softmax(gate_logits, dim=-1)  # [B, S, num_experts]
 
-        # Compute gating weights as [B, S, N]
-        gate_weights = F.softmax(self.gate(x), dim=-1).unsqueeze(2)  # [B, S, 1, N]
+        # # Get hard decisions: one-hot vectors.
+        # gate_hard_indices = gate_soft.argmax(dim=-1, keepdim=True)  # [B, S, 1]
+        # gate_hard = torch.zeros_like(gate_soft).scatter_(dim=-1, index=gate_hard_indices, value=1.0)
 
-        # Weighted sum across experts => [B, S, token_space_dim]
-        output = (expert_outputs * gate_weights).sum(dim=-1)
-        return output, gate_weights
+        # # Straight-through estimator: use hard value in forward pass,
+        # # but pass the gradients of the soft probabilities.
+        # gate_weights = gate_hard - gate_soft.detach() + gate_soft  # [B, S, num_experts]
+        # gate_weights = gate_weights.unsqueeze(2)  # [B, S, 1, num_experts]
+
+        # # Weighted sum over experts.
+        # output = (expert_outputs * gate_weights).sum(dim=-1)  # [B, S, token_space_dim]
+        output = self.fc_out(x)
+        return output  # , gate_weights

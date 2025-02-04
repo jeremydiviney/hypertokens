@@ -212,15 +212,25 @@ def compute_cos_sim_loss(pred: torch.Tensor, target_indices: torch.Tensor, codeb
     return loss
 
 
+def compute_norm_loss(pred: torch.Tensor) -> torch.Tensor:
+    # Normalize the predicted embeddings and the target embeddings along the embedding dimension
+    pred_norm = torch.norm(pred, p=2, dim=-1)
+    target_norm = torch.ones_like(pred_norm)
+    loss = torch.nn.functional.mse_loss(pred_norm, target_norm)
+
+    return loss * 0.01
+
+
 def inference_and_loss_step(dataset, model, x, y):
 
     # Forward pass to get output embeddings
-    model_output, gate_weights = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
+    model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
 
     if model.modelType == JPT1QuantModelType.COS_SIM:
         loss = unique_batch_cosine_ce_loss(model, model_output, y)
-        gate_loss = compute_gate_loss(model, gate_weights)
-        loss += gate_loss
+        # gate_loss = compute_gate_loss(model, gate_weights)
+        # norm_loss = compute_norm_loss(model_output)
+        # loss += gate_loss  # + norm_loss
         return model_output, loss
 
     else:
@@ -550,7 +560,7 @@ def generate_text(
         x = torch.tensor(dataset.codebook.get_token_indices(tokens)).to(device)
         x = x.unsqueeze(0)
 
-        jpt_output, _ = inference_step(jpt_model, x)
+        jpt_output = inference_step(jpt_model, x)
 
         cur_batch_size = jpt_output.shape[0]
         cur_seq_len = jpt_output.shape[1]
@@ -603,12 +613,12 @@ if __name__ == "__main__":
         for n_layers in [6]  # Varying n_layers
         for jed in [512]
         for head_size in [32]  # Varying head_size
-        for lr in [0.0007]
+        for lr in [0.0005]
         for sl in [256]
-        for epochs in [14]
-        for dropout in [0.1]
+        for epochs in [20]
+        for dropout in [0.15]
         for token_space_dim in [jed]
-        for num_experts in [8]
+        for num_experts in [1]
     ]
 
     enable_torch_optimizations()
