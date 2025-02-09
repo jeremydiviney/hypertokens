@@ -28,8 +28,12 @@ from helpers.training import (
     setup_flash_attention,
 )
 
+from optimizers.binaryGradientStepWalk import BinaryGradientStepWalkOptimizer
+from optimizers.SignSGD import SignSGD
+from optimizers.SignAdam import SignAdam, MixedSignAdam
+from optimizers.CustomerAdamW import CustomAdamW
 from models.jpt1_quantizer import JPT1QuantModelType
-
+from models.schedulers.empiriclaLRScheduler import EmpiricalLRScheduler
 from helpers.utilities import calculate_token_accuracy
 
 # --------------------------------------------------
@@ -130,51 +134,49 @@ def analyze_embedding_clustering(model):
 
 
 def compute_logits_with_extras(model, hidden_states, target_indices, extra_negatives):
-    # Step 1: Flatten the target indices.
+    # Flatten target indices and get unique targets.
     target_flat = target_indices.view(-1)
-
-    # Step 2: Get unique targets from the batch.
     unique_targets = target_flat.unique()
 
     lookup_embeddings = model.codebook.lookup_embeddings
-    # lookup_embeddings = model.embeddings
 
-    # Step 3: If extra negatives are requested, sample tokens not in unique_targets.
     if extra_negatives > 0:
         vocab_size = lookup_embeddings.weight.size(0)
-        all_tokens = torch.arange(vocab_size, device=hidden_states.device)
-        # Filter out tokens that are in unique_targets.
-        non_target_tokens = all_tokens[~torch.isin(all_tokens, unique_targets)]
-        # Randomly select extra negatives.
+        # Create a mask to exclude unique targets.
+        mask = torch.ones(vocab_size, dtype=torch.bool, device=hidden_states.device)
+        mask[unique_targets] = False
+        non_target_tokens = mask.nonzero(as_tuple=True)[0]
         perm = torch.randperm(non_target_tokens.size(0), device=hidden_states.device)
         extra_candidates = non_target_tokens[perm[:extra_negatives]]
-        # Combine unique targets and extra negatives, then sort.
         candidate_set = torch.sort(torch.cat([unique_targets, extra_candidates]))[0]
     else:
         candidate_set = unique_targets
 
-    # Step 4: Retrieve and normalize candidate embeddings.
+    # Retrieve and normalize candidate embeddings.
     candidate_embeds = lookup_embeddings(candidate_set)
     candidate_embeds = F.normalize(candidate_embeds, p=2, dim=1)
 
-    # Step 5: Flatten and normalize hidden states.
+    # Flatten and normalize hidden states.
     N, D = target_flat.shape[0], hidden_states.shape[-1]
     hidden_norm = F.normalize(hidden_states.view(N, D), p=2, dim=1)
 
-    # Step 6: Compute logits as cosine similarities scaled by temperature.
+    # Compute logits as cosine similarities scaled by temperature.
     logits = torch.mm(hidden_norm, candidate_embeds.t()) / model.temperature
 
-    # Step 7: Remap each original target to its position in candidate_set.
-    new_targets = torch.searchsorted(candidate_set, target_flat)
+    # Remap each original target to its position in candidate_set using a mapping tensor.
+    mapping = torch.full((lookup_embeddings.weight.size(0),), -1, dtype=torch.long, device=candidate_set.device)
+    mapping[candidate_set] = torch.arange(candidate_set.size(0), device=candidate_set.device)
+    new_targets = mapping[target_flat]
 
     return logits, new_targets
 
 
-def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_indices: torch.Tensor, extra_negatives=6000) -> torch.Tensor:
+def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_indices: torch.Tensor, extra_negatives=16000) -> torch.Tensor:
     """
     Computes cross entropy loss where logits are based on negative MSE distances.
     """
     logits, new_targets = compute_logits_with_extras(model, pred, target_indices, extra_negatives)
+
     loss = F.cross_entropy(logits, new_targets)
 
     return loss
@@ -193,32 +195,6 @@ def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float
     uniform_dist = torch.full_like(usage_dist, 1.0 / num_experts)
     balancing_loss = alpha * F.mse_loss(usage_dist, uniform_dist)
     return balancing_loss
-
-
-def compute_cos_sim_loss(pred: torch.Tensor, target_indices: torch.Tensor, codebook: TokenCodebook) -> torch.Tensor:
-    # Retrieve the target embeddings from the codebook
-    target_embeds = codebook.lookup_embeddings(target_indices)
-
-    # Normalize the predicted embeddings and the target embeddings along the embedding dimension
-    pred_norm = F.normalize(pred, p=2, dim=-1)
-    target_norm = F.normalize(target_embeds, p=2, dim=-1)
-
-    # Compute the cosine similarity for each token across the last dimension
-    cos_sim = torch.sum(pred_norm * target_norm, dim=-1)
-
-    # The loss is defined as 1 minus the cosine similarity (we want a similarity of 1)
-    loss = torch.mean(1 - cos_sim)
-
-    return loss
-
-
-def compute_norm_loss(pred: torch.Tensor) -> torch.Tensor:
-    # Normalize the predicted embeddings and the target embeddings along the embedding dimension
-    pred_norm = torch.norm(pred, p=2, dim=-1)
-    target_norm = torch.ones_like(pred_norm)
-    loss = torch.nn.functional.mse_loss(pred_norm, target_norm)
-
-    return loss * 0.01
 
 
 def inference_and_loss_step(dataset, model, x, y):
@@ -261,25 +237,24 @@ def train_model(
         fused=True,
     )
 
-    # Create optimizer with Lion instead of AdamW
-    # optimizer = Lion(
-    #     model.parameters(),
-    #     lr=config["lr"],
-    #     weight_decay=0.0001,  # Lion typically works well with higher weight decay
-    # )
-
     step_count = 0
     step_size = 1_000_000
 
     total_steps = (config["epochs"] * len(train_dataloader.dataset.text_tokens)) // step_size
 
-    scheduler = optim.lr_scheduler.OneCycleLR(
+    # scheduler = optim.lr_scheduler.OneCycleLR(
+    #     optimizer,
+    #     max_lr=config["lr"],
+    #     total_steps=total_steps,
+    #     pct_start=0.05,
+    #     anneal_strategy="cos",
+    #     cycle_momentum=False,
+    # )
+
+    scheduler = EmpiricalLRScheduler(
         optimizer,
-        max_lr=config["lr"],
-        total_steps=total_steps,
-        pct_start=0.05,
-        anneal_strategy="cos",
-        cycle_momentum=False,
+        alpha=0.025,
+        n=9,
     )
 
     dataset = train_dataloader.dataset
@@ -306,12 +281,13 @@ def train_model(
     #     from_hypertoken=hypertoken_output,
     # )
 
+    tokens_processed = 0
+    train_time_accumulated = 0
+
     for epoch in range(config["epochs"]):
         batch_count = 0
-        optimizer.param_groups[0]["lr"] = current_lr
 
-        train_epoch_start = time.time()
-        tokens_processed = 0
+        train_step_start = time.time()
 
         for x, y in train_dataloader:
 
@@ -349,17 +325,18 @@ def train_model(
 
             loss.backward()
             optimizer.step()
-            # scheduler.step()
+            scheduler.step(current_loss)
 
             tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
 
             if tokens_since_step >= step_size:
-                tokens_since_step = 0
 
+                tokens_since_step = 0
                 step_count += 1
 
-                train_epoch_time = time.time() - train_epoch_start
-                tokens_per_second = tokens_processed / train_epoch_time
+                step_time = time.time() - train_step_start
+                train_time_accumulated += step_time
+                tokens_per_second = tokens_processed / train_time_accumulated
                 wandb.log(
                     {
                         "loss": current_mean_loss,
@@ -380,6 +357,7 @@ def train_model(
                             "epoch": epoch,
                         }
                     )
+                train_step_start = time.time()
 
         print(
             f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
@@ -567,19 +545,19 @@ if __name__ == "__main__":
             "n_layers": n_layers,
             "jpt_embed_dim": jed,
             "dropout": dropout,
-            "num_experts": num_experts,
             "vocab_size": vocab_size,
+            "output_type": output_type,
         }
         for n_layers in [6]  # Varying n_layers
-        for jed in [512]
+        for jed in [768]
         for head_size in [32]  # Varying head_size
         for lr in [0.0005]
         for sl in [256]
-        for epochs in [15]
-        for dropout in [0.15]
+        for epochs in [25]
+        for dropout in [0.2]
         for token_space_dim in [jed]
-        for num_experts in [1]
-        for vocab_size in [30000]
+        for vocab_size in [60000]
+        for output_type in [JPT1QuantModelType.COS_SIM]
     ]
 
     enable_torch_optimizations()
@@ -597,9 +575,8 @@ if __name__ == "__main__":
         head_size = experiment["head_size"]
         jpt_embed_dim = experiment["jpt_embed_dim"]
         dropout = experiment["dropout"]
-        num_experts = experiment["num_experts"]
         vocab_size = experiment["vocab_size"]
-
+        output_type = experiment["output_type"]
         token_space_dim = experiment["token_space_dim"]
         # load this just to get the vocab size
 
@@ -638,8 +615,7 @@ if __name__ == "__main__":
             num_layers=n_layers,
             dropout=dropout,
             codebook=codebook,
-            num_experts=num_experts,
-            modelType=JPT1QuantModelType.COS_SIM,
+            modelType=output_type,
         ).to(DEVICE)
 
         dataloader = DataLoader(

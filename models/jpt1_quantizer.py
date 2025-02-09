@@ -92,7 +92,6 @@ class JPT1Quantized(nn.Module):
         token_space_dim: int,
         num_heads: int,
         num_layers: int,
-        num_experts: int,
         dropout: float,
         codebook: TokenCodebook,
         modelType: JPT1QuantModelType,
@@ -103,7 +102,6 @@ class JPT1Quantized(nn.Module):
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
         self.modelType = modelType
-        self.num_experts = num_experts
 
         # self.embeddings = nn.Embedding(len(codebook.token_list), embed_dim)
         self.embeddings = codebook.lookup_embeddings
