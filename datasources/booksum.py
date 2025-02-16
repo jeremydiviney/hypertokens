@@ -239,9 +239,13 @@ class BooksumDataset(Dataset):
         self.seq_len = seq_len
         self.codebook = codebook
         self.data_stride = data_stride
-        train_text = "\n".join([dataset["train"][i]["text"] for i in range(75)])
-        val_text = "\n".join([dataset["validation"][i]["text"] for i in range(3)])
-        test_text = "\n".join([dataset["test"][i]["text"] for i in range(3)])
+        # train_text = "\n".join([dataset["train"][i]["text"] for i in range(75)])
+        # val_text = "\n".join([dataset["validation"][i]["text"] for i in range(3)])
+        # test_text = "\n".join([dataset["test"][i]["text"] for i in range(3)])
+
+        train_text = "\n".join([block["text"] for block in dataset["train"]])
+        val_text = "\n".join([block["text"] for block in dataset["validation"]])
+        test_text = "\n".join([block["text"] for block in dataset["test"]])
 
         all_text = train_text + val_text + test_text
         val_text = val_text + test_text

@@ -20,7 +20,7 @@ from sklearn.neighbors import KDTree
 
 from models.jpt1_quantizer import JPT1Quantized, TokenCodebook
 
-from datasources.booksum import BooksumDataset, get_or_train_tokenizer
+from datasources.fineweb10B import get_or_train_tokenizer, Fineweb10BDataset
 from helpers.experiments import run_experiment, count_parameters
 from helpers.training import (
     save_model,
@@ -31,7 +31,9 @@ from helpers.training import (
 from optimizers.binaryGradientStepWalk import BinaryGradientStepWalkOptimizer
 from optimizers.SignSGD import SignSGD
 from optimizers.SignAdam import SignAdam, MixedSignAdam
-from optimizers.CustomerAdamW import CustomAdamW
+
+from datasources.fineweb10B import load_hf_dataset, Fineweb10BDataset
+
 from models.jpt1_quantizer import JPT1QuantModelType
 from models.schedulers.empiriclaLRScheduler import EmpiricalLRScheduler
 from helpers.utilities import calculate_token_accuracy
@@ -240,22 +242,25 @@ def train_model(
     step_count = 0
     step_size = 1_000_000
 
-    total_steps = (config["epochs"] * len(train_dataloader.dataset.text_tokens)) // step_size
+    batch_tokens = config["batch_size"] * config["seq_len"]
 
-    # scheduler = optim.lr_scheduler.OneCycleLR(
-    #     optimizer,
-    #     max_lr=config["lr"],
-    #     total_steps=total_steps,
-    #     pct_start=0.05,
-    #     anneal_strategy="cos",
-    #     cycle_momentum=False,
-    # )
+    total_steps = (config["epochs"] * train_dataloader.dataset.token_count) // step_size
+    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // batch_tokens
 
-    scheduler = EmpiricalLRScheduler(
+    scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        alpha=0.025,
-        n=9,
+        max_lr=config["lr"],
+        total_steps=scheduler_steps,
+        pct_start=0.05,
+        anneal_strategy="cos",
+        cycle_momentum=False,
     )
+
+    # scheduler = EmpiricalLRScheduler(
+    #     optimizer,
+    #     alpha=0.025,
+    #     n=9,
+    # )
 
     dataset = train_dataloader.dataset
 
@@ -325,7 +330,7 @@ def train_model(
 
             loss.backward()
             optimizer.step()
-            scheduler.step(current_loss)
+            scheduler.step()
 
             tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
 
@@ -470,7 +475,7 @@ def generate_text(
     jpt_model: nn.Module,
     prompt: str,
     max_new_tokens: int,
-    dataset: BooksumDataset,
+    dataset: Fineweb10BDataset,
     temperature: float = 0.5,
     device: str = "cuda",
 ) -> str:
@@ -536,7 +541,6 @@ if __name__ == "__main__":
     experiments: list[dict] = [
         {
             "seq_len": sl,
-            "token_len": 8,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
             "batch_size": 32,
@@ -551,12 +555,12 @@ if __name__ == "__main__":
         for n_layers in [6]  # Varying n_layers
         for jed in [768]
         for head_size in [32]  # Varying head_size
-        for lr in [0.0005]
+        for lr in [0.0009]
         for sl in [256]
-        for epochs in [25]
+        for epochs in [15]
         for dropout in [0.2]
         for token_space_dim in [jed]
-        for vocab_size in [60000]
+        for vocab_size in [50000]
         for output_type in [JPT1QuantModelType.COS_SIM]
     ]
 
@@ -569,7 +573,6 @@ if __name__ == "__main__":
 
     for experiment in experiments:
         seq_len = experiment["seq_len"]
-        token_len = experiment["token_len"]
         batch_size = experiment["batch_size"]
         n_layers = experiment["n_layers"]
         head_size = experiment["head_size"]
@@ -580,42 +583,35 @@ if __name__ == "__main__":
         token_space_dim = experiment["token_space_dim"]
         # load this just to get the vocab size
 
-        dataset_all = BooksumDataset(
-            token_len=experiment["token_len"],
-            seq_len=seq_len,
-            type="all",
-            codebook=None,
-            data_stride=1,
-            tokenizer=None,
-        )
+        dataset_name = "fineweb-10BT"
 
-        tokenizer = get_or_train_tokenizer(dataset_all.all_text, vocab_size, f"tokenizer_cache/booksum_tokenizer_{vocab_size}.json")
+        hf_dataset = load_hf_dataset()
 
-        codebook = get_codebook(tokenizer, token_space_dim)
+        text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
+        tokenizer = get_or_train_tokenizer(text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
 
-        dataset_train = BooksumDataset(
-            token_len=experiment["token_len"],
+        codebook = get_codebook(tokenizer, token_space_dim).to(DEVICE)
+
+        dataset_train = Fineweb10BDataset(
             seq_len=seq_len,
             type="train",
             codebook=None,
             data_stride=seq_len,
             tokenizer=tokenizer,
+            hf_dataset=hf_dataset,
         )
 
-        dataset_train.codebook = codebook.to(DEVICE)
-
-        vocab_size = len(dataset_train.codebook.token_list)
+        vocab_size = len(tokenizer.get_vocab())
 
         gpt_model = JPT1Quantized(
             token_space_dim=token_space_dim,
             seq_len=seq_len,
-            token_len=token_len,
             embed_dim=jpt_embed_dim,
             num_heads=head_size,
             num_layers=n_layers,
             dropout=dropout,
             codebook=codebook,
-            modelType=output_type,
+            model_type=output_type,
         ).to(DEVICE)
 
         dataloader = DataLoader(
@@ -624,13 +620,13 @@ if __name__ == "__main__":
             shuffle=True,
         )
 
-        val_dataset = BooksumDataset(
-            token_len=token_len,
+        val_dataset = Fineweb10BDataset(
             seq_len=seq_len,
             type="validation",
             codebook=codebook,
             data_stride=seq_len,
             tokenizer=tokenizer,
+            hf_dataset=hf_dataset,
         )
 
         val_dataloader = DataLoader(
@@ -660,7 +656,7 @@ if __name__ == "__main__":
             return model
 
         project_name = "jpt1"
-        exp_name = f"{project_name}-sl:{experiment['seq_len']}-tl:{experiment['token_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"
+        exp_name = f"{project_name}-sl:{experiment['seq_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"
 
         run_experiment(project_name, train_model_lambda, exp_name, experiment)
 

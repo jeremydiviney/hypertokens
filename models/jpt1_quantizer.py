@@ -87,27 +87,25 @@ class JPT1Quantized(nn.Module):
     def __init__(
         self,
         seq_len: int,
-        token_len: int,
         embed_dim: int,
         token_space_dim: int,
         num_heads: int,
         num_layers: int,
         dropout: float,
         codebook: TokenCodebook,
-        modelType: JPT1QuantModelType,
+        model_type: JPT1QuantModelType,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
-        self.modelType = modelType
+        self.model_type = model_type
 
         # self.embeddings = nn.Embedding(len(codebook.token_list), embed_dim)
         self.embeddings = codebook.lookup_embeddings
         self.lookup_embeddings = codebook.lookup_embeddings
 
-        self.token_len = token_len
         self.codebook = codebook
         self.token_space_dim = self.lookup_embeddings.weight.shape[1]
 
@@ -126,7 +124,7 @@ class JPT1Quantized(nn.Module):
 
         # self.ln_final = nn.LayerNorm(embed_dim)
 
-        if modelType == JPT1QuantModelType.COS_SIM:
+        if model_type == JPT1QuantModelType.COS_SIM:
             self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
             # self.fc_out_experts = nn.Linear(embed_dim, token_space_dim * num_experts)
             # self.gate = nn.Linear(embed_dim, num_experts)
