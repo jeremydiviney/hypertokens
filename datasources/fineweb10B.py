@@ -181,13 +181,17 @@ class Fineweb10BDataset(Dataset):
 
         data_row_chunks = len(full_text_tokens) // self.data_stride
 
+        # If the last chunk is not full, add an extra chunk > 1 because the last token is used as the target so we take and extra token for the final target
+        if len(full_text_tokens) % self.data_stride > 1:
+            data_row_chunks += 1
+
         chuck_selection_idx = random.randint(0, data_row_chunks - 1)
 
         # Calculate chunk size based on sequence length
         chunk_size = self.seq_len + 1  # +1 for the target token
 
         # Calculate start and end positions for the chunk
-        start_pos = chuck_selection_idx * chunk_size
+        start_pos = chuck_selection_idx * self.data_stride
         end_pos = start_pos + chunk_size
 
         # Extract the chunk, handling potential end of text
