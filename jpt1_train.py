@@ -74,7 +74,7 @@ def evaluate_model(
             total_loss += loss.item()
             batch_count += 1
 
-            if model.modelType == JPT1QuantModelType.COS_SIM:
+            if model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = dataset.codebook.get_nearest_token_indices_cossim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
@@ -204,7 +204,7 @@ def inference_and_loss_step(dataset, model, x, y):
     # Forward pass to get output embeddings
     model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
 
-    if model.modelType == JPT1QuantModelType.COS_SIM:
+    if model.model_type == JPT1QuantModelType.COS_SIM:
         loss = unique_batch_cosine_ce_loss(model, model_output, y)
         # gate_loss = compute_gate_loss(model, gate_weights)
         # norm_loss = compute_norm_loss(model_output)
@@ -240,7 +240,7 @@ def train_model(
     )
 
     step_count = 0
-    step_size = 1_000_000
+    step_size = 10_000_000
 
     batch_tokens = config["batch_size"] * config["seq_len"]
 
@@ -251,9 +251,11 @@ def train_model(
         optimizer,
         max_lr=config["lr"],
         total_steps=scheduler_steps,
-        pct_start=0.05,
+        pct_start=0.01,
         anneal_strategy="cos",
         cycle_momentum=False,
+        div_factor=25,  # Initial lr = max_lr/25
+        final_div_factor=3,  # Min lr = initial_lr/10 = max_lr/(25*10)
     )
 
     # scheduler = EmpiricalLRScheduler(
@@ -513,7 +515,7 @@ def generate_text(
         last_token = jpt_output[0:1, -1:, :]
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            if jpt_model.modelType == JPT1QuantModelType.COS_SIM:
+            if jpt_model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = dataset.codebook.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
             else:
                 pred_token_indices = last_token.argmax(dim=-1)
@@ -558,7 +560,7 @@ if __name__ == "__main__":
         for lr in [0.0009]
         for sl in [256]
         for epochs in [15]
-        for dropout in [0.2]
+        for dropout in [0.0]
         for token_space_dim in [jed]
         for vocab_size in [50000]
         for output_type in [JPT1QuantModelType.COS_SIM]
@@ -595,7 +597,7 @@ if __name__ == "__main__":
         dataset_train = Fineweb10BDataset(
             seq_len=seq_len,
             type="train",
-            codebook=None,
+            codebook=codebook,
             data_stride=seq_len,
             tokenizer=tokenizer,
             hf_dataset=hf_dataset,
@@ -618,6 +620,9 @@ if __name__ == "__main__":
             dataset_train,
             batch_size=batch_size,
             shuffle=True,
+            num_workers=16,
+            pin_memory=True,
+            prefetch_factor=8,
         )
 
         val_dataset = Fineweb10BDataset(
@@ -632,6 +637,9 @@ if __name__ == "__main__":
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
+            num_workers=16,
+            pin_memory=True,
+            prefetch_factor=8,
         )
 
         # only if not debugging

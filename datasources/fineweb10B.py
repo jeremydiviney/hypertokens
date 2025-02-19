@@ -218,10 +218,9 @@ class Fineweb10BDataset(Dataset):
             # Concatenate the token sequence with padding
             token_sequence = np.concatenate([padding, token_sequence], axis=0)
 
-        x = token_sequence[:-1]
-        y = token_sequence[1:]
+        token_sequence_indices = self.codebook.get_token_indices(token_sequence)
 
-        x = np.array(self.codebook.get_token_indices(x))
-        y = np.array(self.codebook.get_token_indices(y))
+        x = np.array(token_sequence_indices[:-1])
+        y = np.array(token_sequence_indices[1:])
 
         return x, y
