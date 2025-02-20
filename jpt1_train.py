@@ -28,9 +28,6 @@ from helpers.training import (
     setup_flash_attention,
 )
 
-from optimizers.binaryGradientStepWalk import BinaryGradientStepWalkOptimizer
-from optimizers.SignSGD import SignSGD
-from optimizers.SignAdam import SignAdam, MixedSignAdam
 
 from datasources.fineweb10B import load_hf_dataset, Fineweb10BDataset
 
@@ -56,17 +53,14 @@ def evaluate_model(
     total_loss = 0
     batch_count = 0
 
-    char_matches_total = 0
     token_matches_total = 0
-    char_total = 0
+
     token_total = 0
 
     for x, y in dataloader:
 
         x = x.to(device)
         y = y.to(device)
-
-        current_batch_size = x.shape[0]
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
@@ -177,6 +171,7 @@ def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_ind
     """
     Computes cross entropy loss where logits are based on negative MSE distances.
     """
+
     logits, new_targets = compute_logits_with_extras(model, pred, target_indices, extra_negatives)
 
     loss = F.cross_entropy(logits, new_targets)
@@ -298,8 +293,8 @@ def train_model(
 
         for x, y in train_dataloader:
 
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
             tokens_since_step += x.shape[0] * x.shape[1]
 
@@ -309,6 +304,7 @@ def train_model(
                 jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
 
             # Update metrics
+
             current_loss = loss.item()
 
             loss_history.append(current_loss)
@@ -320,7 +316,6 @@ def train_model(
 
             if current_mean_loss < low_loss:
                 low_loss = current_mean_loss
-                print(f"\nNew low loss: {low_loss:.7f}")
 
             # Log batch metrics
 
@@ -337,13 +332,13 @@ def train_model(
             tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
 
             if tokens_since_step >= step_size:
-
                 tokens_since_step = 0
                 step_count += 1
 
                 step_time = time.time() - train_step_start
                 train_time_accumulated += step_time
                 tokens_per_second = tokens_processed / train_time_accumulated
+                print(f"\nNew low loss: {low_loss:.7f},")
                 wandb.log(
                     {
                         "loss": current_mean_loss,
@@ -364,28 +359,33 @@ def train_model(
                             "epoch": epoch,
                         }
                     )
+                    print(
+                        f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
+                        f"val_token_accuracy: {val_token_accuracy:.2%}"
+                        f"tokens_per_second: {tokens_per_second:.2f}"
+                    )
+
                 train_step_start = time.time()
 
-        print(
-            f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
-            f"val_token_accuracy: {val_token_accuracy:.2%}"
+            # print(
+            #     f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
+            #     f"val_token_accuracy: {val_token_accuracy:.2%}"
+            # )
+        # Final Evaluation
+        eval_results = evaluate_model(
+            model,
+            val_dataloader,
+            device,
         )
 
-    # Final Evaluation
-    eval_results = evaluate_model(
-        model,
-        val_dataloader,
-        device,
-    )
-
-    wandb.log(
-        {
-            "val_loss": eval_results["val_loss"],
-            "val_token_accuracy": eval_results["val_token_accuracy"],
-            "epoch": epoch,
-        }
-    )
-    train_time_end = time.time()
+        wandb.log(
+            {
+                "val_loss": eval_results["val_loss"],
+                "val_token_accuracy": eval_results["val_token_accuracy"],
+                "epoch": epoch,
+            }
+        )
+        train_time_end = time.time()
 
     print(f"Training time: {train_time_end - train_time_start:.4f} seconds")
 
@@ -545,7 +545,7 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 32,
+            "batch_size": 16,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
@@ -554,15 +554,15 @@ if __name__ == "__main__":
             "vocab_size": vocab_size,
             "output_type": output_type,
         }
-        for n_layers in [6]  # Varying n_layers
+        for n_layers in [12]  # Varying n_layers
         for jed in [768]
-        for head_size in [32]  # Varying head_size
+        for head_size in [64]  # Varying head_size
         for lr in [0.0009]
-        for sl in [256]
-        for epochs in [15]
+        for sl in [1024]
+        for epochs in [1]
         for dropout in [0.0]
         for token_space_dim in [jed]
-        for vocab_size in [50000]
+        for vocab_size in [50304]
         for output_type in [JPT1QuantModelType.COS_SIM]
     ]
 
@@ -620,7 +620,7 @@ if __name__ == "__main__":
             dataset_train,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=16,
+            num_workers=8,
             pin_memory=True,
             prefetch_factor=8,
         )
@@ -637,7 +637,7 @@ if __name__ == "__main__":
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            num_workers=16,
+            num_workers=8,
             pin_memory=True,
             prefetch_factor=8,
         )

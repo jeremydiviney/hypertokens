@@ -56,19 +56,25 @@ def build_selection_table(data, tokenizer):
 
     lookup_table = []
     total = 0
-    cnt = 0
 
-    for d in data:
-        # tokens = tokenizer.encode(d["text"]).tokens
-        text = d["text"]
-        total += len(text) / 5  # rought token count
-        lookup_table.append(total)
-        cnt += 1
-        if cnt % 10000 == 0:
-            print(f"build_selection_table: Processed {cnt} items")
+    batch_size = 1000
+    for i in range(0, len(data), batch_size):
+        batch_text = data[i : i + batch_size]["text"]
+        # batch encode once for each chunk
+        encoded_batch = tokenizer.encode_batch_fast(batch_text)
+
+        for encoded_row in encoded_batch:
+            total += len(encoded_row.tokens)
+            lookup_table.append(total)
+
+        if i % (10000) == 0:
+            print(f"build_selection_table: Processed {i} items")
 
     with open(cache_filename, "wb") as f:
         pickle.dump(lookup_table, f)
+
+    print("build_selection_table completed!")
+    os._exit(0)
 
     return lookup_table
 
@@ -149,30 +155,41 @@ class Fineweb10BDataset(Dataset):
         self.codebook = codebook
         self.data_stride = data_stride
         self.tokenizer = tokenizer
-        self.train_ratio = 1000
+        self.train_ratio = 4000
         self.type = type
 
-        self.selection_table = build_selection_table(self.hf_dataset["train"], self.tokenizer)
-        self.selection_table_train = self.selection_table[:: self.train_ratio]
+        self.selection_table_master = build_selection_table(self.hf_dataset["train"], self.tokenizer)
+
+        self.selection_table = []
+        self.selection_table_indices = []
+
+        # Convert to numpy array if not already
+        master_array = np.array(self.selection_table_master)
+        # Calculate token counts differences
+        token_counts = np.diff(master_array, prepend=0)
+        # Create an array of indices
+        indices = np.arange(len(master_array))
+        mask = True
+        if self.type == "train":
+            # Select indices where i % train_ratio != 0
+            mask = (indices % self.train_ratio) != 0
+        elif self.type == "validation":
+            # Select indices where i % train_ratio == 0
+            mask = (indices % self.train_ratio) == 0
+        # Apply mask to get selected indices
+        self.selection_table_indices = indices[mask]
+        # Calculate cumulative sums for selected tokens
+        self.selection_table = np.cumsum(token_counts[mask])
 
         self.token_count = math.floor(self.selection_table[-1])
-        if self.type == "validation":
-            self.token_count = self.token_count // self.train_ratio
 
     def get_data_chunk(self, idx: int):
 
         adjusted_idx_value = idx * self.data_stride
 
-        if self.type == "validation":
-            adjusted_idx_value *= self.train_ratio
+        pre_data_row_idx = bisect_left(self.selection_table, adjusted_idx_value)
 
-        if self.type == "train":
-            data_row_idx = bisect_left(self.selection_table, adjusted_idx_value)
-            if data_row_idx % self.train_ratio == 0:
-                data_row_idx = data_row_idx + 1 if data_row_idx < len(self.selection_table) else data_row_idx - 1
-
-        else:
-            data_row_idx = bisect_left(self.selection_table_train, adjusted_idx_value)
+        data_row_idx = int(self.selection_table_indices[pre_data_row_idx])  # lookup the master data index for the row
 
         # Get the full text from the dataset
         full_text = self.hf_dataset["train"][data_row_idx]["text"]
@@ -200,10 +217,7 @@ class Fineweb10BDataset(Dataset):
 
     def __len__(self) -> int:
 
-        if self.type == "train":
-            return math.floor(self.selection_table[-1] / self.data_stride)
-        else:
-            return math.floor(self.selection_table[-1] / (self.data_stride * self.train_ratio))
+        return math.floor(self.selection_table[-1] / self.data_stride)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
 
