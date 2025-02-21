@@ -371,7 +371,6 @@ def train_model(
                         f"val_token_accuracy: {val_token_accuracy:.2%}"
                         f"tokens_per_second: {tokens_per_second:.2f}"
                     )
-                    os._exit(0)
 
                 train_step_start = time.time()
 
