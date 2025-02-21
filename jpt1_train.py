@@ -235,7 +235,7 @@ def train_model(
     )
 
     step_count = 0
-    step_size = 10_000_000
+    step_size = 2_000_000
 
     batch_tokens = config["batch_size"] * config["seq_len"]
 
@@ -316,6 +316,7 @@ def train_model(
 
             if current_mean_loss < low_loss:
                 low_loss = current_mean_loss
+                print(f"\nNew low loss: {low_loss:.7f},")
 
             # Log batch metrics
 
@@ -338,7 +339,7 @@ def train_model(
                 step_time = time.time() - train_step_start
                 train_time_accumulated += step_time
                 tokens_per_second = tokens_processed / train_time_accumulated
-                print(f"\nNew low loss: {low_loss:.7f},")
+
                 wandb.log(
                     {
                         "loss": current_mean_loss,

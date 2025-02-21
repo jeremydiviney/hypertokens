@@ -64,7 +64,7 @@ def build_selection_table(data, tokenizer):
         encoded_batch = tokenizer.encode_batch_fast(batch_text)
 
         for encoded_row in encoded_batch:
-            total += len(encoded_row.tokens)
+            total += len(encoded_row.ids)
             lookup_table.append(total)
 
         if i % (10000) == 0:
@@ -158,6 +158,8 @@ class Fineweb10BDataset(Dataset):
         self.train_ratio = 4000
         self.type = type
 
+        self.pad_token_id = self.tokenizer.token_to_id("[PAD]")
+
         self.selection_table_master = build_selection_table(self.hf_dataset["train"], self.tokenizer)
 
         self.selection_table = []
@@ -194,26 +196,31 @@ class Fineweb10BDataset(Dataset):
         # Get the full text from the dataset
         full_text = self.hf_dataset["train"][data_row_idx]["text"]
 
-        full_text_tokens = self.tokenizer.encode(full_text).tokens
+        full_idx_tokens = self.tokenizer.encode_batch_fast([full_text])[0].ids
 
-        data_row_chunks = len(full_text_tokens) // self.data_stride
+        data_row_chunks = (len(full_idx_tokens) // self.data_stride) + 1
+        data_row_remainder = len(full_idx_tokens) % self.data_stride
 
-        # If the last chunk is not full, add an extra chunk > 1 because the last token is used as the target so we take and extra token for the final target
-        if len(full_text_tokens) % self.data_stride > 1:
-            data_row_chunks += 1
+        # if exactly n chunks, then we need to remove one chunk
+        if data_row_remainder == 0:
+            data_row_chunks -= 1
 
-        chuck_selection_idx = random.randint(0, data_row_chunks - 1)
+        chuck_selection_idx = 0 if data_row_chunks == 1 else random.randint(0, data_row_chunks - 1)
 
         # Calculate chunk size based on sequence length
         chunk_size = self.seq_len + 1  # +1 for the target token
 
         # Calculate start and end positions for the chunk
         start_pos = chuck_selection_idx * self.data_stride
-        end_pos = start_pos + chunk_size
+
+        end_pos = min(start_pos + chunk_size, len(full_idx_tokens))
+
+        if (end_pos - start_pos) < chunk_size:
+            start_pos = max(0, end_pos - chunk_size)
 
         # Extract the chunk, handling potential end of text
-        text_chunk = full_text_tokens[start_pos:end_pos]
-        return text_chunk
+        idx_chunk = full_idx_tokens[start_pos:end_pos]
+        return idx_chunk
 
     def __len__(self) -> int:
 
@@ -221,20 +228,18 @@ class Fineweb10BDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
 
-        token_sequence = self.get_data_chunk(idx)
+        token_sequence_ids = np.array(self.get_data_chunk(idx))
 
         # Calculate padding needed
-        padding_needed = (self.seq_len + 1) - len(token_sequence)
+        padding_needed = (self.seq_len + 1) - len(token_sequence_ids)
 
         if padding_needed > 0:
             # Create padding array filled with pad_token
-            padding = np.full((padding_needed), "[PAD]")
+            padding = np.full((padding_needed), self.pad_token_id)
             # Concatenate the token sequence with padding
-            token_sequence = np.concatenate([padding, token_sequence], axis=0)
+            token_sequence_ids = np.concatenate([padding, token_sequence_ids], axis=0)
 
-        token_sequence_indices = self.codebook.get_token_indices(token_sequence)
-
-        x = np.array(token_sequence_indices[:-1])
-        y = np.array(token_sequence_indices[1:])
+        x = token_sequence_ids[:-1]
+        y = token_sequence_ids[1:]
 
         return x, y
