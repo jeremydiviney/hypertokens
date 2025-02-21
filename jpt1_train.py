@@ -197,16 +197,13 @@ def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float
 def inference_and_loss_step(dataset, model, x, y):
 
     # Forward pass to get output embeddings
-    start_time = time.time()
+
     model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
-    end_time = time.time()
-    print(f"Inference time: {end_time - start_time:.4f} seconds")
 
     if model.model_type == JPT1QuantModelType.COS_SIM:
-        start_time = time.time()
+
         loss = unique_batch_cosine_ce_loss(model, model_output, y)
-        end_time = time.time()
-        print(f"Loss time: {end_time - start_time:.4f} seconds")
+
         # gate_loss = compute_gate_loss(model, gate_weights)
         # norm_loss = compute_norm_loss(model_output)
         # loss += gate_loss  # + norm_loss
@@ -241,7 +238,7 @@ def train_model(
     )
 
     step_count = 0
-    step_size = 2_000_000
+    step_size = 1_000_000
 
     batch_tokens = config["batch_size"] * config["seq_len"]
 
@@ -298,7 +295,7 @@ def train_model(
         train_step_start = time.time()
 
         for x, y in train_dataloader:
-            start_time = time.time()
+            # start_time = time.time()
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
@@ -338,8 +335,8 @@ def train_model(
 
             tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
 
-            end_time = time.time()
-            print(f"Train step time: {end_time - start_time:.4f} seconds")
+            # end_time = time.time()
+            # print(f"Train step time: {end_time - start_time:.4f} seconds")
 
             if tokens_since_step >= step_size:
                 tokens_since_step = 0
@@ -358,7 +355,7 @@ def train_model(
                     }
                 )
 
-                if step_count % 10 == 0:
+                if step_count % 100 == 0:
                     eval_results = evaluate_model(model, val_dataloader, device)
                     val_loss = eval_results["val_loss"]
                     val_token_accuracy = eval_results["val_token_accuracy"]
@@ -374,6 +371,7 @@ def train_model(
                         f"val_token_accuracy: {val_token_accuracy:.2%}"
                         f"tokens_per_second: {tokens_per_second:.2f}"
                     )
+                    os._exit(0)
 
                 train_step_start = time.time()
 
@@ -555,7 +553,7 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 16,
+            "batch_size": 12,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
