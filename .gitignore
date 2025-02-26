@@ -95,3 +95,6 @@ Thumbs.db
 
 # Wandb
 wandb/
+
+# Meta cache exceptions
+!meta_cache/**/*.pkl
