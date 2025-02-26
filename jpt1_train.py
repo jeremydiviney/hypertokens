@@ -199,17 +199,15 @@ def vectorized_infoNCE_loss(model, hidden_states, target_indices):
     return loss
 
 
-def batch_infoNCE_loss(model, hidden_states, target_indices, num_compares=12288):
+def batch_infoNCE_loss_per_batch(model, hidden_states, target_indices):
     """
-    InfoNCE loss computed batch by batch to reduce memory usage.
-    Uses in-batch tokens for comparison, with additional random negatives if needed.
+    InfoNCE loss computed batch by batch with unique targets calculated per batch.
+    Uses only in-batch tokens for comparison with no additional random negatives.
 
     Args:
         model: Model containing the codebook
         hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
         target_indices: Target token indices of shape [batch_size, seq_length]
-        num_compares: Number of embeddings to compare against (including positives)
-                     If None, only use the unique tokens in the batch
 
     Returns:
         Average InfoNCE loss
@@ -217,65 +215,31 @@ def batch_infoNCE_loss(model, hidden_states, target_indices, num_compares=12288)
     batch_size = hidden_states.shape[0]
     total_loss = 0
 
-    # Flatten target indices across the entire batch to find all unique targets
-    all_targets_flat = target_indices.reshape(-1)
-    all_unique_targets, unique_inverse = torch.unique(all_targets_flat, return_inverse=True)
-
-    # Get embeddings for all unique targets and normalize (compute once)
-    all_unique_embeds = model.codebook.lookup_embeddings(all_unique_targets)
-    all_unique_embeds_norm = F.normalize(all_unique_embeds, p=2, dim=1)
-
-    vocab_size = model.codebook.lookup_embeddings.weight.shape[0]
-
-    print(f"unique targets: {all_unique_targets.size(0)}, num compares: {num_compares}")
-
-    # Add random negatives if needed
-    if num_compares is not None and all_unique_targets.size(0) < num_compares:
-        # Determine how many random negatives we need
-        num_needed = num_compares - all_unique_targets.size(0)
-
-        # Get indices that aren't in all_unique_targets
-        all_indices = torch.arange(vocab_size, device=hidden_states.device)
-        mask = ~torch.isin(all_indices, all_unique_targets)
-        valid_indices = all_indices[mask]
-
-        # Sample random indices (assuming we have enough valid indices)
-        perm = torch.randperm(valid_indices.size(0), device=hidden_states.device)
-        random_indices = valid_indices[perm[:num_needed]]
-
-        # Get embeddings for random indices
-        random_embeds = model.codebook.lookup_embeddings(random_indices)
-        random_embeds_norm = F.normalize(random_embeds, p=2, dim=1)
-
-        # Combine with unique embeddings
-        comparison_embeds_norm = torch.cat([all_unique_embeds_norm, random_embeds_norm], dim=0)
-    else:
-        # Just use the unique embeddings
-        comparison_embeds_norm = all_unique_embeds_norm
-
     # Normalize all hidden states at once (outside the loop)
     hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
 
     # Process each batch separately to save memory
     for batch_idx in range(batch_size):
         # Get hidden states for this batch item (already normalized)
-        batch_hidden_norm = hidden_states_norm[batch_idx]
+        batch_hidden_norm = hidden_states_norm[batch_idx]  # shape: [seq_length, hidden_dim]
 
         # Get target tokens for this batch item
         batch_targets = target_indices[batch_idx].reshape(-1)  # shape: [seq_length]
 
-        # Get the start/end indices for this batch in the flattened targets
-        start_idx = batch_idx * batch_targets.size(0)
-        end_idx = start_idx + batch_targets.size(0)
+        # Find unique targets for THIS BATCH ONLY
+        batch_unique_targets, unique_inverse = torch.unique(batch_targets, return_inverse=True)
 
-        # Extract the inverse indices for this batch's targets
-        target_positions = unique_inverse[start_idx:end_idx]
+        # print(f"batch unique targets: {batch_unique_targets.size(0)}")
 
-        # Compute similarities (using all comparison embeddings)
-        similarities = torch.matmul(batch_hidden_norm, comparison_embeds_norm.t()) / model.temperature
+        # Get embeddings for unique targets in this batch and normalize
+        batch_unique_embeds = model.codebook.lookup_embeddings(batch_unique_targets)
+        batch_unique_embeds_norm = F.normalize(batch_unique_embeds, p=2, dim=1)
+
+        # Compute similarities (using only this batch's unique embeddings)
+        similarities = torch.matmul(batch_hidden_norm, batch_unique_embeds_norm.t()) / model.temperature
 
         # Compute loss
-        batch_loss = F.cross_entropy(similarities, target_positions)
+        batch_loss = F.cross_entropy(similarities, unique_inverse)
         total_loss += batch_loss
 
     # Return average loss
@@ -291,7 +255,7 @@ def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_ind
 
     # loss = F.cross_entropy(logits, new_targets)
 
-    loss = batch_infoNCE_loss(model, pred, target_indices)
+    loss = batch_infoNCE_loss_per_batch(model, pred, target_indices)
 
     return loss
 
