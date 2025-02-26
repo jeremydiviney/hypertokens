@@ -19,7 +19,7 @@ from tokenizers import Tokenizer
 
 from sklearn.neighbors import KDTree
 
-from models.jpt1_quantizer import JPT1Quantized, TokenCodebook
+from models.jpt1_quantizer import JPT1Quantized
 
 from datasources.fineweb10B import get_or_train_tokenizer, Fineweb10BDataset
 from helpers.experiments import run_experiment, count_parameters
@@ -45,6 +45,7 @@ def evaluate_model(
     model: nn.Module,
     dataloader: DataLoader,
     device: str,
+    loss_fn: torch.nn.Module,
 ) -> dict:
 
     model.eval()
@@ -64,23 +65,23 @@ def evaluate_model(
         y = y.to(device)
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
+            jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
 
             total_loss += loss.item()
             batch_count += 1
 
             if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = dataset.codebook.get_nearest_token_indices_cossim(jpt_output)
+                pred_token_indices = dataset.get_nearest_token_indices_cossim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
             pred_token_indices = pred_token_indices.detach().cpu().numpy()
 
-        pred_tokens = dataset.codebook.get_text_token_from_indices(pred_token_indices)
+        pred_tokens = dataset.get_text_token_from_indices(pred_token_indices)
 
-        target_tokens = dataset.codebook.get_text_token_from_indices(y.detach().cpu().numpy())
+        target_tokens = dataset.get_text_token_from_indices(y.detach().cpu().numpy())
 
-        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.codebook.token_list["[PAD]"])
+        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.token_list["[PAD]"])
 
         token_matches_total += accuracy_metrics["token_matches"]
         token_total += accuracy_metrics["token_count"]
@@ -111,7 +112,7 @@ def inference_step(model, x):
 
 def analyze_embedding_clustering(model):
     with torch.no_grad():
-        embeddings = model.codebook.lookup_embeddings.weight
+        embeddings = model.lookup_embeddings.weight
         normalized_emb = F.normalize(embeddings, p=2, dim=1)
 
         # Get pairwise similarities
@@ -134,7 +135,7 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
 
     target_flat = target_indices.reshape(-1)
     unique_targets = target_flat.unique()
-    lookup_embeddings = model.codebook.lookup_embeddings
+    lookup_embeddings = model.lookup_embeddings
 
     # Calculate number of extra negatives needed
     total_tokens = target_flat.size(0)  # original number of tokens (seq_len * batch_size)
@@ -172,104 +173,70 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
     return logits, new_targets
 
 
-def vectorized_infoNCE_loss(model, hidden_states, target_indices):
-    # Normalize hidden states
-    hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-    hidden_norm = F.normalize(hidden_flat, p=2, dim=1)
+class CustomLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Initialize any parameters
 
-    # Get target tokens
-    target_flat = target_indices.reshape(-1)
+    def forward(self, model, hidden_states, target_indices, group_size=8):
+        # Your custom loss calculation
+        """
+        InfoNCE loss computed by grouping batches into sets of batches per iteration.
+        Uses in-batch tokens for comparison with unique targets calculated per group.
 
-    # Get unique target tokens and their inverse indices
-    # inverse_indices maps each original target to its position in the unique array
-    unique_targets, inverse_indices = torch.unique(target_flat, return_inverse=True)
+        Args:
+            model: Model
+            hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
+            target_indices: Target token indices of shape [batch_size, seq_length]
+            group_size: Number of batches to process together in each iteration
 
-    # Get embeddings for unique tokens
-    unique_embeds = model.codebook.lookup_embeddings(unique_targets)
-    unique_embeds_norm = F.normalize(unique_embeds, p=2, dim=1)
+        Returns:
+            Average InfoNCE loss
+        """
 
-    # Compute similarities between hidden states and unique token embeddings
-    # This creates a matrix of size [batch_size × num_unique_tokens]
-    similarities = torch.matmul(hidden_norm, unique_embeds_norm.t()) / model.temperature
+        batch_size = hidden_states.shape[0]
+        seq_length = hidden_states.shape[1]
+        total_loss = 0
+        num_groups = (batch_size + group_size - 1) // group_size  # Ceiling division
 
-    # The inverse_indices tensor already tells us which position in unique_targets
-    # corresponds to each target token - perfect for cross entropy targets
-    loss = F.cross_entropy(similarities, inverse_indices)
+        # Normalize all hidden states at once
+        hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
 
-    return loss
+        # Process batches in groups
+        for group_idx in range(num_groups):
+            # Determine the start and end indices for this group
+            group_start = group_idx * group_size
+            group_end = min(group_start + group_size, batch_size)
+            current_group_size = group_end - group_start
 
+            # Get all hidden states and targets for this group
+            group_hidden_norm = hidden_states_norm[group_start:group_end]  # [current_group_size, seq_length, hidden_dim]
+            group_targets = target_indices[group_start:group_end]  # [current_group_size, seq_length]
 
-def grouped_batch_infoNCE_loss(model, hidden_states, target_indices, group_size=4):
-    """
-    InfoNCE loss computed by grouping batches into sets of batches per iteration.
-    Uses in-batch tokens for comparison with unique targets calculated per group.
+            # Reshape to combine all sequences in the group
+            # From [current_group_size, seq_length, hidden_dim] to [current_group_size*seq_length, hidden_dim]
+            group_hidden_flat = group_hidden_norm.reshape(-1, group_hidden_norm.size(-1))
+            group_targets_flat = group_targets.reshape(-1)  # [current_group_size*seq_length]
 
-    Args:
-        model: Model containing the codebook
-        hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
-        target_indices: Target token indices of shape [batch_size, seq_length]
-        group_size: Number of batches to process together in each iteration
+            # Find unique targets in this group
+            group_unique_targets, group_inverse = torch.unique(group_targets_flat, return_inverse=True)
 
-    Returns:
-        Average InfoNCE loss
-    """
-    batch_size = hidden_states.shape[0]
-    seq_length = hidden_states.shape[1]
-    total_loss = 0
-    num_groups = (batch_size + group_size - 1) // group_size  # Ceiling division
+            # Get embeddings for unique targets and normalize
+            group_unique_embeds = model.lookup_embeddings(group_unique_targets)
+            group_unique_embeds_norm = F.normalize(group_unique_embeds, p=2, dim=1)
 
-    # Normalize all hidden states at once
-    hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
+            # Compute similarities for all tokens in the group against the group's unique embeddings
+            similarities = torch.matmul(group_hidden_flat, group_unique_embeds_norm.t()) / model.temperature
 
-    # Process batches in groups
-    for group_idx in range(num_groups):
-        # Determine the start and end indices for this group
-        group_start = group_idx * group_size
-        group_end = min(group_start + group_size, batch_size)
-        current_group_size = group_end - group_start
+            # Compute loss for the entire group
+            group_loss = F.cross_entropy(similarities, group_inverse)
 
-        # Get all hidden states and targets for this group
-        group_hidden_norm = hidden_states_norm[group_start:group_end]  # [current_group_size, seq_length, hidden_dim]
-        group_targets = target_indices[group_start:group_end]  # [current_group_size, seq_length]
+            # Weight the group loss by the number of batches in this group
+            # (to maintain proper averaging when not all groups have the same size)
+            total_loss += group_loss * current_group_size
 
-        # Reshape to combine all sequences in the group
-        # From [current_group_size, seq_length, hidden_dim] to [current_group_size*seq_length, hidden_dim]
-        group_hidden_flat = group_hidden_norm.reshape(-1, group_hidden_norm.size(-1))
-        group_targets_flat = group_targets.reshape(-1)  # [current_group_size*seq_length]
-
-        # Find unique targets in this group
-        group_unique_targets, group_inverse = torch.unique(group_targets_flat, return_inverse=True)
-
-        # Get embeddings for unique targets and normalize
-        group_unique_embeds = model.codebook.lookup_embeddings(group_unique_targets)
-        group_unique_embeds_norm = F.normalize(group_unique_embeds, p=2, dim=1)
-
-        # Compute similarities for all tokens in the group against the group's unique embeddings
-        similarities = torch.matmul(group_hidden_flat, group_unique_embeds_norm.t()) / model.temperature
-
-        # Compute loss for the entire group
-        group_loss = F.cross_entropy(similarities, group_inverse)
-
-        # Weight the group loss by the number of batches in this group
-        # (to maintain proper averaging when not all groups have the same size)
-        total_loss += group_loss * current_group_size
-
-    # Return average loss
-    return total_loss / batch_size
-
-
-def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_indices: torch.Tensor) -> torch.Tensor:
-    """
-    Computes cross entropy loss where logits are based on negative MSE distances.
-    """
-
-    # logits, new_targets = compute_logits_with_extras2(model, pred, target_indices)
-
-    # loss = F.cross_entropy(logits, new_targets)
-
-    loss = grouped_batch_infoNCE_loss(model, pred, target_indices)
-
-    return loss
+        # Return average loss
+        return total_loss / batch_size
 
 
 def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float = 2) -> torch.Tensor:
@@ -287,7 +254,7 @@ def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float
     return balancing_loss
 
 
-def inference_and_loss_step(dataset, model, x, y):
+def inference_and_loss_step(dataset, model, x, y, loss_fn):
 
     # Forward pass to get output embeddings
     # start_time = time.time()
@@ -295,26 +262,25 @@ def inference_and_loss_step(dataset, model, x, y):
     # end_time = time.time()
     # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
-    if model.model_type == JPT1QuantModelType.COS_SIM:
+    # if model.model_type == JPT1QuantModelType.COS_SIM:
 
-        # start_time = time.time()
-        loss = unique_batch_cosine_ce_loss(model, model_output, y)
-        # end_time = time.time()
-        # print(f"Loss step time: {end_time - start_time:.4f} seconds")
+    # start_time = time.time()
+    loss = loss_fn(model, model_output, y)
+    # end_time = time.time()
+    # print(f"Loss step time: {end_time - start_time:.4f} seconds")
 
-        # gate_loss = compute_gate_loss(model, gate_weights)
-        # norm_loss = compute_norm_loss(model_output)
-        # loss += gate_loss  # + norm_loss
-        return model_output, loss
+    # gate_loss = compute_gate_loss(model, gate_weights)
+    # norm_loss = compute_norm_loss(model_output)
+    # loss += gate_loss  # + norm_loss
+    return model_output, loss
 
-    else:
-        # For standard model types, compute logits normally and apply cross entropy over the vocab.
-        logits = model_output
-        loss_fn = nn.CrossEntropyLoss()
-        # logits shape is assumed to be [batch, seq_len, vocab_size]
-        ce_loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-        loss = ce_loss
-        return model_output, loss
+    # else:
+    #     # For standard model types, compute logits normally and apply cross entropy over the vocab.
+    #     logits = model_output
+    #     # logits shape is assumed to be [batch, seq_len, vocab_size]
+    #     ce_loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+    #     loss = ce_loss
+    #     return model_output, loss
 
 
 def train_model(
@@ -323,6 +289,7 @@ def train_model(
     train_dataloader,
     val_dataloader,
     config: dict,
+    loss_fn: torch.nn.Module,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -384,9 +351,6 @@ def train_model(
     #     from_hypertoken=hypertoken_output,
     # )
 
-    tokens_processed = 0
-    train_time_accumulated = 0
-
     for epoch in range(config["epochs"]):
         batch_count = 0
 
@@ -397,29 +361,13 @@ def train_model(
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            tokens_since_step += x.shape[0] * x.shape[1]
+            tokens_processed = x.shape[0] * x.shape[1]
+            tokens_since_step += tokens_processed
 
             batch_count += 1
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(dataset, model, x, y)
-
-            # Update metrics
-
-            current_loss = loss.item()
-
-            loss_history.append(current_loss)
-
-            if len(loss_history) > 50:
-                loss_history.pop(0)
-
-            current_mean_loss = sum(loss_history) / len(loss_history)
-
-            if current_mean_loss < low_loss:
-                low_loss = current_mean_loss
-                print(f"\nNew low loss: {low_loss:.7f},")
-
-            # Log batch metrics
+                jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -431,18 +379,31 @@ def train_model(
             optimizer.step()
             scheduler.step()
 
-            tokens_processed += x.shape[0] * x.shape[1]  # x.shape[0] is batch size, x.shape[1] is sequence length
-
             # end_time = time.time()
             # print(f"Train step time: {end_time - start_time:.4f} seconds")
+
+            torch.cuda.synchronize()
+
+            current_loss = loss.item()
+
+            loss_history.append(current_loss)
+
+            if len(loss_history) > 50:
+                loss_history.pop(0)
+
+            current_mean_loss = sum(loss_history) / len(loss_history)
+
+            tokens_per_second = tokens_processed / (time.time() - train_step_start)
+
+            if current_mean_loss < low_loss:
+                low_loss = current_mean_loss
+                print(
+                    f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f}, Tokens per second: {tokens_per_second:.2f}"
+                )
 
             if tokens_since_step >= step_size:
                 tokens_since_step = 0
                 step_count += 1
-
-                step_time = time.time() - train_step_start
-                train_time_accumulated += step_time
-                tokens_per_second = tokens_processed / train_time_accumulated
 
                 wandb.log(
                     {
@@ -454,7 +415,7 @@ def train_model(
                 )
 
                 if step_count % 25 == 0:
-                    eval_results = evaluate_model(model, val_dataloader, device)
+                    eval_results = evaluate_model(model, val_dataloader, device, loss_fn)
                     val_loss = eval_results["val_loss"]
                     val_token_accuracy = eval_results["val_token_accuracy"]
                     wandb.log(
@@ -473,7 +434,7 @@ def train_model(
                 if step_count % 310 == 0:
                     os._exit(0)
 
-                train_step_start = time.time()
+            train_step_start = time.time()
 
             # print(
             #     f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
@@ -484,6 +445,7 @@ def train_model(
             model,
             val_dataloader,
             device,
+            loss_fn,
         )
 
         wandb.log(
@@ -572,15 +534,6 @@ def get_text_token_from_prediction_text(prediction_text: str) -> str:
     return "".join(pred_text_chars)
 
 
-def get_codebook(tokenizer: Tokenizer, embed_dim: int):
-
-    codebook = TokenCodebook(tokenizer=tokenizer, embed_dim=embed_dim)
-
-    print(f"Populated codebook with {len(codebook.token_list)} unique tokens")
-
-    return codebook
-
-
 def generate_text(
     jpt_model: nn.Module,
     prompt: str,
@@ -607,10 +560,10 @@ def generate_text(
         # make sure the context is not empty
         current_context = " " if current_context == "" else current_context
 
-        tokens = dataset.codebook.tokenizer.encode(current_context).tokens
+        tokens = dataset.tokenizer.encode(current_context).tokens
         tokens = tokens[-jpt_model.seq_len :]
 
-        x = torch.tensor(dataset.codebook.get_token_indices(tokens)).to(device)
+        x = torch.tensor(dataset.get_token_indices(tokens)).to(device)
         x = x.unsqueeze(0)
 
         jpt_output = inference_step(jpt_model, x)
@@ -624,11 +577,11 @@ def generate_text(
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if jpt_model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = dataset.codebook.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
+                pred_token_indices = dataset.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
             else:
                 pred_token_indices = last_token.argmax(dim=-1)
 
-        next_token = dataset.codebook.get_text_token_from_indices(pred_token_indices.cpu().numpy())
+        next_token = dataset.get_text_token_from_indices(pred_token_indices.cpu().numpy())
         next_token = next_token.item()
 
         next_token = "" if next_token == "[UNK]" or next_token == "[PAD]" else next_token
@@ -653,7 +606,7 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 36,
+            "batch_size": 16,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
@@ -697,15 +650,18 @@ if __name__ == "__main__":
 
         hf_dataset = load_hf_dataset()
 
+        loss_fn = None
+        if output_type == JPT1QuantModelType.COS_SIM:
+            loss_fn = CustomLoss()
+        else:
+            loss_fn = nn.CrossEntropyLoss()
+
         text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
         tokenizer = get_or_train_tokenizer(text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
-
-        codebook = get_codebook(tokenizer, token_space_dim).to(DEVICE)
 
         dataset_train = Fineweb10BDataset(
             seq_len=seq_len,
             type="train",
-            codebook=codebook,
             data_stride=seq_len,
             tokenizer=tokenizer,
             hf_dataset=hf_dataset,
@@ -720,7 +676,7 @@ if __name__ == "__main__":
             num_heads=head_size,
             num_layers=n_layers,
             dropout=dropout,
-            codebook=codebook,
+            tokenizer=tokenizer,
             model_type=output_type,
         ).to(DEVICE)
 
@@ -736,7 +692,6 @@ if __name__ == "__main__":
         val_dataset = Fineweb10BDataset(
             seq_len=seq_len,
             type="validation",
-            codebook=codebook,
             data_stride=seq_len,
             tokenizer=tokenizer,
             hf_dataset=hf_dataset,
@@ -754,7 +709,7 @@ if __name__ == "__main__":
         if sys.gettrace() is None:  # No debugger attached
             print("Compiling models...")
             gpt_model = torch.compile(gpt_model)
-            codebook = torch.compile(codebook)
+            loss_fn = torch.compile(loss_fn)
 
             print("Models compiled!")
 
@@ -768,6 +723,7 @@ if __name__ == "__main__":
                 dataloader,
                 val_dataloader,
                 experiment,
+                loss_fn,
             )
             return model
 

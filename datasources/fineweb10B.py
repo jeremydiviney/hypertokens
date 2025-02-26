@@ -23,8 +23,6 @@ from torch.utils.data.dataset import Dataset
 
 from datasets import load_dataset
 
-from models.jpt1_quantizer import TokenCodebook
-
 TOKEN_PATTERN = re.compile(r"(\s+|\w+|[^\w\s])")
 
 TOKEN_CORPUS_PATTERN = re.compile(r"(\n+|\w+|[^\w\s])")
@@ -143,7 +141,6 @@ class Fineweb10BDataset(Dataset):
     def __init__(
         self,
         seq_len: int,
-        codebook: TokenCodebook,
         data_stride: int,
         hf_dataset: Dataset,
         tokenizer: Tokenizer | None,
@@ -152,7 +149,6 @@ class Fineweb10BDataset(Dataset):
         # Load TinyShakespeare from Hugging Face
         self.hf_dataset = hf_dataset
         self.seq_len = seq_len
-        self.codebook = codebook
         self.data_stride = data_stride
         self.tokenizer = tokenizer
         self.train_ratio = 4000
