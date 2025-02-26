@@ -123,7 +123,7 @@ def get_or_train_tokenizer(text_corpus: str | Iterable[str], vocab_size: int, to
         # Save the trained tokenizer to file for future use
         tokenizer.save(tokenizer_path)
         print(f"Trained and saved tokenizer to {tokenizer_path}")
-        os._exit(0)
+        # os._exit(0)
     return tokenizer
 
 
