@@ -199,48 +199,60 @@ def vectorized_infoNCE_loss(model, hidden_states, target_indices):
     return loss
 
 
-def batch_infoNCE_loss_per_batch(model, hidden_states, target_indices):
+def grouped_batch_infoNCE_loss(model, hidden_states, target_indices, group_size=4):
     """
-    InfoNCE loss computed batch by batch with unique targets calculated per batch.
-    Uses only in-batch tokens for comparison with no additional random negatives.
+    InfoNCE loss computed by grouping batches into sets of batches per iteration.
+    Uses in-batch tokens for comparison with unique targets calculated per group.
 
     Args:
         model: Model containing the codebook
         hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
         target_indices: Target token indices of shape [batch_size, seq_length]
+        group_size: Number of batches to process together in each iteration
 
     Returns:
         Average InfoNCE loss
     """
     batch_size = hidden_states.shape[0]
+    seq_length = hidden_states.shape[1]
     total_loss = 0
+    num_groups = (batch_size + group_size - 1) // group_size  # Ceiling division
 
-    # Normalize all hidden states at once (outside the loop)
+    # Normalize all hidden states at once
     hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
 
-    # Process each batch separately to save memory
-    for batch_idx in range(batch_size):
-        # Get hidden states for this batch item (already normalized)
-        batch_hidden_norm = hidden_states_norm[batch_idx]  # shape: [seq_length, hidden_dim]
+    # Process batches in groups
+    for group_idx in range(num_groups):
+        # Determine the start and end indices for this group
+        group_start = group_idx * group_size
+        group_end = min(group_start + group_size, batch_size)
+        current_group_size = group_end - group_start
 
-        # Get target tokens for this batch item
-        batch_targets = target_indices[batch_idx].reshape(-1)  # shape: [seq_length]
+        # Get all hidden states and targets for this group
+        group_hidden_norm = hidden_states_norm[group_start:group_end]  # [current_group_size, seq_length, hidden_dim]
+        group_targets = target_indices[group_start:group_end]  # [current_group_size, seq_length]
 
-        # Find unique targets for THIS BATCH ONLY
-        batch_unique_targets, unique_inverse = torch.unique(batch_targets, return_inverse=True)
+        # Reshape to combine all sequences in the group
+        # From [current_group_size, seq_length, hidden_dim] to [current_group_size*seq_length, hidden_dim]
+        group_hidden_flat = group_hidden_norm.reshape(-1, group_hidden_norm.size(-1))
+        group_targets_flat = group_targets.reshape(-1)  # [current_group_size*seq_length]
 
-        # print(f"batch unique targets: {batch_unique_targets.size(0)}")
+        # Find unique targets in this group
+        group_unique_targets, group_inverse = torch.unique(group_targets_flat, return_inverse=True)
 
-        # Get embeddings for unique targets in this batch and normalize
-        batch_unique_embeds = model.codebook.lookup_embeddings(batch_unique_targets)
-        batch_unique_embeds_norm = F.normalize(batch_unique_embeds, p=2, dim=1)
+        # Get embeddings for unique targets and normalize
+        group_unique_embeds = model.codebook.lookup_embeddings(group_unique_targets)
+        group_unique_embeds_norm = F.normalize(group_unique_embeds, p=2, dim=1)
 
-        # Compute similarities (using only this batch's unique embeddings)
-        similarities = torch.matmul(batch_hidden_norm, batch_unique_embeds_norm.t()) / model.temperature
+        # Compute similarities for all tokens in the group against the group's unique embeddings
+        similarities = torch.matmul(group_hidden_flat, group_unique_embeds_norm.t()) / model.temperature
 
-        # Compute loss
-        batch_loss = F.cross_entropy(similarities, unique_inverse)
-        total_loss += batch_loss
+        # Compute loss for the entire group
+        group_loss = F.cross_entropy(similarities, group_inverse)
+
+        # Weight the group loss by the number of batches in this group
+        # (to maintain proper averaging when not all groups have the same size)
+        total_loss += group_loss * current_group_size
 
     # Return average loss
     return total_loss / batch_size
@@ -255,7 +267,7 @@ def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_ind
 
     # loss = F.cross_entropy(logits, new_targets)
 
-    loss = batch_infoNCE_loss_per_batch(model, pred, target_indices)
+    loss = grouped_batch_infoNCE_loss(model, pred, target_indices)
 
     return loss
 
