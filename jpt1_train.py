@@ -4,6 +4,7 @@ from datetime import datetime
 import time
 import sys
 import random
+import math
 
 import numpy as np
 
@@ -129,12 +130,16 @@ def analyze_embedding_clustering(model):
             print(f"Most clustered token indices: {most_clustered.indices.tolist()}")
 
 
-def compute_logits_with_extras(model, hidden_states, target_indices, extra_negatives):
-    # Flatten target indices and get unique targets.
-    target_flat = target_indices.view(-1)
-    unique_targets = target_flat.unique()
+def compute_logits_with_extras(model, hidden_states, target_indices):
 
+    target_flat = target_indices.reshape(-1)
+    unique_targets = target_flat.unique()
     lookup_embeddings = model.codebook.lookup_embeddings
+
+    # Calculate number of extra negatives needed
+    total_tokens = target_flat.size(0)  # original number of tokens (seq_len * batch_size)
+    num_unique_targets = unique_targets.size(0)
+    extra_negatives = max(0, total_tokens - num_unique_targets)  # ensure we don't go negative
 
     if extra_negatives > 0:
         vocab_size = lookup_embeddings.weight.size(0)
@@ -167,14 +172,124 @@ def compute_logits_with_extras(model, hidden_states, target_indices, extra_negat
     return logits, new_targets
 
 
-def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_indices: torch.Tensor, extra_negatives=16000) -> torch.Tensor:
+def vectorized_infoNCE_loss(model, hidden_states, target_indices):
+    # Normalize hidden states
+    hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+    hidden_norm = F.normalize(hidden_flat, p=2, dim=1)
+
+    # Get target tokens
+    target_flat = target_indices.reshape(-1)
+
+    # Get unique target tokens and their inverse indices
+    # inverse_indices maps each original target to its position in the unique array
+    unique_targets, inverse_indices = torch.unique(target_flat, return_inverse=True)
+
+    # Get embeddings for unique tokens
+    unique_embeds = model.codebook.lookup_embeddings(unique_targets)
+    unique_embeds_norm = F.normalize(unique_embeds, p=2, dim=1)
+
+    # Compute similarities between hidden states and unique token embeddings
+    # This creates a matrix of size [batch_size × num_unique_tokens]
+    similarities = torch.matmul(hidden_norm, unique_embeds_norm.t()) / model.temperature
+
+    # The inverse_indices tensor already tells us which position in unique_targets
+    # corresponds to each target token - perfect for cross entropy targets
+    loss = F.cross_entropy(similarities, inverse_indices)
+
+    return loss
+
+
+def batch_infoNCE_loss(model, hidden_states, target_indices, num_compares=10240):
+    """
+    InfoNCE loss computed batch by batch to reduce memory usage.
+    Uses in-batch tokens for comparison, with additional random negatives if needed.
+
+    Args:
+        model: Model containing the codebook
+        hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
+        target_indices: Target token indices of shape [batch_size, seq_length]
+        num_compares: Number of embeddings to compare against (including positives)
+                     If None, only use the unique tokens in the batch
+
+    Returns:
+        Average InfoNCE loss
+    """
+    batch_size = hidden_states.shape[0]
+    total_loss = 0
+
+    # Flatten target indices across the entire batch to find all unique targets
+    all_targets_flat = target_indices.reshape(-1)
+    all_unique_targets, unique_inverse = torch.unique(all_targets_flat, return_inverse=True)
+
+    # Get embeddings for all unique targets and normalize (compute once)
+    all_unique_embeds = model.codebook.lookup_embeddings(all_unique_targets)
+    all_unique_embeds_norm = F.normalize(all_unique_embeds, p=2, dim=1)
+
+    vocab_size = model.codebook.lookup_embeddings.weight.shape[0]
+
+    # Add random negatives if needed
+    if num_compares is not None and all_unique_targets.size(0) < num_compares:
+        # Determine how many random negatives we need
+        num_needed = num_compares - all_unique_targets.size(0)
+
+        # Get indices that aren't in all_unique_targets
+        all_indices = torch.arange(vocab_size, device=hidden_states.device)
+        mask = ~torch.isin(all_indices, all_unique_targets)
+        valid_indices = all_indices[mask]
+
+        # Sample random indices (assuming we have enough valid indices)
+        perm = torch.randperm(valid_indices.size(0), device=hidden_states.device)
+        random_indices = valid_indices[perm[:num_needed]]
+
+        # Get embeddings for random indices
+        random_embeds = model.codebook.lookup_embeddings(random_indices)
+        random_embeds_norm = F.normalize(random_embeds, p=2, dim=1)
+
+        # Combine with unique embeddings
+        comparison_embeds_norm = torch.cat([all_unique_embeds_norm, random_embeds_norm], dim=0)
+    else:
+        # Just use the unique embeddings
+        comparison_embeds_norm = all_unique_embeds_norm
+
+    # Normalize all hidden states at once (outside the loop)
+    hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
+
+    # Process each batch separately to save memory
+    for batch_idx in range(batch_size):
+        # Get hidden states for this batch item (already normalized)
+        batch_hidden_norm = hidden_states_norm[batch_idx]
+
+        # Get target tokens for this batch item
+        batch_targets = target_indices[batch_idx].reshape(-1)  # shape: [seq_length]
+
+        # Get the start/end indices for this batch in the flattened targets
+        start_idx = batch_idx * batch_targets.size(0)
+        end_idx = start_idx + batch_targets.size(0)
+
+        # Extract the inverse indices for this batch's targets
+        target_positions = unique_inverse[start_idx:end_idx]
+
+        # Compute similarities (using all comparison embeddings)
+        similarities = torch.matmul(batch_hidden_norm, comparison_embeds_norm.t()) / model.temperature
+
+        # Compute loss
+        batch_loss = F.cross_entropy(similarities, target_positions)
+        total_loss += batch_loss
+
+    # Return average loss
+    return total_loss / batch_size
+
+
+def unique_batch_cosine_ce_loss(model: nn.Module, pred: torch.Tensor, target_indices: torch.Tensor) -> torch.Tensor:
     """
     Computes cross entropy loss where logits are based on negative MSE distances.
     """
 
-    logits, new_targets = compute_logits_with_extras(model, pred, target_indices, extra_negatives)
+    # logits, new_targets = compute_logits_with_extras2(model, pred, target_indices)
 
-    loss = F.cross_entropy(logits, new_targets)
+    # loss = F.cross_entropy(logits, new_targets)
+
+    loss = batch_infoNCE_loss(model, pred, target_indices)
 
     return loss
 
@@ -325,9 +440,9 @@ def train_model(
 
             optimizer.zero_grad(set_to_none=True)
 
-            max_grad_norm = 1
+            # max_grad_norm = 1
             # Add gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
             loss.backward()
             optimizer.step()
@@ -355,7 +470,7 @@ def train_model(
                     }
                 )
 
-                if step_count % 100 == 0:
+                if step_count % 25 == 0:
                     eval_results = evaluate_model(model, val_dataloader, device)
                     val_loss = eval_results["val_loss"]
                     val_token_accuracy = eval_results["val_token_accuracy"]
@@ -371,6 +486,9 @@ def train_model(
                         f"val_token_accuracy: {val_token_accuracy:.2%}"
                         f"tokens_per_second: {tokens_per_second:.2f}"
                     )
+
+                if step_count % 310 == 0:
+                    os._exit(0)
 
                 train_step_start = time.time()
 
@@ -552,7 +670,7 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 12,
+            "batch_size": 36,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
@@ -564,7 +682,7 @@ if __name__ == "__main__":
         for n_layers in [12]  # Varying n_layers
         for jed in [768]
         for head_size in [64]  # Varying head_size
-        for lr in [0.0009]
+        for lr in [0.0004]
         for sl in [1024]
         for epochs in [1]
         for dropout in [0.0]
