@@ -290,17 +290,17 @@ def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float
 def inference_and_loss_step(dataset, model, x, y):
 
     # Forward pass to get output embeddings
-    start_time = time.time()
+    # start_time = time.time()
     model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
-    end_time = time.time()
-    print(f"Inference step time: {end_time - start_time:.4f} seconds")
+    # end_time = time.time()
+    # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
     if model.model_type == JPT1QuantModelType.COS_SIM:
 
-        start_time = time.time()
+        # start_time = time.time()
         loss = unique_batch_cosine_ce_loss(model, model_output, y)
-        end_time = time.time()
-        print(f"Loss step time: {end_time - start_time:.4f} seconds")
+        # end_time = time.time()
+        # print(f"Loss step time: {end_time - start_time:.4f} seconds")
 
         # gate_loss = compute_gate_loss(model, gate_weights)
         # norm_loss = compute_norm_loss(model_output)
