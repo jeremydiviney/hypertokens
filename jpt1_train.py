@@ -199,7 +199,7 @@ def vectorized_infoNCE_loss(model, hidden_states, target_indices):
     return loss
 
 
-def batch_infoNCE_loss(model, hidden_states, target_indices, num_compares=10240):
+def batch_infoNCE_loss(model, hidden_states, target_indices, num_compares=12288):
     """
     InfoNCE loss computed batch by batch to reduce memory usage.
     Uses in-batch tokens for comparison, with additional random negatives if needed.
@@ -226,6 +226,8 @@ def batch_infoNCE_loss(model, hidden_states, target_indices, num_compares=10240)
     all_unique_embeds_norm = F.normalize(all_unique_embeds, p=2, dim=1)
 
     vocab_size = model.codebook.lookup_embeddings.weight.shape[0]
+
+    print(f"unique targets: {all_unique_targets.size(0)}, num compares: {num_compares}")
 
     # Add random negatives if needed
     if num_compares is not None and all_unique_targets.size(0) < num_compares:
@@ -312,12 +314,17 @@ def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float
 def inference_and_loss_step(dataset, model, x, y):
 
     # Forward pass to get output embeddings
-
+    start_time = time.time()
     model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
+    end_time = time.time()
+    print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
     if model.model_type == JPT1QuantModelType.COS_SIM:
 
+        start_time = time.time()
         loss = unique_batch_cosine_ce_loss(model, model_output, y)
+        end_time = time.time()
+        print(f"Loss step time: {end_time - start_time:.4f} seconds")
 
         # gate_loss = compute_gate_loss(model, gate_weights)
         # norm_loss = compute_norm_loss(model_output)
