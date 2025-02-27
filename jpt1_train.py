@@ -71,17 +71,17 @@ def evaluate_model(
             batch_count += 1
 
             if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = dataset.get_nearest_token_indices_cossim(jpt_output)
+                pred_token_indices = model.get_nearest_token_indices_cossim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
             pred_token_indices = pred_token_indices.detach().cpu().numpy()
 
-        pred_tokens = dataset.get_text_token_from_indices(pred_token_indices)
+        pred_tokens = model.get_text_token_from_indices(pred_token_indices)
 
-        target_tokens = dataset.get_text_token_from_indices(y.detach().cpu().numpy())
+        target_tokens = model.get_text_token_from_indices(y.detach().cpu().numpy())
 
-        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.token_list["[PAD]"])
+        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, model.token_list["[PAD]"])
 
         token_matches_total += accuracy_metrics["token_matches"]
         token_total += accuracy_metrics["token_count"]
@@ -262,25 +262,16 @@ def inference_and_loss_step(dataset, model, x, y, loss_fn):
     # end_time = time.time()
     # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
-    # if model.model_type == JPT1QuantModelType.COS_SIM:
-
-    # start_time = time.time()
-    loss = loss_fn(model, model_output, y)
-    # end_time = time.time()
-    # print(f"Loss step time: {end_time - start_time:.4f} seconds")
-
-    # gate_loss = compute_gate_loss(model, gate_weights)
-    # norm_loss = compute_norm_loss(model_output)
-    # loss += gate_loss  # + norm_loss
-    return model_output, loss
-
-    # else:
-    #     # For standard model types, compute logits normally and apply cross entropy over the vocab.
-    #     logits = model_output
-    #     # logits shape is assumed to be [batch, seq_len, vocab_size]
-    #     ce_loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-    #     loss = ce_loss
-    #     return model_output, loss
+    if model.model_type == JPT1QuantModelType.COS_SIM:
+        loss = loss_fn(model, model_output, y)
+        return model_output, loss
+    else:
+        # For standard model types, compute logits normally and apply cross entropy over the vocab.
+        logits = model_output
+        # logits shape is assumed to be [batch, seq_len, vocab_size]
+        ce_loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+        loss = ce_loss
+        return model_output, loss
 
 
 def train_model(
@@ -307,8 +298,8 @@ def train_model(
 
     batch_tokens = config["batch_size"] * config["seq_len"]
 
-    total_steps = (config["epochs"] * train_dataloader.dataset.token_count) // step_size
-    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // batch_tokens
+    total_steps = (config["epochs"] * model.token_count) // step_size
+    scheduler_steps = 1 + (config["epochs"] * model.token_count) // batch_tokens
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -382,9 +373,9 @@ def train_model(
             # end_time = time.time()
             # print(f"Train step time: {end_time - start_time:.4f} seconds")
 
-            torch.cuda.synchronize()
-
             current_loss = loss.item()
+
+            torch.cuda.synchronize()
 
             loss_history.append(current_loss)
 
@@ -560,7 +551,7 @@ def generate_text(
         # make sure the context is not empty
         current_context = " " if current_context == "" else current_context
 
-        tokens = dataset.tokenizer.encode(current_context).tokens
+        tokens = jpt_model.tokenizer.encode(current_context).tokens
         tokens = tokens[-jpt_model.seq_len :]
 
         x = torch.tensor(dataset.get_token_indices(tokens)).to(device)
@@ -577,11 +568,11 @@ def generate_text(
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if jpt_model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = dataset.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
+                pred_token_indices = jpt_model.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
             else:
                 pred_token_indices = last_token.argmax(dim=-1)
 
-        next_token = dataset.get_text_token_from_indices(pred_token_indices.cpu().numpy())
+        next_token = jpt_model.get_text_token_from_indices(pred_token_indices.cpu().numpy())
         next_token = next_token.item()
 
         next_token = "" if next_token == "[UNK]" or next_token == "[PAD]" else next_token

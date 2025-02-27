@@ -120,7 +120,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: str) -> dic
     char_total = 0
 
     vocab_size = len(dataloader.dataset.char2idx)
-    token_len = dataloader.dataset.token_len
+    token_len = model.token_len
 
     dataset = dataloader.dataset
 

@@ -33,6 +33,7 @@ class JPT1Quantized(nn.Module):
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
         self.model_type = model_type
+        self.tokenizer = tokenizer
 
         # Pre-compute position IDs for the maximum sequence length
         self.register_buffer("position_ids", torch.arange(seq_len).unsqueeze(0))
@@ -103,24 +104,6 @@ class JPT1Quantized(nn.Module):
         embedded = embedded + self.position_embedding(self.position_ids)
         x = self.transformer(embedded, mask=self.causal_mask)  # [B, S, embed_dim]
 
-        # expert_outputs = self.fc_out_experts(x).view(batch_size, seq_len, self.token_space_dim, self.num_experts)
-        # expert_outputs = F.normalize(expert_outputs, p=2, dim=2)
-
-        # # Compute gating logits and soft probabilities.
-        # gate_logits = self.gate(x)  # [B, S, num_experts]
-        # gate_soft = F.softmax(gate_logits, dim=-1)  # [B, S, num_experts]
-
-        # # Get hard decisions: one-hot vectors.
-        # gate_hard_indices = gate_soft.argmax(dim=-1, keepdim=True)  # [B, S, 1]
-        # gate_hard = torch.zeros_like(gate_soft).scatter_(dim=-1, index=gate_hard_indices, value=1.0)
-
-        # # Straight-through estimator: use hard value in forward pass,
-        # # but pass the gradients of the soft probabilities.
-        # gate_weights = gate_hard - gate_soft.detach() + gate_soft  # [B, S, num_experts]
-        # gate_weights = gate_weights.unsqueeze(2)  # [B, S, 1, num_experts]
-
-        # # Weighted sum over experts.
-        # output = (expert_outputs * gate_weights).sum(dim=-1)  # [B, S, token_space_dim]
         output = self.fc_out(x)
         return output  # , gate_weights
 
@@ -180,7 +163,7 @@ class JPT1Quantized(nn.Module):
         return decoded_tokens.reshape(shape)
 
 
-def grouped_batch_infoNCE_loss(model, hidden_states, target_indices, group_size=4):
+def grouped_batch_infoNCE_loss(model, hidden_states, target_indices, group_size=8):
     """
     InfoNCE loss computed by grouping batches into sets of batches per iteration.
     Uses in-batch tokens for comparison with unique targets calculated per group.
