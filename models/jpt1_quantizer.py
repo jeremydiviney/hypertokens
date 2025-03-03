@@ -35,10 +35,6 @@ class JPT1Quantized(nn.Module):
         self.model_type = model_type
         self.tokenizer = tokenizer
 
-        # Pre-compute position IDs for the maximum sequence length
-        self.register_buffer("position_ids", torch.arange(seq_len).unsqueeze(0))
-        self.register_buffer("causal_mask", self.generate_square_subsequent_mask(seq_len))
-
         self.token_list = tokenizer.get_vocab()
         self.vocab_size = len(self.token_list)
 
@@ -50,7 +46,6 @@ class JPT1Quantized(nn.Module):
 
         self.token_space_dim = self.lookup_embeddings.weight.shape[1]
 
-        # Use PyTorch's TransformerEncoder -- since we are only trying to predict the next sequence after the final input sequence we can just use the encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -58,6 +53,7 @@ class JPT1Quantized(nn.Module):
             dropout=dropout,
             batch_first=True,
             norm_first=True,  # Pre-norm architecture
+            activation=nn.GELU(),
         )
 
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -73,10 +69,11 @@ class JPT1Quantized(nn.Module):
             self.fc_out = nn.Linear(embed_dim, self.vocab_size)
 
         self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.extra_temperature = nn.Parameter(torch.tensor(1.0))
 
-    def generate_square_subsequent_mask(self, sz):
+    def generate_square_subsequent_mask(self, sz, device):
         """Generate a causal mask to prevent attending to future tokens."""
-        mask = torch.triu(torch.ones(sz, sz), diagonal=1)  # Upper triangular matrix
+        mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)  # Upper triangular matrix
         mask = mask.masked_fill(mask == 1, float("-inf"))  # Mask future tokens with -inf
         return mask
 
@@ -100,9 +97,14 @@ class JPT1Quantized(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.shape
         embedded = self.embeddings(x)
-        # Use the pre-computed position IDs, expanding to match the batch size
-        embedded = embedded + self.position_embedding(self.position_ids)
-        x = self.transformer(embedded, mask=self.causal_mask)  # [B, S, embed_dim]
+
+        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
+
+        embedded = embedded + self.position_embedding(position_ids)
+
+        causal_mask = self.generate_square_subsequent_mask(seq_len, x.device)
+
+        x = self.transformer(embedded, mask=causal_mask)  # [B, S, embed_dim]
 
         output = self.fc_out(x)
         return output  # , gate_weights

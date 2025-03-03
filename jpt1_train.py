@@ -34,6 +34,7 @@ from datasources.fineweb10B import load_hf_dataset, Fineweb10BDataset
 
 from models.jpt1_quantizer import JPT1QuantModelType
 from models.schedulers.empiriclaLRScheduler import EmpiricalLRScheduler
+from schedulers.oscillatingOneCycleLR import OscillatingOneCycleLR
 from helpers.utilities import calculate_token_accuracy
 
 # --------------------------------------------------
@@ -81,7 +82,7 @@ def evaluate_model(
 
         target_tokens = model.get_text_token_from_indices(y.detach().cpu().numpy())
 
-        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, model.token_list["[PAD]"])
+        accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.token_list["[PAD]"])
 
         token_matches_total += accuracy_metrics["token_matches"]
         token_total += accuracy_metrics["token_count"]
@@ -176,67 +177,120 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
 class CustomLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        # Initialize any parameters
 
-    def forward(self, model, hidden_states, target_indices, group_size=8):
-        # Your custom loss calculation
-        """
-        InfoNCE loss computed by grouping batches into sets of batches per iteration.
-        Uses in-batch tokens for comparison with unique targets calculated per group.
+    # def forward(self, model, hidden_states, target_indices):
+    #     """
+    #     InfoNCE loss computed for all batches at once without loops.
 
-        Args:
-            model: Model
-            hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
-            target_indices: Target token indices of shape [batch_size, seq_length]
-            group_size: Number of batches to process together in each iteration
+    #     Args:
+    #         model: A model with lookup_embeddings, temperature, and vocab_size
+    #         hidden_states: Tensor of shape [batch_size, seq_length, hidden_dim]
+    #         target_indices: Tensor of shape [batch_size, seq_length]
 
-        Returns:
-            Average InfoNCE loss
-        """
+    #     Returns:
+    #         Average InfoNCE loss (scalar)
+    #     """
+    #     device = hidden_states.device
+    #     batch_size, seq_length, hidden_dim = hidden_states.shape
 
-        batch_size = hidden_states.shape[0]
-        seq_length = hidden_states.shape[1]
-        total_loss = 0
-        num_groups = (batch_size + group_size - 1) // group_size  # Ceiling division
+    #     # Normalize hidden states
+    #     hidden_states_norm = F.normalize(hidden_states, p=2, dim=2, eps=1e-6)
 
-        # Normalize all hidden states at once
-        hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
+    #     # Get all embeddings from the model instead of undefined comparison_tokens
+    #     all_embeddings = model.lookup_embeddings.weight
+    #     comparison_embeds_norm = F.normalize(all_embeddings, p=2, dim=1, eps=1e-6)
 
-        # Process batches in groups
-        for group_idx in range(num_groups):
-            # Determine the start and end indices for this group
-            group_start = group_idx * group_size
-            group_end = min(group_start + group_size, batch_size)
-            current_group_size = group_end - group_start
+    #     # Reshape hidden states to [batch_size * seq_length, hidden_dim]
+    #     flat_hidden = hidden_states_norm.reshape(-1, hidden_dim)
 
-            # Get all hidden states and targets for this group
-            group_hidden_norm = hidden_states_norm[group_start:group_end]  # [current_group_size, seq_length, hidden_dim]
-            group_targets = target_indices[group_start:group_end]  # [current_group_size, seq_length]
+    #     # Compute similarities for all hidden states against all embeddings at once
+    #     # [batch_size * seq_length, hidden_dim] @ [hidden_dim, vocab_size]
+    #     similarities = torch.matmul(flat_hidden, comparison_embeds_norm.t()) / model.temperature
 
-            # Reshape to combine all sequences in the group
-            # From [current_group_size, seq_length, hidden_dim] to [current_group_size*seq_length, hidden_dim]
-            group_hidden_flat = group_hidden_norm.reshape(-1, group_hidden_norm.size(-1))
-            group_targets_flat = group_targets.reshape(-1)  # [current_group_size*seq_length]
+    #     # Flatten target indices
+    #     flat_targets = target_indices.reshape(-1)
 
-            # Find unique targets in this group
-            group_unique_targets, group_inverse = torch.unique(group_targets_flat, return_inverse=True)
+    #     # Compute cross-entropy loss
+    #     loss = F.cross_entropy(similarities, flat_targets)
 
-            # Get embeddings for unique targets and normalize
-            group_unique_embeds = model.lookup_embeddings(group_unique_targets)
-            group_unique_embeds_norm = F.normalize(group_unique_embeds, p=2, dim=1)
+    #     return lossdef forward(self, model, hidden_states, target_indices):
+    def forward(self, model, hidden_states, target_indices):
+        batch_size, seq_length, hidden_dim = hidden_states.shape
+        vocab_size = model.lookup_embeddings.weight.size(0)
 
-            # Compute similarities for all tokens in the group against the group's unique embeddings
-            similarities = torch.matmul(group_hidden_flat, group_unique_embeds_norm.t()) / model.temperature
+        # Normalize the hidden states and embeddings
+        flat_hidden = F.normalize(hidden_states, p=2, dim=2).reshape(-1, hidden_dim)
+        flat_targets = target_indices.reshape(-1)
+        all_embeddings = F.normalize(model.lookup_embeddings.weight, p=2, dim=1)
 
-            # Compute loss for the entire group
-            group_loss = F.cross_entropy(similarities, group_inverse)
+        # Get positive embeddings directly
+        positive_embeddings = all_embeddings[flat_targets]  # [batch_size*seq_length, hidden_dim]
 
-            # Weight the group loss by the number of batches in this group
-            # (to maintain proper averaging when not all groups have the same size)
-            total_loss += group_loss * current_group_size
+        # Get all unique targets from the batch
+        unique_targets = torch.unique(flat_targets)
 
-        # Return average loss
-        return total_loss / batch_size
+        # Get embeddings for all unique targets in the batch
+        unique_embeddings = all_embeddings[unique_targets]  # [num_unique, hidden_dim]
+
+        # Sample additional negative indices (ensuring they're not in the batch uniques)
+        N = 6144 - 1  # Total number of negative samples desired
+        num_batch_uniques = unique_targets.shape[0]
+        num_extra_samples = max(0, N - num_batch_uniques)
+
+        # Create mask for sampling (0 for tokens in unique_targets, 1 for others)
+        sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
+        sampling_mask[unique_targets] = False
+
+        # Get valid indices for sampling
+        valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
+
+        # Sample extra negative indices
+        if num_extra_samples > 0:
+            # Handle case where we need fewer samples than available valid indices
+            num_to_sample = min(num_extra_samples, len(valid_indices))
+            perm = torch.randperm(len(valid_indices), device=valid_indices.device)
+            extra_neg_indices = valid_indices[perm[:num_to_sample]]
+        else:
+            extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
+
+        # Get embeddings for extra negative samples
+        extra_neg_embeddings = (
+            all_embeddings[extra_neg_indices]
+            if len(extra_neg_indices) > 0
+            else torch.tensor([], device=flat_hidden.device).reshape(0, hidden_dim)
+        )
+
+        # Compute positive similarities
+        positive_similarities = torch.sum(flat_hidden * positive_embeddings, dim=1) / model.temperature
+
+        # Compute similarities with batch unique targets
+        batch_unique_similarities = torch.matmul(flat_hidden, unique_embeddings.t()) / model.temperature
+
+        # Compute similarities with extra negative samples
+        extra_similarities = (
+            torch.matmul(flat_hidden, extra_neg_embeddings.t()) / model.temperature
+            if len(extra_neg_indices) > 0
+            else torch.tensor([], device=flat_hidden.device).reshape(flat_hidden.shape[0], 0)
+        )
+
+        # Mark accidental positives in batch unique similarities
+        # Create a mask where True indicates token i matches unique target j
+        is_positive_mask = flat_targets.unsqueeze(1) == unique_targets.unsqueeze(0)
+
+        # Apply large negative value to positives (excluding the direct positive)
+        large_negative = -1e9  # Effectively negative infinity for softmax
+        batch_unique_similarities = torch.where(is_positive_mask, large_negative, batch_unique_similarities)
+
+        # Combine all similarities: [positive, batch_uniques, extra_samples]
+        logits = torch.cat([positive_similarities.unsqueeze(1), batch_unique_similarities, extra_similarities], dim=1)
+
+        # Create targets (index 0 = positive example)
+        targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+
+        # Apply cross entropy loss
+        loss = F.cross_entropy(logits, targets)
+
+        return loss
 
 
 def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float = 2) -> torch.Tensor:
@@ -298,8 +352,8 @@ def train_model(
 
     batch_tokens = config["batch_size"] * config["seq_len"]
 
-    total_steps = (config["epochs"] * model.token_count) // step_size
-    scheduler_steps = 1 + (config["epochs"] * model.token_count) // batch_tokens
+    total_steps = (config["epochs"] * train_dataloader.dataset.token_count) // step_size
+    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // batch_tokens
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -311,6 +365,17 @@ def train_model(
         div_factor=25,  # Initial lr = max_lr/25
         final_div_factor=3,  # Min lr = initial_lr/10 = max_lr/(25*10)
     )
+
+    # scheduler = OscillatingOneCycleLR(
+    #     optimizer,
+    #     min_lr=config["lr"] * 0.01,
+    #     max_lr=config["lr"],
+    #     total_steps=scheduler_steps,
+    #     pct_start=0.0001,
+    #     oscillation_amplitude=1,
+    #     oscillation_period=scheduler_steps / 150,
+    #     anneal_strategy="cos",
+    # )
 
     # scheduler = EmpiricalLRScheduler(
     #     optimizer,
@@ -332,15 +397,6 @@ def train_model(
     batches_per_epoch = 100000 // config["batch_size"]
 
     wandb.watch(model, log_freq=batches_per_epoch, log="all")
-
-    # eval_results = evaluate_model(
-    #     model,
-    #     encoder_model,
-    #     decoder_model,
-    #     val_dataloader,
-    #     device,
-    #     from_hypertoken=hypertoken_output,
-    # )
 
     for epoch in range(config["epochs"]):
         batch_count = 0
@@ -368,7 +424,6 @@ def train_model(
 
             loss.backward()
             optimizer.step()
-            scheduler.step()
 
             # end_time = time.time()
             # print(f"Train step time: {end_time - start_time:.4f} seconds")
@@ -425,6 +480,7 @@ def train_model(
                 if step_count % 310 == 0:
                     os._exit(0)
 
+            scheduler.step()
             train_step_start = time.time()
 
             # print(
@@ -526,7 +582,7 @@ def get_text_token_from_prediction_text(prediction_text: str) -> str:
 
 
 def generate_text(
-    jpt_model: nn.Module,
+    model: nn.Module,
     prompt: str,
     max_new_tokens: int,
     dataset: Fineweb10BDataset,
@@ -534,7 +590,7 @@ def generate_text(
     device: str = "cuda",
 ) -> str:
     # Set models to eval mode
-    jpt_model.eval()
+    model.eval()
 
     print("Generating...\n")
 
@@ -551,13 +607,13 @@ def generate_text(
         # make sure the context is not empty
         current_context = " " if current_context == "" else current_context
 
-        tokens = jpt_model.tokenizer.encode(current_context).tokens
-        tokens = tokens[-jpt_model.seq_len :]
+        tokens = dataset.tokenizer.encode(current_context).tokens
+        tokens = tokens[-model.seq_len :]
 
-        x = torch.tensor(dataset.get_token_indices(tokens)).to(device)
+        x = torch.tensor(model.get_token_indices(tokens)).to(device)
         x = x.unsqueeze(0)
 
-        jpt_output = inference_step(jpt_model, x)
+        jpt_output = inference_step(model, x)
 
         cur_batch_size = jpt_output.shape[0]
         cur_seq_len = jpt_output.shape[1]
@@ -567,12 +623,12 @@ def generate_text(
         last_token = jpt_output[0:1, -1:, :]
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            if jpt_model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = jpt_model.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
+            if model.model_type == JPT1QuantModelType.COS_SIM:
+                pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
             else:
                 pred_token_indices = last_token.argmax(dim=-1)
 
-        next_token = jpt_model.get_text_token_from_indices(pred_token_indices.cpu().numpy())
+        next_token = model.get_text_token_from_indices(pred_token_indices.cpu().numpy())
         next_token = next_token.item()
 
         next_token = "" if next_token == "[UNK]" or next_token == "[PAD]" else next_token
@@ -581,7 +637,7 @@ def generate_text(
 
         result.append(next_token)
 
-        if len(result) > jpt_model.seq_len:
+        if len(result) > model.seq_len:
             result.pop(0)
 
     final_text = "".join(result)
@@ -597,7 +653,7 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 16,
+            "batch_size": 24,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
@@ -671,6 +727,14 @@ if __name__ == "__main__":
             model_type=output_type,
         ).to(DEVICE)
 
+        # only if not debugging
+        if sys.gettrace() is None:  # No debugger attached
+            print("Compiling models...")
+            gpt_model = torch.compile(gpt_model)
+            loss_fn = torch.compile(loss_fn)
+
+            print("Models compiled!")
+
         dataloader = DataLoader(
             dataset_train,
             batch_size=batch_size,
@@ -695,14 +759,6 @@ if __name__ == "__main__":
             pin_memory=True,
             prefetch_factor=8,
         )
-
-        # only if not debugging
-        if sys.gettrace() is None:  # No debugger attached
-            print("Compiling models...")
-            gpt_model = torch.compile(gpt_model)
-            loss_fn = torch.compile(loss_fn)
-
-            print("Models compiled!")
 
         verify_model_params(experiment)
 

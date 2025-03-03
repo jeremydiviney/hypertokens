@@ -179,6 +179,7 @@ class Fineweb10BDataset(Dataset):
         # Calculate cumulative sums for selected tokens
         self.selection_table = np.cumsum(token_counts[mask])
 
+        self.token_list = tokenizer.get_vocab()
         self.token_count = math.floor(self.selection_table[-1])
 
     def get_data_chunk(self, idx: int):
