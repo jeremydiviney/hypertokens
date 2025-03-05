@@ -347,19 +347,25 @@ def train_model(
         fused=True,
     )
 
+    seq_len = config["seq_len"]
+    batch_size = config["batch_size"]
+
+    batch_tokens = batch_size * seq_len
+
     step_count = 0
+    grad_accum_size = batch_tokens * 2
     step_size = 1_000_000
 
-    batch_tokens = config["batch_size"] * config["seq_len"]
+    grad_accum_steps = math.ceil(grad_accum_size / batch_tokens)
 
     total_steps = (config["epochs"] * train_dataloader.dataset.token_count) // step_size
-    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // batch_tokens
+    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["lr"],
         total_steps=scheduler_steps,
-        pct_start=0.01,
+        pct_start=0.0025,
         anneal_strategy="cos",
         cycle_momentum=False,
         div_factor=25,  # Initial lr = max_lr/25
@@ -393,6 +399,7 @@ def train_model(
     loss_history = []
 
     tokens_since_step = 0
+    tokens_since_grad_accum = 0
 
     batches_per_epoch = 100000 // config["batch_size"]
 
@@ -400,6 +407,8 @@ def train_model(
 
     for epoch in range(config["epochs"]):
         batch_count = 0
+
+        loss_accum = 0
 
         train_step_start = time.time()
 
@@ -410,78 +419,81 @@ def train_model(
 
             tokens_processed = x.shape[0] * x.shape[1]
             tokens_since_step += tokens_processed
+            tokens_since_grad_accum += tokens_processed
 
             batch_count += 1
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
 
-            optimizer.zero_grad(set_to_none=True)
-
-            # max_grad_norm = 1
-            # Add gradient clipping
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
             loss.backward()
-            optimizer.step()
 
-            # end_time = time.time()
-            # print(f"Train step time: {end_time - start_time:.4f} seconds")
+            if tokens_since_grad_accum >= grad_accum_size:
 
-            current_loss = loss.item()
+                max_grad_norm = 1
+                # Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-            torch.cuda.synchronize()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            loss_history.append(current_loss)
+                torch.cuda.synchronize()
 
-            if len(loss_history) > 50:
-                loss_history.pop(0)
+                # loss and timing stuff
+                current_loss = loss_accum
+                loss_accum = 0
+                loss_history.append(current_loss)
+                if len(loss_history) > 50:
+                    loss_history.pop(0)
+                current_mean_loss = sum(loss_history) / len(loss_history)
+                tokens_per_second = tokens_since_grad_accum / (time.time() - train_step_start)
 
-            current_mean_loss = sum(loss_history) / len(loss_history)
+                tokens_since_grad_accum = 0
 
-            tokens_per_second = tokens_processed / (time.time() - train_step_start)
+                if current_mean_loss < low_loss:
+                    low_loss = current_mean_loss
+                    print(
+                        f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f}, Tokens per second: {tokens_per_second:.2f}"
+                    )
 
-            if current_mean_loss < low_loss:
-                low_loss = current_mean_loss
-                print(
-                    f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f}, Tokens per second: {tokens_per_second:.2f}"
-                )
+                if tokens_since_step >= step_size:
+                    tokens_since_step = 0
+                    step_count += 1
 
-            if tokens_since_step >= step_size:
-                tokens_since_step = 0
-                step_count += 1
-
-                wandb.log(
-                    {
-                        "loss": current_mean_loss,
-                        "learning_rate": optimizer.param_groups[0]["lr"],
-                        "epoch": epoch,
-                        "tokens_per_second": tokens_per_second,
-                    }
-                )
-
-                if step_count % 25 == 0:
-                    eval_results = evaluate_model(model, val_dataloader, device, loss_fn)
-                    val_loss = eval_results["val_loss"]
-                    val_token_accuracy = eval_results["val_token_accuracy"]
                     wandb.log(
                         {
-                            "val_loss": val_loss,
-                            "val_token_accuracy": eval_results["val_token_accuracy"],
+                            "loss": current_mean_loss,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
                             "epoch": epoch,
+                            "tokens_per_second": tokens_per_second,
                         }
                     )
-                    print(
-                        f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
-                        f"val_token_accuracy: {val_token_accuracy:.2%}"
-                        f"tokens_per_second: {tokens_per_second:.2f}"
-                    )
 
-                if step_count % 310 == 0:
-                    os._exit(0)
+                    if step_count % 25 == 0:
+                        eval_results = evaluate_model(model, val_dataloader, device, loss_fn)
+                        val_loss = eval_results["val_loss"]
+                        val_token_accuracy = eval_results["val_token_accuracy"]
+                        wandb.log(
+                            {
+                                "val_loss": val_loss,
+                                "val_token_accuracy": eval_results["val_token_accuracy"],
+                                "epoch": epoch,
+                            }
+                        )
+                        print(
+                            f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
+                            f"val_token_accuracy: {val_token_accuracy:.2%}"
+                            f"tokens_per_second: {tokens_per_second:.2f}"
+                        )
 
-            scheduler.step()
-            train_step_start = time.time()
+                    if step_count % 510 == 0:
+                        os._exit(0)
+
+                scheduler.step()
+                torch.cuda.synchronize()
+                train_step_start = time.time()
 
             # print(
             #     f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
@@ -653,7 +665,7 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 24,
+            "batch_size": 16,
             "lr": lr,
             "head_size": head_size,
             "n_layers": n_layers,
