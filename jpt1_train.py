@@ -175,8 +175,9 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
 
 
 class CustomLoss(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, ignore_index: int):
         super().__init__()
+        self.ignore_index = ignore_index
 
     # def forward(self, model, hidden_states, target_indices):
     #     """
@@ -214,81 +215,149 @@ class CustomLoss(torch.nn.Module):
     #     loss = F.cross_entropy(similarities, flat_targets)
 
     #     return lossdef forward(self, model, hidden_states, target_indices):
+
+    # def forward(self, model, hidden_states, target_indices):
+    #     batch_size, seq_length, hidden_dim = hidden_states.shape
+    #     vocab_size = model.lookup_embeddings.weight.size(0)
+
+    #     # Create mask for valid indices (where target_indices != self.ignore_index)
+    #     valid_mask = target_indices != self.ignore_index
+
+    #     # Filter hidden_states and target_indices
+    #     # For hidden_states, we need to maintain 3D structure but only keep valid positions
+    #     flat_valid_mask = valid_mask.reshape(-1)
+    #     flat_hidden = hidden_states.reshape(-1, hidden_dim)[flat_valid_mask]
+    #     flat_targets = target_indices.reshape(-1)[flat_valid_mask]
+
+    #     # Normalize the filtered hidden states and embeddings
+    #     flat_hidden = F.normalize(flat_hidden, p=2, dim=1)
+    #     all_embeddings = F.normalize(model.lookup_embeddings.weight, p=2, dim=1)
+
+    #     # Get positive embeddings directly
+    #     positive_embeddings = all_embeddings[flat_targets]  # [num_valid, hidden_dim]
+
+    #     # Get all unique targets from the batch
+    #     unique_targets = torch.unique(flat_targets)
+
+    #     # Get embeddings for all unique targets in the batch
+    #     unique_embeddings = all_embeddings[unique_targets]  # [num_unique, hidden_dim]
+
+    #     # Sample additional negative indices (ensuring they're not in the batch uniques)
+    #     N = (1024 * 8) - 1  # Total number of negative samples desired
+    #     num_batch_uniques = unique_targets.shape[0]
+    #     num_extra_samples = max(0, N - num_batch_uniques)
+
+    #     # Create mask for sampling (0 for tokens in unique_targets, 1 for others)
+    #     sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
+    #     sampling_mask[unique_targets] = False
+
+    #     # Get valid indices for sampling
+    #     valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
+
+    #     # Sample extra negative indices
+    #     if num_extra_samples > 0:
+    #         # Handle case where we need fewer samples than available valid indices
+    #         num_to_sample = min(num_extra_samples, len(valid_indices))
+    #         perm = torch.randperm(len(valid_indices), device=valid_indices.device)
+    #         extra_neg_indices = valid_indices[perm[:num_to_sample]]
+    #     else:
+    #         extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
+
+    #     # Get embeddings for extra negative samples
+    #     extra_neg_embeddings = (
+    #         all_embeddings[extra_neg_indices]
+    #         if len(extra_neg_indices) > 0
+    #         else torch.tensor([], device=flat_hidden.device).reshape(0, hidden_dim)
+    #     )
+
+    #     # Compute positive similarities
+    #     positive_similarities = torch.sum(flat_hidden * positive_embeddings, dim=1) / model.temperature
+
+    #     # Compute similarities with batch unique targets
+    #     batch_unique_similarities = torch.matmul(flat_hidden, unique_embeddings.t()) / model.temperature
+
+    #     # Compute similarities with extra negative samples
+    #     extra_similarities = (
+    #         torch.matmul(flat_hidden, extra_neg_embeddings.t()) / model.temperature
+    #         if len(extra_neg_indices) > 0
+    #         else torch.tensor([], device=flat_hidden.device).reshape(flat_hidden.shape[0], 0)
+    #     )
+
+    #     # Mark accidental positives in batch unique similarities
+    #     # Create a mask where True indicates token i matches unique target j
+    #     is_positive_mask = flat_targets.unsqueeze(1) == unique_targets.unsqueeze(0)
+
+    #     # Apply large negative value to positives (excluding the direct positive)
+    #     large_negative = -1e9  # Effectively negative infinity for softmax
+    #     batch_unique_similarities = torch.where(is_positive_mask, large_negative, batch_unique_similarities)
+
+    #     # Combine all similarities: [positive, batch_uniques, extra_samples]
+    #     logits = torch.cat([positive_similarities.unsqueeze(1), batch_unique_similarities, extra_similarities], dim=1)
+
+    #     # Create targets (index 0 = positive example)
+    #     targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+
+    #     # Apply cross entropy loss
+    #     loss = F.cross_entropy(logits, targets)
+
+    #     return loss
+
     def forward(self, model, hidden_states, target_indices):
         batch_size, seq_length, hidden_dim = hidden_states.shape
         vocab_size = model.lookup_embeddings.weight.size(0)
 
-        # Normalize the hidden states and embeddings
-        flat_hidden = F.normalize(hidden_states, p=2, dim=2).reshape(-1, hidden_dim)
-        flat_targets = target_indices.reshape(-1)
+        # Flatten tensors
+        flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
+        flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
+
+        ignore_mask = flat_targets == self.ignore_index
+        flat_hidden = flat_hidden[~ignore_mask]
+        flat_targets = flat_targets[~ignore_mask]
+
+        # Normalize embeddings and hidden states
+        flat_hidden = F.normalize(flat_hidden, p=2, dim=1)
         all_embeddings = F.normalize(model.lookup_embeddings.weight, p=2, dim=1)
 
-        # Get positive embeddings directly
-        positive_embeddings = all_embeddings[flat_targets]  # [batch_size*seq_length, hidden_dim]
-
-        # Get all unique targets from the batch
+        # Get unique targets from the batch
         unique_targets = torch.unique(flat_targets)
 
-        # Get embeddings for all unique targets in the batch
-        unique_embeddings = all_embeddings[unique_targets]  # [num_unique, hidden_dim]
-
-        # Sample additional negative indices (ensuring they're not in the batch uniques)
-        N = 6144 - 1  # Total number of negative samples desired
+        # Sample additional negative indices
+        N = 1024 * 8  # Target number of negative samples
         num_batch_uniques = unique_targets.shape[0]
         num_extra_samples = max(0, N - num_batch_uniques)
 
-        # Create mask for sampling (0 for tokens in unique_targets, 1 for others)
+        # Sample from non-batch tokens
         sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
         sampling_mask[unique_targets] = False
-
-        # Get valid indices for sampling
         valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
 
-        # Sample extra negative indices
-        if num_extra_samples > 0:
-            # Handle case where we need fewer samples than available valid indices
-            num_to_sample = min(num_extra_samples, len(valid_indices))
+        # Get extra negative indices
+        if num_extra_samples > 0 and len(valid_indices) > 0:
             perm = torch.randperm(len(valid_indices), device=valid_indices.device)
+            num_to_sample = min(num_extra_samples, len(valid_indices))
             extra_neg_indices = valid_indices[perm[:num_to_sample]]
         else:
             extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
 
-        # Get embeddings for extra negative samples
-        extra_neg_embeddings = (
-            all_embeddings[extra_neg_indices]
-            if len(extra_neg_indices) > 0
-            else torch.tensor([], device=flat_hidden.device).reshape(0, hidden_dim)
-        )
+        # Combine all indices for comparisons - positives first, then uniques, then extras
+        all_indices = torch.cat([unique_targets, extra_neg_indices])  # Include all unique targets (which includes all positives)
 
-        # Compute positive similarities
-        positive_similarities = torch.sum(flat_hidden * positive_embeddings, dim=1) / model.temperature
+        # Get embeddings for all indices
+        comparison_embeddings = all_embeddings[all_indices]  # [num_comparisons, hidden_dim]
 
-        # Compute similarities with batch unique targets
-        batch_unique_similarities = torch.matmul(flat_hidden, unique_embeddings.t()) / model.temperature
+        # Compute all similarities at once
+        all_similarities = torch.matmul(flat_hidden, comparison_embeddings.t()) / model.temperature  # [batch*seq, num_comparisons]
 
-        # Compute similarities with extra negative samples
-        extra_similarities = (
-            torch.matmul(flat_hidden, extra_neg_embeddings.t()) / model.temperature
-            if len(extra_neg_indices) > 0
-            else torch.tensor([], device=flat_hidden.device).reshape(flat_hidden.shape[0], 0)
-        )
+        # Create targets tensor - map each flat_target to its position in all_indices
+        # First create a mapping from token IDs to their positions in all_indices
+        indices_map = torch.zeros(vocab_size, dtype=torch.long, device=flat_hidden.device)
+        indices_map[all_indices] = torch.arange(len(all_indices), device=flat_hidden.device)
 
-        # Mark accidental positives in batch unique similarities
-        # Create a mask where True indicates token i matches unique target j
-        is_positive_mask = flat_targets.unsqueeze(1) == unique_targets.unsqueeze(0)
-
-        # Apply large negative value to positives (excluding the direct positive)
-        large_negative = -1e9  # Effectively negative infinity for softmax
-        batch_unique_similarities = torch.where(is_positive_mask, large_negative, batch_unique_similarities)
-
-        # Combine all similarities: [positive, batch_uniques, extra_samples]
-        logits = torch.cat([positive_similarities.unsqueeze(1), batch_unique_similarities, extra_similarities], dim=1)
-
-        # Create targets (index 0 = positive example)
-        targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        # Use the mapping to get the target positions
+        targets = indices_map[flat_targets]
 
         # Apply cross entropy loss
-        loss = F.cross_entropy(logits, targets)
+        loss = F.cross_entropy(all_similarities, targets)
 
         return loss
 
@@ -353,7 +422,7 @@ def train_model(
     batch_tokens = batch_size * seq_len
 
     step_count = 0
-    grad_accum_size = batch_tokens * 2
+    grad_accum_size = batch_tokens * 1
     step_size = 1_000_000
 
     grad_accum_steps = math.ceil(grad_accum_size / batch_tokens)
@@ -365,7 +434,7 @@ def train_model(
         optimizer,
         max_lr=config["lr"],
         total_steps=scheduler_steps,
-        pct_start=0.0025,
+        pct_start=0.01,
         anneal_strategy="cos",
         cycle_momentum=False,
         div_factor=25,  # Initial lr = max_lr/25
@@ -425,6 +494,8 @@ def train_model(
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
+                # logits = model(x, y)
+                # loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
@@ -665,9 +736,9 @@ if __name__ == "__main__":
             "seq_len": sl,
             "token_space_dim": token_space_dim,
             "epochs": epochs,
-            "batch_size": 16,
+            "batch_size": 24,
             "lr": lr,
-            "head_size": head_size,
+            "num_head": num_head,
             "n_layers": n_layers,
             "jpt_embed_dim": jed,
             "dropout": dropout,
@@ -676,7 +747,7 @@ if __name__ == "__main__":
         }
         for n_layers in [12]  # Varying n_layers
         for jed in [768]
-        for head_size in [64]  # Varying head_size
+        for num_head in [12]  # Varying num_head
         for lr in [0.0004]
         for sl in [1024]
         for epochs in [1]
@@ -697,7 +768,7 @@ if __name__ == "__main__":
         seq_len = experiment["seq_len"]
         batch_size = experiment["batch_size"]
         n_layers = experiment["n_layers"]
-        head_size = experiment["head_size"]
+        num_head = experiment["num_head"]
         jpt_embed_dim = experiment["jpt_embed_dim"]
         dropout = experiment["dropout"]
         vocab_size = experiment["vocab_size"]
@@ -709,14 +780,14 @@ if __name__ == "__main__":
 
         hf_dataset = load_hf_dataset()
 
-        loss_fn = None
-        if output_type == JPT1QuantModelType.COS_SIM:
-            loss_fn = CustomLoss()
-        else:
-            loss_fn = nn.CrossEntropyLoss()
-
         text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
         tokenizer = get_or_train_tokenizer(text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
+
+        loss_fn = None
+        if output_type == JPT1QuantModelType.COS_SIM:
+            loss_fn = CustomLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
+        else:
+            loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
 
         dataset_train = Fineweb10BDataset(
             seq_len=seq_len,
@@ -732,7 +803,7 @@ if __name__ == "__main__":
             token_space_dim=token_space_dim,
             seq_len=seq_len,
             embed_dim=jpt_embed_dim,
-            num_heads=head_size,
+            num_head=num_head,
             num_layers=n_layers,
             dropout=dropout,
             tokenizer=tokenizer,
@@ -787,7 +858,7 @@ if __name__ == "__main__":
             return model
 
         project_name = "jpt1"
-        exp_name = f"{project_name}-sl:{experiment['seq_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['head_size']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"
+        exp_name = f"{project_name}-sl:{experiment['seq_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['num_head']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"
 
         run_experiment(project_name, train_model_lambda, exp_name, experiment)
 
