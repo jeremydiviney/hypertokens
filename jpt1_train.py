@@ -559,8 +559,8 @@ def train_model(
                             f"tokens_per_second: {tokens_per_second:.2f}"
                         )
 
-                    if step_count % 510 == 0:
-                        os._exit(0)
+                    # if step_count % 510 == 0:
+                    #     os._exit(0)
 
                 scheduler.step()
                 torch.cuda.synchronize()
