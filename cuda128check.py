@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-def test_cuda_compatibility():
+def test_cuda_compatibility_and_compilation():
     # Check if CUDA is available
     if not torch.cuda.is_available():
         print("CUDA is not available on this system.")
@@ -53,7 +53,31 @@ def test_cuda_compatibility():
         output.sum().backward()
         print("Backward pass completed successfully.")
 
-        print("\nCUDA compatibility test PASSED!")
+        # Test model compilation with torch.compile()
+        print("\nTesting model compilation with torch.compile()...")
+        try:
+            # Compile the model using PyTorch 2.0+ compile
+            compiled_model = torch.compile(model)
+            print("Model compiled successfully.")
+
+            # Test the compiled model with a forward pass
+            compiled_output = compiled_model(x)
+            print("Forward pass through compiled model successful.")
+
+            # Verify output matches the original model
+            match = torch.allclose(output, compiled_output)
+            if match:
+                print("Compiled model output matches the original model.")
+            else:
+                print("Warning: Compiled model output doesn't match original model.")
+
+            print("Model compilation test PASSED!")
+
+        except Exception as e:
+            print(f"Model compilation FAILED with error: {e}")
+            return False
+
+        print("\nCUDA compatibility and compilation tests PASSED!")
         return True
 
     except Exception as e:
@@ -62,5 +86,5 @@ def test_cuda_compatibility():
 
 
 if __name__ == "__main__":
-    print("Testing CUDA 12.8 compatibility...")
-    test_cuda_compatibility()
+    print("Testing CUDA 12.8 compatibility and model compilation...")
+    test_cuda_compatibility_and_compilation()
