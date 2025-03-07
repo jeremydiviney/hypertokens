@@ -7,12 +7,14 @@ dependencies:
   - python=3.12.8  # Specify your desired Python version
   - pandas=2.2.3
   - scikit-learn=1.6.1
-  - pytorch=2.5.1
-  - torchvision=0.20.1
   - tokenizers
   - transformers
   - pip  # Ensure pip is available for installing pip-only packages
   - pip:
+    - --pre  # Allow pre-release packages
+    - torch==torch-nightly  # Latest nightly build as of your date
+    - torchvision==torchvision-nightly  # Latest nightly build as of your date
+    - torchaudio==torchaudio-nightly  # Latest nightly build as of your date
     - adabelief-pytorch==0.2.1
     - aiohappyeyeballs==2.4.4
     - aiohttp==3.11.11
@@ -90,7 +92,6 @@ dependencies:
     - threadpoolctl==3.5.0
     - tomlkit==0.13.2
     - torchtyping==0.1.5
-    - torchaudio==2.5.1
     - tqdm==4.67.1
     - triton==3.1.0
     - typeguard==2.13.3
