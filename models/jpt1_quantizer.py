@@ -151,7 +151,7 @@ class JPT1Quantized(nn.Module):
         else:
             self.fc_out = nn.Linear(embed_dim, self.vocab_size)
             # Tie weights - share the embedding matrix with the output projection
-            # self.embeddings.weight = self.fc_out.weight
+            self.embeddings.weight = self.fc_out.weight
 
         self.temperature = nn.Parameter(torch.tensor(1.0))
         self.extra_temperature = nn.Parameter(torch.tensor(1.0))
