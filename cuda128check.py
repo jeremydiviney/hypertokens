@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from helpers.training import enable_torch_optimizations, setup_flash_attention
+
 
 def test_cuda_compatibility_and_compilation():
     # Check if CUDA is available
@@ -86,5 +88,9 @@ def test_cuda_compatibility_and_compilation():
 
 
 if __name__ == "__main__":
+
+    enable_torch_optimizations()
+    setup_flash_attention()
+
     print("Testing CUDA 12.8 compatibility and model compilation...")
     test_cuda_compatibility_and_compilation()
