@@ -310,6 +310,7 @@ class CustomLoss(torch.nn.Module):
         flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
         flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
 
+        # Ignore padding tokens
         ignore_mask = flat_targets == self.ignore_index
         flat_hidden = flat_hidden[~ignore_mask]
         flat_targets = flat_targets[~ignore_mask]
@@ -421,14 +422,13 @@ def train_model(
 
     batch_tokens = batch_size * seq_len
 
-    step_count = 0
-    grad_accum_size = batch_tokens * 1
-    step_size = 1_000_000
+    log_step_count = 0
+    grad_accum_size = config["grad_accum_size"]
+    log_step_size = config["log_step_size"]
 
     grad_accum_steps = math.ceil(grad_accum_size / batch_tokens)
 
-    total_steps = (config["epochs"] * train_dataloader.dataset.token_count) // step_size
-    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
+    scheduler_steps = (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -440,17 +440,6 @@ def train_model(
         div_factor=25,  # Initial lr = max_lr/25
         final_div_factor=3,  # Min lr = initial_lr/10 = max_lr/(25*10)
     )
-
-    # scheduler = OscillatingOneCycleLR(
-    #     optimizer,
-    #     min_lr=config["lr"] * 0.01,
-    #     max_lr=config["lr"],
-    #     total_steps=scheduler_steps,
-    #     pct_start=0.0001,
-    #     oscillation_amplitude=1,
-    #     oscillation_period=scheduler_steps / 150,
-    #     anneal_strategy="cos",
-    # )
 
     # scheduler = EmpiricalLRScheduler(
     #     optimizer,
@@ -529,9 +518,9 @@ def train_model(
                         f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f}, Tokens per second: {tokens_per_second:.2f}"
                     )
 
-                if tokens_since_step >= step_size:
+                if tokens_since_step >= log_step_size:
                     tokens_since_step = 0
-                    step_count += 1
+                    log_step_count += 1
 
                     wandb.log(
                         {
@@ -542,7 +531,7 @@ def train_model(
                         }
                     )
 
-                    if step_count % 25 == 0:
+                    if log_step_count % 25 == 0:
                         eval_results = evaluate_model(model, val_dataloader, device, loss_fn)
                         val_loss = eval_results["val_loss"]
                         val_token_accuracy = eval_results["val_token_accuracy"]
@@ -559,8 +548,8 @@ def train_model(
                             f"tokens_per_second: {tokens_per_second:.2f}"
                         )
 
-                    if step_count % 1000 == 0:
-                        os._exit(0)
+                    # if log_step_count % 1000 == 0:
+                    #     os._exit(0)
 
                 scheduler.step()
                 torch.cuda.synchronize()
@@ -744,6 +733,9 @@ if __name__ == "__main__":
             "dropout": dropout,
             "vocab_size": vocab_size,
             "output_type": output_type,
+            "grad_accum_size": grad_accum_size,
+            "log_step_size": 1_000_000,
+            "dset_ratio": 0.01,
         }
         for n_layers in [12]  # Varying n_layers
         for jed in [768]
@@ -754,6 +746,7 @@ if __name__ == "__main__":
         for dropout in [0.0]
         for token_space_dim in [jed]
         for vocab_size in [50304]
+        for grad_accum_size in [24 * sl * 1, 24 * sl * 2, 24 * sl * 4]
         for output_type in [JPT1QuantModelType.COS_SIM]
     ]
 
@@ -774,6 +767,9 @@ if __name__ == "__main__":
         vocab_size = experiment["vocab_size"]
         output_type = experiment["output_type"]
         token_space_dim = experiment["token_space_dim"]
+        grad_accum_size = experiment["grad_accum_size"]
+        log_step_size = experiment["log_step_size"]
+        dset_ratio = experiment["dset_ratio"]
         # load this just to get the vocab size
 
         dataset_name = "fineweb-10BT"
@@ -795,6 +791,7 @@ if __name__ == "__main__":
             data_stride=seq_len,
             tokenizer=tokenizer,
             hf_dataset=hf_dataset,
+            dset_ratio=dset_ratio,
         )
 
         vocab_size = len(tokenizer.get_vocab())

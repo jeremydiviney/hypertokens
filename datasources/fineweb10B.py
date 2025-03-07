@@ -144,6 +144,7 @@ class Fineweb10BDataset(Dataset):
         data_stride: int,
         hf_dataset: Dataset,
         tokenizer: Tokenizer | None,
+        dset_ratio: float = 1.0,  # control the ratio of the dataset to use
         type: str = "train",
     ):
         # Load TinyShakespeare from Hugging Face
@@ -152,6 +153,7 @@ class Fineweb10BDataset(Dataset):
         self.data_stride = data_stride
         self.tokenizer = tokenizer
         self.train_ratio = 4000
+        self.dset_ratio = dset_ratio
         self.type = type
 
         self.pad_token_id = self.tokenizer.token_to_id("[PAD]")
@@ -167,20 +169,33 @@ class Fineweb10BDataset(Dataset):
         token_counts = np.diff(master_array, prepend=0)
         # Create an array of indices
         indices = np.arange(len(master_array))
-        mask = True
+
+        # Apply train/validation split
         if self.type == "train":
-            # Select indices where i % train_ratio != 0
-            mask = (indices % self.train_ratio) != 0
+            split_mask = (indices % self.train_ratio) != 0
         elif self.type == "validation":
-            # Select indices where i % train_ratio == 0
-            mask = (indices % self.train_ratio) == 0
+            split_mask = (indices % self.train_ratio) == 0
+        else:
+            raise ValueError(f"Invalid dataset type: {self.type}")
+
+        # Apply dataset ratio - randomly select subset of data based on dset_ratio
+        if self.dset_ratio < 1.0 and self.type == "train":
+            # Use a fixed seed for deterministic selection
+            rng = np.random.default_rng(42)  # Fixed seed for reproducibility
+            # Create random mask with probability = dset_ratio
+            ratio_mask = rng.random(len(indices)) < self.dset_ratio
+            # Combine both masks
+            mask = np.logical_and(split_mask, ratio_mask)
+        else:
+            mask = split_mask
+
         # Apply mask to get selected indices
         self.selection_table_indices = indices[mask]
         # Calculate cumulative sums for selected tokens
         self.selection_table = np.cumsum(token_counts[mask])
 
         self.token_list = tokenizer.get_vocab()
-        self.token_count = math.floor(self.selection_table[-1])
+        self.token_count = self.selection_table[-1].item()
 
     def get_data_chunk(self, idx: int):
 
