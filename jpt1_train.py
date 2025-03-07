@@ -735,19 +735,19 @@ if __name__ == "__main__":
             "output_type": output_type,
             "grad_accum_size": grad_accum_size,
             "log_step_size": 1_000_000,
-            "dset_ratio": 0.01,
+            "dset_ratio": 0.15,
         }
         for n_layers in [12]  # Varying n_layers
         for jed in [768]
         for num_head in [12]  # Varying num_head
-        for lr in [0.0004]
+        for lr in [0.00015, 0.0005]
         for sl in [1024]
         for epochs in [1]
         for dropout in [0.0]
         for token_space_dim in [jed]
         for vocab_size in [50304]
-        for grad_accum_size in [24 * sl * 1, 24 * sl * 2, 24 * sl * 4]
-        for output_type in [JPT1QuantModelType.COS_SIM]
+        for grad_accum_size in [24 * sl * 1, 24 * sl * 4, 24 * sl * 12]
+        for output_type in [JPT1QuantModelType.STANDARD, JPT1QuantModelType.COS_SIM]
     ]
 
     enable_torch_optimizations()
