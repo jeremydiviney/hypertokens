@@ -113,3 +113,64 @@ def run_experiment(projectName, train_model, exp_name, config: dict) -> None:
     )
 
     wandb.finish()
+
+
+def create_experiments(mode="cartesian", **param_lists):
+    """
+    Create a list of experiment configurations.
+
+    Args:
+        mode: How to combine parameter values:
+              - "cartesian": Generate all possible combinations (Cartesian product)
+              - "paired": Use corresponding elements from each parameter list
+        **param_lists: Dictionary of parameter names to lists of values
+
+    Returns:
+        List of experiment configurations
+    """
+    if mode == "paired":
+        # Check that all multi-value parameters have the same length
+        multi_value_params = [(name, values) for name, values in param_lists.items() if len(values) > 1]
+        if multi_value_params:
+            expected_length = len(multi_value_params[0][1])
+            mismatched_params = [name for name, values in multi_value_params if len(values) != expected_length]
+
+            if mismatched_params:
+                raise ValueError(
+                    f"All multi-value parameters must have the same length when mode='paired'. "
+                    f"Mismatched parameters: {mismatched_params}"
+                )
+
+        # Find the length to use for pairing (max length of any parameter list)
+        pair_length = max([len(values) for values in param_lists.values()], default=1)
+
+        # Create experiments with paired parameters
+        experiments = []
+        for i in range(pair_length):
+            experiment = {}
+            for param_name, param_values in param_lists.items():
+                # If parameter has only one value, use it for all experiments
+                # Otherwise, use the value at the current index
+                experiment[param_name] = param_values[i % len(param_values)]
+            experiments.append(experiment)
+        return experiments
+
+    elif mode == "cartesian":
+        # Generate all combinations (Cartesian product)
+        # Start with a single empty experiment
+        experiments = [{}]
+
+        # For each parameter, create new experiments with all possible values
+        for param_name, param_values in param_lists.items():
+            new_experiments = []
+            for experiment in experiments:
+                for value in param_values:
+                    new_experiment = experiment.copy()
+                    new_experiment[param_name] = value
+                    new_experiments.append(new_experiment)
+            experiments = new_experiments
+
+        return experiments
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Expected 'cartesian' or 'paired'.")

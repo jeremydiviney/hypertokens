@@ -22,7 +22,7 @@ from sklearn.neighbors import KDTree
 from models.jpt1_quantizer import JPT1Quantized
 
 from datasources.fineweb10B import get_or_train_tokenizer, Fineweb10BDataset
-from helpers.experiments import run_experiment, count_parameters
+from helpers.experiments import run_experiment, count_parameters, create_experiments
 from helpers.training import (
     save_model,
     enable_torch_optimizations,
@@ -36,6 +36,7 @@ from models.jpt1_quantizer import JPT1QuantModelType
 from models.schedulers.empiriclaLRScheduler import EmpiricalLRScheduler
 from schedulers.oscillatingOneCycleLR import OscillatingOneCycleLR
 from helpers.utilities import calculate_token_accuracy
+
 
 # --------------------------------------------------
 # 2. Model Definition
@@ -720,35 +721,31 @@ def generate_text(
 if __name__ == "__main__":
 
     # Define experiments
-    experiments: list[dict] = [
-        {
-            "seq_len": sl,
-            "token_space_dim": token_space_dim,
-            "epochs": epochs,
-            "batch_size": 24,
-            "lr": lr,
-            "num_head": num_head,
-            "n_layers": n_layers,
-            "jpt_embed_dim": jed,
-            "dropout": dropout,
-            "vocab_size": vocab_size,
-            "output_type": output_type,
-            "grad_accum_size": grad_accum_size,
-            "log_step_size": 1_000_000,
-            "dset_ratio": 0.15,
-        }
-        for n_layers in [12]  # Varying n_layers
-        for jed in [768]
-        for num_head in [12]  # Varying num_head
-        for lr in [0.00015, 0.0005]
-        for sl in [1024]
-        for epochs in [1]
-        for dropout in [0.0]
-        for token_space_dim in [jed]
-        for vocab_size in [50304]
-        for grad_accum_size in [24 * sl * 1, 24 * sl * 4, 24 * sl * 12]
-        for output_type in [JPT1QuantModelType.STANDARD, JPT1QuantModelType.COS_SIM]
-    ]
+    experiments: list[dict] = {
+        "seq_len": [12],
+        "token_space_dim": [768],
+        "epochs": [1],
+        "batch_size": [24],
+        "lr": [0.00015, 0.00025, 0.0005, 0.00025, 0.0005, 0.00075],
+        "num_head": [12],
+        "n_layers": [12],
+        "jpt_embed_dim": [768],
+        "dropout": [0.0],
+        "vocab_size": [50304],
+        "output_type": [
+            JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.COS_SIM,
+            JPT1QuantModelType.COS_SIM,
+            JPT1QuantModelType.COS_SIM,
+        ],
+        "grad_accum_size": [24 * 1024 * 1, 24 * 1024 * 4, 24 * 1024 * 12],
+        "log_step_size": [1_000_000],
+        "dset_ratio": [0.15],
+    }
+
+    experiments = create_experiments(mode="paired", **experiments)
 
     enable_torch_optimizations()
     setup_flash_attention()
