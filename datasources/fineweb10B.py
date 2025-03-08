@@ -9,8 +9,7 @@ from bisect import bisect_left
 from multiprocessing import Pool
 
 from typing import List, Tuple, Iterable
-from torchtyping import TensorType, patch_typeguard
-from typeguard import typechecked
+
 
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
 
