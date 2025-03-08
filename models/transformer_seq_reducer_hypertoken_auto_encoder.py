@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typeguard import typechecked
-from torchtyping import TensorType
 
 
 class TransformerSequenceReduceHyperTokenEncoder(nn.Module):
@@ -161,9 +159,7 @@ class TransformerSequenceExpandHyperTokenDecoder(nn.Module):
         self.to(torch.bfloat16)
 
     @typechecked
-    def forward(
-        self, x: TensorType["batch_size", "hypertoken_size"]
-    ) -> TensorType["batch_size", "token_len", "vocab_size"]:
+    def forward(self, x: TensorType["batch_size", "hypertoken_size"]) -> TensorType["batch_size", "token_len", "vocab_size"]:
         batch_size = x.size(0)
 
         expanded = self.initial_expand(x)  # Project from hypertoken

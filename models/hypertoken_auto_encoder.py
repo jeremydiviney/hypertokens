@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typeguard import typechecked
-from torchtyping import TensorType
 
 
 class HyperTokenEncoder(nn.Module):
@@ -41,9 +39,7 @@ class HyperTokenEncoder(nn.Module):
         # self.linear_compression_layer = nn.Linear(embed_dim, 2 * (hypertoken_size // token_len))
 
         # self.fc_out = nn.Linear(2 * (hypertoken_size // token_len) * token_len, hypertoken_size)
-        self.fc_out = nn.Sequential(
-            nn.Linear(embed_dim, hypertoken_size), nn.LayerNorm(hypertoken_size), nn.LayerNorm(hypertoken_size)
-        )
+        self.fc_out = nn.Sequential(nn.Linear(embed_dim, hypertoken_size), nn.LayerNorm(hypertoken_size), nn.LayerNorm(hypertoken_size))
 
         self.to(torch.bfloat16)
 
@@ -125,9 +121,7 @@ class HyperTokenDecoder(nn.Module):
         self.to(torch.bfloat16)
 
     @typechecked
-    def forward(
-        self, x: TensorType["batch_size", "hypertoken_size"]
-    ) -> TensorType["batch_size", "token_len", "vocab_size"]:
+    def forward(self, x: TensorType["batch_size", "hypertoken_size"]) -> TensorType["batch_size", "token_len", "vocab_size"]:
         device = x.device
         batch_size = x.size(0)
 

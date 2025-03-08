@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typeguard import typechecked
-from torchtyping import TensorType
 
 
 class ResidualConvBlock(nn.Module):
@@ -56,9 +54,7 @@ class ConvHyperTokenEncoder(nn.Module):
         self.register_buffer("positions", torch.arange(token_len, dtype=torch.long).unsqueeze(0))
 
         # Initial projection to increase channel dimension
-        self.input_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2), nn.LayerNorm(embed_dim * 2), nn.GELU(), nn.Dropout(0.1)
-        )
+        self.input_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.LayerNorm(embed_dim * 2), nn.GELU(), nn.Dropout(0.1))
 
         # Residual blocks at each resolution
         self.res_blocks1 = nn.Sequential(ResidualConvBlock(embed_dim * 2), ResidualConvBlock(embed_dim * 2))
@@ -171,9 +167,7 @@ class ConvHyperTokenDecoder(nn.Module):
         self.to(torch.bfloat16)
 
     @typechecked
-    def forward(
-        self, x: TensorType["batch_size", "hypertoken_size"]
-    ) -> TensorType["batch_size", "token_len", "vocab_size"]:
+    def forward(self, x: TensorType["batch_size", "hypertoken_size"]) -> TensorType["batch_size", "token_len", "vocab_size"]:
         batch_size = x.size(0)
 
         # Initial projection and reshape

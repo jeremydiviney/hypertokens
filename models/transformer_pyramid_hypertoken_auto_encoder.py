@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typeguard import typechecked
-from torchtyping import TensorType
 
 
 class TransformerPyramidHyperTokenEncoder(nn.Module):
@@ -57,9 +55,7 @@ class TransformerPyramidHyperTokenEncoder(nn.Module):
 
             self.compression_layers.append(nn.TransformerEncoder(t_layer, num_layers=n_layers))
 
-        self.compression_residuals = nn.ModuleList(
-            [nn.Linear(dim_in, dim_out) for dim_in, dim_out in self.compression_sizes]
-        )
+        self.compression_residuals = nn.ModuleList([nn.Linear(dim_in, dim_out) for dim_in, dim_out in self.compression_sizes])
 
         self.compression_res_scales = nn.ParameterList([nn.Parameter(torch.zeros(1)) for _ in self.compression_sizes])
 
@@ -140,9 +136,7 @@ class TransformerPyramidHyperTokenDecoder(nn.Module):
             self.expansion_layers.append(nn.TransformerEncoder(t_layer, num_layers=n_layers))
 
         # Intra-expansion residuals
-        self.expansion_residuals = nn.ModuleList(
-            [nn.Linear(dim_in, dim_out) for dim_in, dim_out in self.expansion_sizes]
-        )
+        self.expansion_residuals = nn.ModuleList([nn.Linear(dim_in, dim_out) for dim_in, dim_out in self.expansion_sizes])
         self.expansion_res_scales = nn.ParameterList([nn.Parameter(torch.zeros(1)) for _ in self.expansion_sizes])
 
         # Hypertoken-to-output residual
@@ -152,9 +146,7 @@ class TransformerPyramidHyperTokenDecoder(nn.Module):
         self.fc_out = nn.Linear(embed_dim, vocab_size)
 
     @typechecked
-    def forward(
-        self, x: TensorType["batch_size", "hypertoken_size"]
-    ) -> TensorType["batch_size", "token_len", "vocab_size"]:
+    def forward(self, x: TensorType["batch_size", "hypertoken_size"]) -> TensorType["batch_size", "token_len", "vocab_size"]:
         batch_size = x.size(0)
         hypertoken = x
         expanded = x.reshape(batch_size, self.token_len, -1)
@@ -163,9 +155,9 @@ class TransformerPyramidHyperTokenDecoder(nn.Module):
         for i, (dim_in, dim_out) in enumerate(self.expansion_sizes):
             res_input = expanded  # Preserve pre-expansion state
             expand_factor = dim_out // dim_in
-            expanded = expanded.unsqueeze(-1).expand(-1, -1, -1, expand_factor).reshape(
-                batch_size, self.token_len, dim_out
-            ) * (1.0 / expand_factor)
+            expanded = expanded.unsqueeze(-1).expand(-1, -1, -1, expand_factor).reshape(batch_size, self.token_len, dim_out) * (
+                1.0 / expand_factor
+            )
 
             expanded = self.expansion_layers[i](expanded)
             expanded += self.expansion_residuals[i](res_input) * torch.sigmoid(self.expansion_res_scales[i])

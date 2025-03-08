@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typeguard import typechecked
-from torchtyping import TensorType
 
 
 class RNNHyperTokenEncoder(nn.Module):
@@ -107,9 +105,7 @@ class RNNHyperTokenDecoder(nn.Module):
 
         # Output projection
         self.project = nn.Sequential(
-            nn.Linear(
-                self.hidden_size * 2, embed_dim
-            ),  # Corrected input dimension to match bidirectional hidden output
+            nn.Linear(self.hidden_size * 2, embed_dim),  # Corrected input dimension to match bidirectional hidden output
             nn.LayerNorm(embed_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -121,9 +117,7 @@ class RNNHyperTokenDecoder(nn.Module):
         self.register_buffer("positions", torch.arange(token_len, dtype=torch.long))
 
     @typechecked
-    def forward(
-        self, x: TensorType["batch_size", "hypertoken_size"]
-    ) -> TensorType["batch_size", "token_len", "vocab_size"]:
+    def forward(self, x: TensorType["batch_size", "hypertoken_size"]) -> TensorType["batch_size", "token_len", "vocab_size"]:
         batch_size = x.size(0)
 
         # Expand hypertoken
