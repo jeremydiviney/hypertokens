@@ -722,7 +722,7 @@ if __name__ == "__main__":
 
     # Define experiments
     experiments: list[dict] = {
-        "seq_len": [12],
+        "seq_len": [1024],
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [24],
