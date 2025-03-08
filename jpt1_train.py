@@ -740,7 +740,7 @@ if __name__ == "__main__":
             JPT1QuantModelType.COS_SIM,
             JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [24 * 1024 * 1, 24 * 1024 * 4, 24 * 1024 * 12],
+        "grad_accum_size": [24 * 1024 * 1, 24 * 1024 * 4, 24 * 1024 * 12, 24 * 1024 * 1, 24 * 1024 * 4, 24 * 1024 * 12],
         "log_step_size": [1_000_000],
         "dset_ratio": [0.15],
     }
