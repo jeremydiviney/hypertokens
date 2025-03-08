@@ -429,13 +429,13 @@ def train_model(
 
     grad_accum_steps = math.ceil(grad_accum_size / batch_tokens)
 
-    scheduler_steps = (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
+    scheduler_steps = 10 * (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["lr"],
         total_steps=scheduler_steps,
-        pct_start=0.01,
+        pct_start=0.0025,
         anneal_strategy="cos",
         cycle_momentum=False,
         div_factor=25,  # Initial lr = max_lr/25
