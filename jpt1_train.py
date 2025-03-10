@@ -739,7 +739,7 @@ if __name__ == "__main__":
             24 * 1024 * 20,
         ],
         "log_step_size": [24 * 1024 * 20 * 2],
-        "dset_ratio": [0.20],
+        "dset_ratio": [1],
         "warmup_pct": [0.1],
     }
 
