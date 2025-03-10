@@ -429,13 +429,13 @@ def train_model(
 
     grad_accum_steps = math.ceil(grad_accum_size / batch_tokens)
 
-    scheduler_steps = 10 * (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
+    scheduler_steps = (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["lr"],
         total_steps=scheduler_steps,
-        pct_start=0.0025,
+        pct_start=config["warmup_pct"],
         anneal_strategy="cos",
         cycle_momentum=False,
         div_factor=25,  # Initial lr = max_lr/25
@@ -726,23 +726,21 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [24],
-        "lr": [0.00015, 0.00025, 0.0005, 0.00025, 0.0005, 0.00075],
+        "lr": [0.00025, 0.0004, 0.00075, 0.0015],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.STANDARD,
-            JPT1QuantModelType.STANDARD,
-            JPT1QuantModelType.STANDARD,
             JPT1QuantModelType.COS_SIM,
             JPT1QuantModelType.COS_SIM,
             JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [24 * 1024 * 1, 24 * 1024 * 4, 24 * 1024 * 12, 24 * 1024 * 1, 24 * 1024 * 4, 24 * 1024 * 12],
+        "grad_accum_size": [24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12],
         "log_step_size": [1_000_000],
         "dset_ratio": [0.15],
+        "warmup_pct": [0.40],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
@@ -767,6 +765,7 @@ if __name__ == "__main__":
         grad_accum_size = experiment["grad_accum_size"]
         log_step_size = experiment["log_step_size"]
         dset_ratio = experiment["dset_ratio"]
+        warmup_pct = experiment["warmup_pct"]
         # load this just to get the vocab size
 
         dataset_name = "fineweb-10BT"
