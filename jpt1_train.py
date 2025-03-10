@@ -726,7 +726,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [24],
-        "lr": [0.00025, 0.0004, 0.00075, 0.0015],
+        "lr": [0.00025, 0.0004, 0.00075, 0.0015, 0.00025, 0.0004, 0.00075],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -737,11 +737,14 @@ if __name__ == "__main__":
             JPT1QuantModelType.COS_SIM,
             JPT1QuantModelType.COS_SIM,
             JPT1QuantModelType.COS_SIM,
+            JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12],
+        "grad_accum_size": [24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12, 24 * 1024 * 12],
         "log_step_size": [1_000_000],
-        "dset_ratio": [0.15],
-        "warmup_pct": [0.40],
+        "dset_ratio": [0.20],
+        "warmup_pct": [0.35],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
