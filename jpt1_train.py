@@ -474,14 +474,14 @@ def train_model(
 
         train_step_start = time.time()
 
+        # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
+        current_grad_accum_size = max(batch_tokens, min(grad_accum_size, 4 * completion_percentage * grad_accum_size))
+        current_grad_accum_steps = math.ceil(current_grad_accum_size / batch_tokens)
+
         for x, y in train_dataloader:
             # start_time = time.time()
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-
-            # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
-            current_grad_accum_size = max(batch_tokens, min(grad_accum_size, 4 * completion_percentage * grad_accum_size))
-            current_grad_accum_steps = math.ceil(current_grad_accum_size / batch_tokens)
 
             tokens_processed = x.shape[0] * x.shape[1]
             tokens_since_step += tokens_processed
@@ -557,6 +557,10 @@ def train_model(
 
                     completion_percentage = log_step_count / logging_steps
                     scheduler.step()
+
+                # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
+                current_grad_accum_size = max(batch_tokens, min(grad_accum_size, 4 * completion_percentage * grad_accum_size))
+                current_grad_accum_steps = math.ceil(current_grad_accum_size / batch_tokens)
 
                 torch.cuda.synchronize()
                 train_step_start = time.time()
