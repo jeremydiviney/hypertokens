@@ -675,7 +675,7 @@ def generate_text(
     # Set models to eval mode
     model.eval()
 
-    print("Generating...\n")
+    print("\nGenerating...\n")
 
     print(f"\nPrompt: {prompt}\n", end="", flush=True)
 
@@ -709,7 +709,18 @@ def generate_text(
             if model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=10, temperature=0.5)
             else:
-                pred_token_indices = last_token.argmax(dim=-1)
+                # Apply temperature and sample using top-k
+                logits = last_token.squeeze() / temperature
+
+                probs = torch.softmax(logits, dim=-1)
+                top_k_probs, top_k_indices = torch.topk(probs, min(10, logits.size(-1)))
+                top_k_probs = top_k_probs / top_k_probs.sum()  # Renormalize
+
+                # Sample from the filtered distribution
+                pred_token_indices = torch.multinomial(top_k_probs, num_samples=1).unsqueeze(0)
+
+                # Map back to original indices
+                pred_token_indices = top_k_indices[pred_token_indices]
 
         next_token = model.get_text_token_from_indices(pred_token_indices.cpu().numpy())
         next_token = next_token.item()
