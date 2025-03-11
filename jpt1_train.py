@@ -95,7 +95,9 @@ def evaluate_model(
         # print(f"Pred:   {pred_texts[0]}")
         print(f"Current token accuracy: {token_matches_total/token_total:.2%}")
 
-    generate_text(model, "The", 250, dataloader.dataset)
+    print("Generating text...")
+    for _ in range(20):
+        generate_text(model, "The", 50, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
@@ -416,6 +418,7 @@ def train_model(
         model.parameters(),
         lr=config["lr"],
         fused=True,
+        betas=(0.9, 0.95),
     )
 
     seq_len = config["seq_len"]
@@ -427,19 +430,19 @@ def train_model(
     grad_accum_size = config["grad_accum_size"]
     log_step_size = config["log_step_size"]
 
-    grad_accum_steps = math.ceil(grad_accum_size / batch_tokens)
+    completion_percentage = 0.0
 
-    scheduler_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // (batch_tokens * grad_accum_steps)
+    logging_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // log_step_size
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["lr"],
-        total_steps=scheduler_steps,
+        total_steps=logging_steps,
         pct_start=config["warmup_pct"],
         anneal_strategy="cos",
         cycle_momentum=False,
-        div_factor=25,  # Initial lr = max_lr/25
-        final_div_factor=3,  # Min lr = initial_lr/10 = max_lr/(25*10)
+        div_factor=10,
+        final_div_factor=1,
     )
 
     # scheduler = EmpiricalLRScheduler(
@@ -476,6 +479,10 @@ def train_model(
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
+            # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
+            current_grad_accum_size = max(batch_tokens, min(grad_accum_size, 4 * completion_percentage * grad_accum_size))
+            current_grad_accum_steps = math.ceil(current_grad_accum_size / batch_tokens)
+
             tokens_processed = x.shape[0] * x.shape[1]
             tokens_since_step += tokens_processed
             tokens_since_grad_accum += tokens_processed
@@ -487,15 +494,14 @@ def train_model(
                 # logits = model(x, y)
                 # loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
-            loss = loss / grad_accum_steps
+            loss = loss / current_grad_accum_steps
             loss_accum += loss.detach()
             loss.backward()
 
-            if tokens_since_grad_accum >= grad_accum_size:
+            if tokens_since_grad_accum >= current_grad_accum_size:
 
-                max_grad_norm = 1
                 # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -549,10 +555,9 @@ def train_model(
                             f"tokens_per_second: {tokens_per_second:.2f}"
                         )
 
-                    # if log_step_count % 1000 == 0:
-                    #     os._exit(0)
+                    completion_percentage = log_step_count / logging_steps
+                    scheduler.step()
 
-                scheduler.step()
                 torch.cuda.synchronize()
                 train_step_start = time.time()
 
@@ -697,7 +702,7 @@ def generate_text(
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=1, temperature=0.1)
+                pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=10, temperature=0.5)
             else:
                 pred_token_indices = last_token.argmax(dim=-1)
 
@@ -740,7 +745,7 @@ if __name__ == "__main__":
         ],
         "log_step_size": [24 * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.1],
+        "warmup_pct": [0.25],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
