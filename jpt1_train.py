@@ -535,6 +535,7 @@ def train_model(
                             "learning_rate": optimizer.param_groups[0]["lr"],
                             "epoch": epoch,
                             "tokens_per_second": tokens_per_second,
+                            "current_grad_accum_size": current_grad_accum_size,
                         }
                     )
 
