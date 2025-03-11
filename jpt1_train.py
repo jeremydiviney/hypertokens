@@ -97,7 +97,7 @@ def evaluate_model(
 
     print("Generating text...")
     for _ in range(20):
-        generate_text(model, "The", 50, dataloader.dataset)
+        generate_text(model, "Hello, I'm a language model,", 50, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
