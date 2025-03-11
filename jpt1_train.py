@@ -736,7 +736,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [24],
-        "lr": [0.0006, 0.00012],
+        "lr": [0.0006, 0.0012],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
