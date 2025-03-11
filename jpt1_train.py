@@ -731,7 +731,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [24],
-        "lr": [0.0006],
+        "lr": [0.0006, 0.00012],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -739,10 +739,9 @@ if __name__ == "__main__":
         "vocab_size": [50304],
         "output_type": [
             JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [
-            24 * 1024 * 20,
-        ],
+        "grad_accum_size": [24 * 1024 * 20],
         "log_step_size": [24 * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.25],
