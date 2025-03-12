@@ -550,7 +550,7 @@ def train_model(
                         }
                     )
 
-                    if log_step_count % 25 == 0:
+                    if log_step_count % 50 == 0:
                         eval_results = evaluate_model(model, val_dataloader, device, loss_fn)
                         val_loss = eval_results["val_loss"]
                         val_token_accuracy = eval_results["val_token_accuracy"]
