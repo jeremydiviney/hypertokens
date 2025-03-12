@@ -401,6 +401,13 @@ def inference_and_loss_step(dataset, model, x, y, loss_fn):
         return model_output, loss
 
 
+def get_grad_accum_size(completion_percentage: float, batch_tokens: int, grad_accum_size: int, hit_max_at: float) -> int:
+
+    max_facter = 1 / hit_max_at
+
+    return max(batch_tokens, min(grad_accum_size, max_facter * completion_percentage * grad_accum_size))
+
+
 def train_model(
     wandb,
     model,
@@ -431,6 +438,8 @@ def train_model(
     log_step_size = config["log_step_size"]
 
     completion_percentage = 0.0
+
+    grad_accum_max_at = 0.25
 
     logging_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // log_step_size
 
@@ -475,8 +484,8 @@ def train_model(
         train_step_start = time.time()
 
         # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
-        current_grad_accum_size = max(batch_tokens, min(grad_accum_size, 4 * completion_percentage * grad_accum_size))
-        current_grad_accum_steps = math.ceil(current_grad_accum_size / batch_tokens)
+        current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
+        grad_accum_step_count = math.ceil(current_grad_accum_size / batch_tokens)
 
         for x, y in train_dataloader:
             # start_time = time.time()
@@ -494,7 +503,7 @@ def train_model(
                 # logits = model(x, y)
                 # loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
-            loss = loss / current_grad_accum_steps
+            loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
             loss.backward()
 
@@ -559,9 +568,9 @@ def train_model(
                     completion_percentage = log_step_count / logging_steps
                     scheduler.step()
 
-                # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
-                current_grad_accum_size = max(batch_tokens, min(grad_accum_size, 4 * completion_percentage * grad_accum_size))
-                current_grad_accum_steps = math.ceil(current_grad_accum_size / batch_tokens)
+                # Grad accum size is a function of the completion percentage we reach 100% at grad_accum_max_at completion
+                current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
+                grad_accum_step_count = math.ceil(current_grad_accum_size / batch_tokens)
 
                 torch.cuda.synchronize()
                 train_step_start = time.time()
@@ -707,14 +716,13 @@ def generate_text(
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=10, temperature=0.5)
+                pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=50, temperature=temperature)
             else:
                 # Apply temperature and sample using top-k
                 logits = last_token.squeeze() / temperature
 
                 probs = torch.softmax(logits, dim=-1)
-                top_k_probs, top_k_indices = torch.topk(probs, min(10, logits.size(-1)))
-                top_k_probs = top_k_probs / top_k_probs.sum()  # Renormalize
+                top_k_probs, top_k_indices = torch.topk(probs, 50)
 
                 # Sample from the filtered distribution
                 pred_token_indices = torch.multinomial(top_k_probs, num_samples=1).unsqueeze(0)
@@ -788,9 +796,9 @@ if __name__ == "__main__":
         warmup_pct = experiment["warmup_pct"]
         # load this just to get the vocab size
 
-        dataset_name = "fineweb-10BT"
+        dataset_name = "fineweb-10BT-edu"
 
-        hf_dataset = load_hf_dataset()
+        hf_dataset = load_hf_dataset(dataset_name)
 
         text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
         tokenizer = get_or_train_tokenizer(text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
@@ -807,6 +815,7 @@ if __name__ == "__main__":
             data_stride=seq_len,
             tokenizer=tokenizer,
             hf_dataset=hf_dataset,
+            dataset_name=dataset_name,
             dset_ratio=dset_ratio,
         )
 
@@ -846,6 +855,7 @@ if __name__ == "__main__":
             data_stride=seq_len,
             tokenizer=tokenizer,
             hf_dataset=hf_dataset,
+            dataset_name=dataset_name,
         )
 
         val_dataloader = DataLoader(

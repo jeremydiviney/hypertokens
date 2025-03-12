@@ -39,9 +39,9 @@ def chunked(iterator, chunk_size):
         yield chunk
 
 
-def build_selection_table(data, tokenizer):
+def build_selection_table(data, tokenizer, dataset_name: str):
     vocab_size = len(tokenizer.get_vocab())
-    cache_filename = f"meta_cache/jpt1/selection_table_vocab_{vocab_size}.pkl"
+    cache_filename = f"meta_cache/jpt1/{dataset_name}/selection_table_vocab_{vocab_size}.pkl"
 
     if os.path.exists(cache_filename):
         with open(cache_filename, "rb") as f:
@@ -124,11 +124,11 @@ def get_or_train_tokenizer(text_corpus: str | Iterable[str], vocab_size: int, to
     return tokenizer
 
 
-def load_hf_dataset():
-    cache_path = "data_cache/fineweb-10BT"
+def load_hf_dataset(dataset_name: str):
+    cache_path = f"data_cache/{dataset_name}"
     try:
         # Try to load from cache first
-        dataset = load_dataset("HuggingFaceFW/fineweb", "sample-10BT", cache_dir=cache_path)
+        dataset = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", cache_dir=cache_path)
     except Exception as e:
         print(f"Warning: Could not load dataset from Hugging Face: {e}")
         # Fallback to local backup if it exists
@@ -143,6 +143,7 @@ class Fineweb10BDataset(Dataset):
         data_stride: int,
         hf_dataset: Dataset,
         tokenizer: Tokenizer | None,
+        dataset_name: str,
         dset_ratio: float = 1.0,  # control the ratio of the dataset to use
         type: str = "train",
     ):
@@ -157,7 +158,7 @@ class Fineweb10BDataset(Dataset):
 
         self.pad_token_id = self.tokenizer.token_to_id("[PAD]")
 
-        self.selection_table_master = build_selection_table(self.hf_dataset["train"], self.tokenizer)
+        self.selection_table_master = build_selection_table(self.hf_dataset["train"], self.tokenizer, dataset_name)
 
         self.selection_table = []
         self.selection_table_indices = []
