@@ -439,6 +439,8 @@ def train_model(
 
     completion_percentage = 0.0
 
+    early_end_pct = 0.2
+
     grad_accum_max_at = 0.25
 
     logging_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // log_step_size
@@ -574,6 +576,9 @@ def train_model(
 
                 torch.cuda.synchronize()
                 train_step_start = time.time()
+
+                if completion_percentage >= early_end_pct:
+                    break
 
             # print(
             #     f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
@@ -755,7 +760,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [24],
-        "lr": [0.0012],
+        "lr": [0.008, 0.008, 0.008],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -767,7 +772,7 @@ if __name__ == "__main__":
         "grad_accum_size": [24 * 1024 * 20],
         "log_step_size": [24 * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.25],
+        "warmup_pct": [0.075, 0.5, 0.025],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
