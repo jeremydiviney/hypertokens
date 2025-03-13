@@ -5,8 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import numpy as np
 
+import numpy as np
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from tokenizers import Tokenizer
 
 
@@ -24,6 +25,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(d_model, 3 * d_model)
         # output projection
         self.c_proj = nn.Linear(d_model, d_model)
+        self.c_proj.SCALE_RESIDUAL = True  # Mark for scaling
 
         # regularization
         self.n_head = num_head
@@ -53,6 +55,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(d_model, dim_feedforward)
         self.activation = activation
         self.c_proj = nn.Linear(dim_feedforward, d_model)
+        self.c_proj.SCALE_RESIDUAL = True  # Mark for scaling
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -65,9 +68,9 @@ class TransformerDecoderLayerCustom(nn.Module):
 
     def __init__(self, d_model, num_head, dropout, dim_feedforward, activation):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(d_model)
+        self.ln_1 = LlamaRMSNorm(d_model, eps=1e-6)
         self.attn = CausalSelfAttention(d_model, num_head, dropout)
-        self.ln_2 = nn.LayerNorm(d_model)
+        self.ln_2 = LlamaRMSNorm(d_model, eps=1e-6)
         self.mlp = MLP(d_model, dim_feedforward, activation)
 
     def forward(self, x):
@@ -111,6 +114,7 @@ class JPT1Quantized(nn.Module):
         super().__init__()
         self.seq_len = seq_len
         self.embed_dim = embed_dim
+        self.num_layers = num_layers
         # Use nn.Embedding for learnable positional encodings
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
         self.model_type = model_type
@@ -140,9 +144,7 @@ class JPT1Quantized(nn.Module):
         # self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         # self.transformer = nn.TransformerDecoder(encoder_layer, num_layers=num_layers)
 
-        # self.ln_final = nn.LayerNorm(embed_dim)
-
-        self.fc_ln = nn.LayerNorm(embed_dim)
+        self.fc_ln = LlamaRMSNorm(embed_dim, eps=1e-6)
 
         if model_type == JPT1QuantModelType.COS_SIM:
             self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
@@ -153,8 +155,34 @@ class JPT1Quantized(nn.Module):
             # Tie weights - share the embedding matrix with the output projection
             self.embeddings.weight = self.fc_out.weight
 
-        self.temperature = nn.Parameter(torch.tensor(1.0))
-        self.extra_temperature = nn.Parameter(torch.tensor(1.0))
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+
+            if hasattr(module, "SCALE_RESIDUAL") and module.SCALE_RESIDUAL:
+                # Scale by depth for residual path projections
+                std = 0.02 * (2 * self.num_layers) ** -0.5
+
+            # Use normal initialization with the calculated std
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+            # Small normal initialization for embeddings
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            # Standard init for LayerNorm
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, LlamaRMSNorm) or "LlamaRMSNorm" in module.__class__.__name__:
+            # RMSNorm only has weight parameter (no bias)
+            torch.nn.init.ones_(module.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = x.shape

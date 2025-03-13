@@ -439,7 +439,7 @@ def train_model(
 
     completion_percentage = 0.0
 
-    early_end_pct = None
+    early_end_pct = config["early_end_pct"]
 
     grad_accum_max_at = config["grad_accum_max_at"]
 
@@ -474,9 +474,9 @@ def train_model(
     tokens_since_step = 0
     tokens_since_grad_accum = 0
 
-    batches_per_epoch = 100000 // config["batch_size"]
+    # batches_per_epoch = 100000 // config["batch_size"]
 
-    wandb.watch(model, log_freq=batches_per_epoch, log="all")
+    # wandb.watch(model, log_freq=batches_per_epoch, log="all")
 
     for epoch in range(config["epochs"]):
         batch_count = 0
@@ -512,7 +512,7 @@ def train_model(
             if tokens_since_grad_accum >= current_grad_accum_size:
 
                 # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -533,7 +533,7 @@ def train_model(
                 if current_mean_loss < low_loss:
                     low_loss = current_mean_loss
                     print(
-                        f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f}, Tokens per second: {tokens_per_second:.2f}"
+                        f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f},Grad Norm: {norm:.2f}, Tokens per second: {tokens_per_second:.2f}"
                     )
 
                 if tokens_since_step >= log_step_size:
@@ -547,6 +547,7 @@ def train_model(
                             "epoch": epoch,
                             "tokens_per_second": tokens_per_second,
                             "current_grad_accum_size": current_grad_accum_size,
+                            "grad_norm": norm,
                         }
                     )
 
@@ -773,8 +774,9 @@ if __name__ == "__main__":
         "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.035],
-        "grad_accum_max_at": [0.07],
+        "warmup_pct": [0.1],
+        "grad_accum_max_at": [0.1],
+        "early_end_pct": [None],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
@@ -799,7 +801,6 @@ if __name__ == "__main__":
         grad_accum_size = experiment["grad_accum_size"]
         log_step_size = experiment["log_step_size"]
         dset_ratio = experiment["dset_ratio"]
-        warmup_pct = experiment["warmup_pct"]
         # load this just to get the vocab size
 
         dataset_name = "fineweb-10BT-edu"
