@@ -754,12 +754,13 @@ def generate_text(
 
 if __name__ == "__main__":
 
+    bs = 24
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
         "token_space_dim": [768],
         "epochs": [1],
-        "batch_size": [24],
+        "batch_size": [bs],
         "lr": [0.0008],
         "num_head": [12],
         "n_layers": [12],
@@ -769,11 +770,11 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [24 * 1024 * 20],
-        "log_step_size": [24 * 1024 * 20 * 2],
+        "grad_accum_size": [bs * 1024 * 20],
+        "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.05],
-        "grad_accum_max_at": [0.1],
+        "grad_accum_max_at": [0.05],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
