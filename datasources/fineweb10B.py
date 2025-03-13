@@ -248,8 +248,8 @@ class Fineweb10BDataset(Dataset):
         if padding_needed > 0:
             # Create padding array filled with pad_token
             padding = np.full((padding_needed), self.pad_token_id)
-            # Concatenate the token sequence with padding
-            token_sequence_ids = np.concatenate([padding, token_sequence_ids], axis=0)
+            # Concatenate the token sequence with padding (pad at the end to avoid attending to the pad tokens)
+            token_sequence_ids = np.concatenate([token_sequence_ids, padding], axis=0)
 
         x = token_sequence_ids[:-1]
         y = token_sequence_ids[1:]

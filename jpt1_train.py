@@ -491,8 +491,8 @@ def train_model(
 
         for x, y in train_dataloader:
             # start_time = time.time()
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+            x = x.to(device)
+            y = y.to(device)
 
             tokens_processed = x.shape[0] * x.shape[1]
             tokens_since_step += tokens_processed
