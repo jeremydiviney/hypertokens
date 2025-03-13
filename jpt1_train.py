@@ -773,8 +773,8 @@ if __name__ == "__main__":
         "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.05],
-        "grad_accum_max_at": [0.05],
+        "warmup_pct": [0.035],
+        "grad_accum_max_at": [0.07],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
