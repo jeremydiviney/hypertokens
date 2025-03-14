@@ -13,6 +13,7 @@ from tokenizers import Tokenizer
 
 class JPT1QuantModelType(Enum):
     COS_SIM = "cossim"
+    L2_SIM = "l2sim"
     STANDARD = "standard"
 
 
@@ -148,8 +149,8 @@ class JPT1Quantized(nn.Module):
 
         if model_type == JPT1QuantModelType.COS_SIM:
             self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
-            # self.fc_out_experts = nn.Linear(embed_dim, token_space_dim * num_experts)
-            # self.gate = nn.Linear(embed_dim, num_experts)
+        elif model_type == JPT1QuantModelType.L2_SIM:
+            self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
         else:
             self.fc_out = nn.Linear(embed_dim, self.vocab_size)
             # Tie weights - share the embedding matrix with the output projection
@@ -238,6 +239,54 @@ class JPT1Quantized(nn.Module):
         final_indices = torch.gather(topk_indices_flat, dim=1, index=chosen.unsqueeze(-1)).view(bsz, seq_len)
 
         return final_indices
+
+    def get_nearest_token_indices_l2sim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
+        """
+        Return the nearest token indices based on L2 distance similarity.
+        Memory-optimized version without loops.
+
+        Args:
+            projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
+            top_k (int): Number of candidates to sample from. If 1, returns argmin.
+            temperature (float): Temperature for sampling from the top_k candidates.
+
+        Returns:
+            torch.Tensor: [B, S] tensor of token indices.
+        """
+        batch_size, seq_len = projections.shape[:2]
+
+        # Compute L2 distances more efficiently
+        # Instead of explicitly calculating squared norms and dot products separately,
+        # we can use torch's cdist function which is optimized for this purpose
+
+        # Reshape projections to 2D for cdist
+        proj_flat = projections.reshape(-1, projections.size(-1))  # [B*S, E]
+
+        # Calculate pairwise distances efficiently
+        # We use squared L2 distance (p=2, squared=True)
+        distances = torch.cdist(proj_flat, self.lookup_embeddings.weight, p=2).pow(2)  # [B*S, V]
+
+        # Convert distances to similarities (negative distances)
+        similarity = -distances
+
+        if top_k == 1:
+            # For top_k=1, just return the argmax directly
+            indices_flat = similarity.argmax(dim=-1)  # [B*S]
+            return indices_flat.view(batch_size, seq_len)
+
+        # For top_k > 1, get top-k values and indices
+        topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)  # [B*S, top_k]
+
+        # Apply temperature scaling and softmax
+        probs = F.softmax(topk_values / temperature, dim=-1)  # [B*S, top_k]
+
+        # Sample one index per position
+        chosen = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B*S]
+
+        # Map back to original indices and reshape
+        final_indices = torch.gather(topk_indices, dim=1, index=chosen.unsqueeze(-1)).squeeze(-1)  # [B*S]
+
+        return final_indices.view(batch_size, seq_len)
 
     def get_token_indices(self, text_tokens: list[str]) -> list[int]:
         """

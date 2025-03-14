@@ -74,6 +74,8 @@ def evaluate_model(
 
             if model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = model.get_nearest_token_indices_cossim(jpt_output)
+            elif model.model_type == JPT1QuantModelType.L2_SIM:
+                pred_token_indices = model.get_nearest_token_indices_l2sim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
@@ -177,133 +179,10 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
     return logits, new_targets
 
 
-class CustomLoss(torch.nn.Module):
+class CustomLossCosSim(torch.nn.Module):
     def __init__(self, ignore_index: int):
         super().__init__()
         self.ignore_index = ignore_index
-
-    # def forward(self, model, hidden_states, target_indices):
-    #     """
-    #     InfoNCE loss computed for all batches at once without loops.
-
-    #     Args:
-    #         model: A model with lookup_embeddings, temperature, and vocab_size
-    #         hidden_states: Tensor of shape [batch_size, seq_length, hidden_dim]
-    #         target_indices: Tensor of shape [batch_size, seq_length]
-
-    #     Returns:
-    #         Average InfoNCE loss (scalar)
-    #     """
-    #     device = hidden_states.device
-    #     batch_size, seq_length, hidden_dim = hidden_states.shape
-
-    #     # Normalize hidden states
-    #     hidden_states_norm = F.normalize(hidden_states, p=2, dim=2, eps=1e-6)
-
-    #     # Get all embeddings from the model instead of undefined comparison_tokens
-    #     all_embeddings = model.lookup_embeddings.weight
-    #     comparison_embeds_norm = F.normalize(all_embeddings, p=2, dim=1, eps=1e-6)
-
-    #     # Reshape hidden states to [batch_size * seq_length, hidden_dim]
-    #     flat_hidden = hidden_states_norm.reshape(-1, hidden_dim)
-
-    #     # Compute similarities for all hidden states against all embeddings at once
-    #     # [batch_size * seq_length, hidden_dim] @ [hidden_dim, vocab_size]
-    #     similarities = torch.matmul(flat_hidden, comparison_embeds_norm.t()) / model.temperature
-
-    #     # Flatten target indices
-    #     flat_targets = target_indices.reshape(-1)
-
-    #     # Compute cross-entropy loss
-    #     loss = F.cross_entropy(similarities, flat_targets)
-
-    #     return lossdef forward(self, model, hidden_states, target_indices):
-
-    # def forward(self, model, hidden_states, target_indices):
-    #     batch_size, seq_length, hidden_dim = hidden_states.shape
-    #     vocab_size = model.lookup_embeddings.weight.size(0)
-
-    #     # Create mask for valid indices (where target_indices != self.ignore_index)
-    #     valid_mask = target_indices != self.ignore_index
-
-    #     # Filter hidden_states and target_indices
-    #     # For hidden_states, we need to maintain 3D structure but only keep valid positions
-    #     flat_valid_mask = valid_mask.reshape(-1)
-    #     flat_hidden = hidden_states.reshape(-1, hidden_dim)[flat_valid_mask]
-    #     flat_targets = target_indices.reshape(-1)[flat_valid_mask]
-
-    #     # Normalize the filtered hidden states and embeddings
-    #     flat_hidden = F.normalize(flat_hidden, p=2, dim=1)
-    #     all_embeddings = F.normalize(model.lookup_embeddings.weight, p=2, dim=1)
-
-    #     # Get positive embeddings directly
-    #     positive_embeddings = all_embeddings[flat_targets]  # [num_valid, hidden_dim]
-
-    #     # Get all unique targets from the batch
-    #     unique_targets = torch.unique(flat_targets)
-
-    #     # Get embeddings for all unique targets in the batch
-    #     unique_embeddings = all_embeddings[unique_targets]  # [num_unique, hidden_dim]
-
-    #     # Sample additional negative indices (ensuring they're not in the batch uniques)
-    #     N = (1024 * 8) - 1  # Total number of negative samples desired
-    #     num_batch_uniques = unique_targets.shape[0]
-    #     num_extra_samples = max(0, N - num_batch_uniques)
-
-    #     # Create mask for sampling (0 for tokens in unique_targets, 1 for others)
-    #     sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
-    #     sampling_mask[unique_targets] = False
-
-    #     # Get valid indices for sampling
-    #     valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
-
-    #     # Sample extra negative indices
-    #     if num_extra_samples > 0:
-    #         # Handle case where we need fewer samples than available valid indices
-    #         num_to_sample = min(num_extra_samples, len(valid_indices))
-    #         perm = torch.randperm(len(valid_indices), device=valid_indices.device)
-    #         extra_neg_indices = valid_indices[perm[:num_to_sample]]
-    #     else:
-    #         extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
-
-    #     # Get embeddings for extra negative samples
-    #     extra_neg_embeddings = (
-    #         all_embeddings[extra_neg_indices]
-    #         if len(extra_neg_indices) > 0
-    #         else torch.tensor([], device=flat_hidden.device).reshape(0, hidden_dim)
-    #     )
-
-    #     # Compute positive similarities
-    #     positive_similarities = torch.sum(flat_hidden * positive_embeddings, dim=1) / model.temperature
-
-    #     # Compute similarities with batch unique targets
-    #     batch_unique_similarities = torch.matmul(flat_hidden, unique_embeddings.t()) / model.temperature
-
-    #     # Compute similarities with extra negative samples
-    #     extra_similarities = (
-    #         torch.matmul(flat_hidden, extra_neg_embeddings.t()) / model.temperature
-    #         if len(extra_neg_indices) > 0
-    #         else torch.tensor([], device=flat_hidden.device).reshape(flat_hidden.shape[0], 0)
-    #     )
-
-    #     # Mark accidental positives in batch unique similarities
-    #     # Create a mask where True indicates token i matches unique target j
-    #     is_positive_mask = flat_targets.unsqueeze(1) == unique_targets.unsqueeze(0)
-
-    #     # Apply large negative value to positives (excluding the direct positive)
-    #     large_negative = -1e9  # Effectively negative infinity for softmax
-    #     batch_unique_similarities = torch.where(is_positive_mask, large_negative, batch_unique_similarities)
-
-    #     # Combine all similarities: [positive, batch_uniques, extra_samples]
-    #     logits = torch.cat([positive_similarities.unsqueeze(1), batch_unique_similarities, extra_similarities], dim=1)
-
-    #     # Create targets (index 0 = positive example)
-    #     targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-
-    #     # Apply cross entropy loss
-    #     loss = F.cross_entropy(logits, targets)
-
-    #     return loss
 
     def forward(self, model, hidden_states, target_indices):
         batch_size, seq_length, hidden_dim = hidden_states.shape
@@ -366,6 +245,82 @@ class CustomLoss(torch.nn.Module):
         return loss
 
 
+class CustomLossL2Sim(torch.nn.Module):
+    def __init__(self, ignore_index: int):
+        super().__init__()
+        self.ignore_index = ignore_index
+
+    def forward(self, model, hidden_states, target_indices):
+        batch_size, seq_length, hidden_dim = hidden_states.shape
+        vocab_size = model.lookup_embeddings.weight.size(0)
+
+        # Flatten tensors
+        flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
+        flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
+
+        # Ignore padding tokens
+        ignore_mask = flat_targets == self.ignore_index
+        flat_hidden = flat_hidden[~ignore_mask]
+        flat_targets = flat_targets[~ignore_mask]
+
+        # Get unique targets from the batch
+        unique_targets = torch.unique(flat_targets)
+
+        # Sample additional negative indices
+        N = 1024 * 8  # Target number of negative samples
+        num_batch_uniques = unique_targets.shape[0]
+        num_extra_samples = max(0, N - num_batch_uniques)
+
+        # Sample from non-batch tokens
+        sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
+        sampling_mask[unique_targets] = False
+        valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
+
+        # Get extra negative indices
+        if num_extra_samples > 0 and len(valid_indices) > 0:
+            perm = torch.randperm(len(valid_indices), device=valid_indices.device)
+            num_to_sample = min(num_extra_samples, len(valid_indices))
+            extra_neg_indices = valid_indices[perm[:num_to_sample]]
+        else:
+            extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
+
+        # Combine all indices for comparisons
+        all_indices = torch.cat([unique_targets, extra_neg_indices])
+
+        # Get embeddings for all indices
+        all_embeddings = model.lookup_embeddings.weight
+        comparison_embeddings = all_embeddings[all_indices]  # [num_comparisons, hidden_dim]
+
+        # Compute L2 distances - we need to compute pairwise distances efficiently
+        # Using the formula ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
+
+        # Compute squared norms
+        hidden_norm_squared = torch.sum(flat_hidden**2, dim=1, keepdim=True)  # [batch*seq, 1]
+        embed_norm_squared = torch.sum(comparison_embeddings**2, dim=1, keepdim=True).t()  # [1, num_comparisons]
+
+        # Compute dot products
+        dot_products = torch.matmul(flat_hidden, comparison_embeddings.t())  # [batch*seq, num_comparisons]
+
+        # Compute squared L2 distances
+        l2_squared = hidden_norm_squared + embed_norm_squared - 2 * dot_products  # [batch*seq, num_comparisons]
+
+        # Convert distances to similarities (negative distances scaled by temperature)
+        # Lower distance = higher similarity
+        all_similarities = -l2_squared / model.temperature  # [batch*seq, num_comparisons]
+
+        # Create targets tensor - map each flat_target to its position in all_indices
+        indices_map = torch.zeros(vocab_size, dtype=torch.long, device=flat_hidden.device)
+        indices_map[all_indices] = torch.arange(len(all_indices), device=flat_hidden.device)
+
+        # Use the mapping to get the target positions
+        targets = indices_map[flat_targets]
+
+        # Apply cross entropy loss
+        loss = F.cross_entropy(all_similarities, targets)
+
+        return loss
+
+
 def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float = 2) -> torch.Tensor:
 
     num_experts = gate_weights.shape[-1]
@@ -389,7 +344,7 @@ def inference_and_loss_step(dataset, model, x, y, loss_fn):
     # end_time = time.time()
     # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
-    if model.model_type == JPT1QuantModelType.COS_SIM:
+    if model.model_type == JPT1QuantModelType.COS_SIM or model.model_type == JPT1QuantModelType.L2_SIM:
         loss = loss_fn(model, model_output, y)
         return model_output, loss
     else:
@@ -474,10 +429,6 @@ def train_model(
     tokens_since_step = 0
     tokens_since_grad_accum = 0
 
-    # batches_per_epoch = 100000 // config["batch_size"]
-
-    # wandb.watch(model, log_freq=batches_per_epoch, log="all")
-
     for epoch in range(config["epochs"]):
         batch_count = 0
 
@@ -512,7 +463,10 @@ def train_model(
             if tokens_since_grad_accum >= current_grad_accum_size:
 
                 # Add gradient clipping
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 4.0 if model.model_type == JPT1QuantModelType.COS_SIM else 1)
+                norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    4.0 if model.model_type == JPT1QuantModelType.COS_SIM or model.model_type == JPT1QuantModelType.L2_SIM else 1,
+                )
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -721,6 +675,8 @@ def generate_text(
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=50, temperature=temperature)
+            elif model.model_type == JPT1QuantModelType.L2_SIM:
+                pred_token_indices = model.get_nearest_token_indices_l2sim(last_token, top_k=50, temperature=temperature)
             else:
                 # Apply temperature and sample using top-k
                 logits = last_token.squeeze() / temperature
@@ -760,21 +716,21 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.0008, 0.0012],
+        "lr": [0.0008],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.COS_SIM,
+            JPT1QuantModelType.L2_SIM,
         ],
         "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.7],
+        "early_end_pct": [None],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
@@ -810,7 +766,9 @@ if __name__ == "__main__":
 
         loss_fn = None
         if output_type == JPT1QuantModelType.COS_SIM:
-            loss_fn = CustomLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
+            loss_fn = CustomLossCosSim(ignore_index=tokenizer.token_to_id("[PAD]"))
+        elif output_type == JPT1QuantModelType.L2_SIM:
+            loss_fn = CustomLossL2Sim(ignore_index=tokenizer.token_to_id("[PAD]"))
         else:
             loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
 
