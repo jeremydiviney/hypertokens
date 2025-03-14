@@ -512,7 +512,7 @@ def train_model(
             if tokens_since_grad_accum >= current_grad_accum_size:
 
                 # Add gradient clipping
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 4.0 if model.model_type == JPT1QuantModelType.COS_SIM else 1)
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -690,7 +690,7 @@ def generate_text(
     # Set models to eval mode
     model.eval()
 
-    print(f"\nPrompt: {prompt}", end="", flush=True)
+    print(f"\n\nPrompt: {prompt}", end="", flush=True)
 
     if len(prompt) == 0:
         raise ValueError("Prompt must be at least one character long")
@@ -760,7 +760,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.00015, 0.00025, 0.0005, 0.001],
+        "lr": [0.0008, 0.0012],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -769,12 +769,12 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [bs * 1024],
+        "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.01],
-        "grad_accum_max_at": [0.01],
-        "early_end_pct": [0.075],
+        "warmup_pct": [0.1],
+        "grad_accum_max_at": [0.1],
+        "early_end_pct": [0.7],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
