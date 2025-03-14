@@ -690,9 +690,7 @@ def generate_text(
     # Set models to eval mode
     model.eval()
 
-    print("\nGenerating...\n")
-
-    print(f"\nPrompt: {prompt}\n", end="", flush=True)
+    print(f"\nPrompt: {prompt}", end="", flush=True)
 
     if len(prompt) == 0:
         raise ValueError("Prompt must be at least one character long")
@@ -762,21 +760,21 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.0008],
+        "lr": [0.00015, 0.00025, 0.0005, 0.001],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [bs * 1024 * 20],
+        "grad_accum_size": [bs * 1024],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.1],
-        "grad_accum_max_at": [0.1],
-        "early_end_pct": [None],
+        "warmup_pct": [0.01],
+        "grad_accum_max_at": [0.01],
+        "early_end_pct": [0.075],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
