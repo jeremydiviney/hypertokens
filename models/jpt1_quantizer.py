@@ -309,7 +309,7 @@ class JPT1Quantized(nn.Module):
         num_tokens = proj_flat.size(0)
 
         # Process in batches to save memory
-        batch_size_tokens = 1024
+        batch_size_tokens = num_tokens
 
         # Initialize tensor to store results
         all_similarities = torch.zeros(num_tokens, vocab_size, device=proj_flat.device)
