@@ -291,7 +291,7 @@ class JPT1Quantized(nn.Module):
     def get_nearest_token_indices_l2sim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
         """
         Return the nearest token indices based on L2 norm of element-wise products.
-        Memory-optimized vectorized implementation.
+        Extremely memory-efficient implementation that processes by dimension.
 
         Args:
             projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
@@ -306,25 +306,36 @@ class JPT1Quantized(nn.Module):
 
         # Reshape projections to 2D
         proj_flat = projections.reshape(-1, hidden_dim)  # [B*S, E]
+        num_tokens = proj_flat.size(0)
 
         # Process in batches to save memory
         batch_size_tokens = 1024
-        num_tokens = proj_flat.size(0)
+
+        # Initialize tensor to store results
         all_similarities = torch.zeros(num_tokens, vocab_size, device=proj_flat.device)
 
         for i in range(0, num_tokens, batch_size_tokens):
             end_idx = min(i + batch_size_tokens, num_tokens)
             current_batch = proj_flat[i:end_idx]  # [batch, E]
+            current_batch_size = end_idx - i
 
-            # Reshape for broadcasting
-            h = current_batch.unsqueeze(1)  # [batch, 1, E]
-            e = self.lookup_embeddings.weight.unsqueeze(0)  # [1, V, E]
+            # Initialize squared norms accumulator for this batch
+            squared_norms = torch.zeros(current_batch_size, vocab_size, device=current_batch.device)
 
-            # Element-wise multiplication
-            products = h * e  # [batch, V, E]
+            # Process dimension-by-dimension to avoid materializing the full tensor
+            for d in range(hidden_dim):
+                # Get the d-th dimension for batch of projections and all embeddings
+                h_d = current_batch[:, d].unsqueeze(1)  # [batch, 1]
+                e_d = self.lookup_embeddings.weight[:, d].unsqueeze(0)  # [1, V]
 
-            # Compute L2 norm along the embedding dimension
-            norms = torch.norm(products, p=2, dim=2)  # [batch, V]
+                # Element-wise product for this dimension
+                product_d = h_d * e_d  # [batch, V]
+
+                # Add squared contribution to accumulated squared norms
+                squared_norms += product_d**2
+
+            # Take sqrt for L2 norm
+            norms = torch.sqrt(squared_norms + 1e-10)  # [batch, V]
 
             # Store negative norms as similarities (smaller norm = higher similarity)
             all_similarities[i:end_idx] = -norms
