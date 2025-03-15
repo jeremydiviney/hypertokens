@@ -180,9 +180,10 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
 
 
 class CustomLossCosSim(torch.nn.Module):
-    def __init__(self, ignore_index: int):
+    def __init__(self, ignore_index: int, total_compare_tokens: int):
         super().__init__()
         self.ignore_index = ignore_index
+        self.total_compare_tokens = total_compare_tokens
 
     def forward(self, model, hidden_states, target_indices):
         batch_size, seq_length, hidden_dim = hidden_states.shape
@@ -205,9 +206,9 @@ class CustomLossCosSim(torch.nn.Module):
         unique_targets = torch.unique(flat_targets)
 
         # Sample additional negative indices
-        N = 1024 * 8  # Target number of negative samples
+        # Target number of negative samples
         num_batch_uniques = unique_targets.shape[0]
-        num_extra_samples = max(0, N - num_batch_uniques)
+        num_extra_samples = max(0, self.total_compare_tokens - num_batch_uniques)
 
         # Sample from non-batch tokens
         sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
@@ -246,9 +247,10 @@ class CustomLossCosSim(torch.nn.Module):
 
 
 class CustomLossL2Sim(torch.nn.Module):
-    def __init__(self, ignore_index: int):
+    def __init__(self, ignore_index: int, total_compare_tokens: int):
         super().__init__()
         self.ignore_index = ignore_index
+        self.total_compare_tokens = total_compare_tokens
 
     def forward(self, model, hidden_states, target_indices):
         batch_size, seq_length, hidden_dim = hidden_states.shape
@@ -267,9 +269,8 @@ class CustomLossL2Sim(torch.nn.Module):
         unique_targets = torch.unique(flat_targets)
 
         # Sample additional negative indices
-        N = 1024 * 8  # Target number of negative samples
         num_batch_uniques = unique_targets.shape[0]
-        num_extra_samples = max(0, N - num_batch_uniques)
+        num_extra_samples = max(0, self.total_compare_tokens - num_batch_uniques)
 
         # Sample from non-batch tokens
         sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
@@ -723,14 +724,15 @@ if __name__ == "__main__":
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.L2_SIM,
+            JPT1QuantModelType.COS_SIM,
         ],
         "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [None],
+        "early_end_pct": [0.25],
+        "total_compare_tokens": [6 * 1024, 12 * 1024, 16 * 1024],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
@@ -755,6 +757,7 @@ if __name__ == "__main__":
         grad_accum_size = experiment["grad_accum_size"]
         log_step_size = experiment["log_step_size"]
         dset_ratio = experiment["dset_ratio"]
+        total_compare_tokens = experiment["total_compare_tokens"]
         # load this just to get the vocab size
 
         dataset_name = "fineweb-10BT-edu"
@@ -766,9 +769,9 @@ if __name__ == "__main__":
 
         loss_fn = None
         if output_type == JPT1QuantModelType.COS_SIM:
-            loss_fn = CustomLossCosSim(ignore_index=tokenizer.token_to_id("[PAD]"))
+            loss_fn = CustomLossCosSim(ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens)
         elif output_type == JPT1QuantModelType.L2_SIM:
-            loss_fn = CustomLossL2Sim(ignore_index=tokenizer.token_to_id("[PAD]"))
+            loss_fn = CustomLossL2Sim(ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens)
         else:
             loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
 
