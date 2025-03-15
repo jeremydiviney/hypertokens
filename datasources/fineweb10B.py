@@ -152,7 +152,7 @@ class Fineweb10BDataset(Dataset):
         self.seq_len = seq_len
         self.data_stride = data_stride
         self.tokenizer = tokenizer
-        self.train_ratio = 4000
+        self.train_ratio = 40000
         self.dset_ratio = dset_ratio
         self.type = type
 
