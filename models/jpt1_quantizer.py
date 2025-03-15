@@ -240,42 +240,103 @@ class JPT1Quantized(nn.Module):
 
         return final_indices
 
+    # def get_nearest_token_indices_l2sim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
+    #     """
+    #     Return the nearest token indices based on L2 distance similarity.
+    #     Memory-optimized version without loops.
+
+    #     Args:
+    #         projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
+    #         top_k (int): Number of candidates to sample from. If 1, returns argmin.
+    #         temperature (float): Temperature for sampling from the top_k candidates.
+
+    #     Returns:
+    #         torch.Tensor: [B, S] tensor of token indices.
+    #     """
+    #     batch_size, seq_len = projections.shape[:2]
+
+    #     # Compute L2 distances more efficiently
+    #     # Instead of explicitly calculating squared norms and dot products separately,
+    #     # we can use torch's cdist function which is optimized for this purpose
+
+    #     # Reshape projections to 2D for cdist
+    #     proj_flat = projections.reshape(-1, projections.size(-1))  # [B*S, E]
+
+    #     # Calculate pairwise distances efficiently
+    #     # We use squared L2 distance (p=2, squared=True)
+    #     distances = torch.cdist(proj_flat, self.lookup_embeddings.weight, p=2).pow(2)  # [B*S, V]
+
+    #     # Convert distances to similarities (negative distances)
+    #     similarity = -distances
+
+    #     if top_k == 1:
+    #         # For top_k=1, just return the argmax directly
+    #         indices_flat = similarity.argmax(dim=-1)  # [B*S]
+    #         return indices_flat.view(batch_size, seq_len)
+
+    #     # For top_k > 1, get top-k values and indices
+    #     topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)  # [B*S, top_k]
+
+    #     # Apply temperature scaling and softmax
+    #     probs = F.softmax(topk_values / temperature, dim=-1)  # [B*S, top_k]
+
+    #     # Sample one index per position
+    #     chosen = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B*S]
+
+    #     # Map back to original indices and reshape
+    #     final_indices = torch.gather(topk_indices, dim=1, index=chosen.unsqueeze(-1)).squeeze(-1)  # [B*S]
+
+    #     return final_indices.view(batch_size, seq_len)
+
     def get_nearest_token_indices_l2sim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
         """
-        Return the nearest token indices based on L2 distance similarity.
-        Memory-optimized version without loops.
+        Return the nearest token indices based on L2 norm of element-wise products.
+        Memory-optimized vectorized implementation.
 
         Args:
             projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
-            top_k (int): Number of candidates to sample from. If 1, returns argmin.
+            top_k (int): Number of candidates to sample from. If 1, returns argmax.
             temperature (float): Temperature for sampling from the top_k candidates.
 
         Returns:
             torch.Tensor: [B, S] tensor of token indices.
         """
-        batch_size, seq_len = projections.shape[:2]
+        batch_size, seq_len, hidden_dim = projections.shape
+        vocab_size = self.lookup_embeddings.weight.size(0)
 
-        # Compute L2 distances more efficiently
-        # Instead of explicitly calculating squared norms and dot products separately,
-        # we can use torch's cdist function which is optimized for this purpose
+        # Reshape projections to 2D
+        proj_flat = projections.reshape(-1, hidden_dim)  # [B*S, E]
 
-        # Reshape projections to 2D for cdist
-        proj_flat = projections.reshape(-1, projections.size(-1))  # [B*S, E]
+        # Process in batches to save memory
+        batch_size_tokens = 1024
+        num_tokens = proj_flat.size(0)
+        all_similarities = torch.zeros(num_tokens, vocab_size, device=proj_flat.device)
 
-        # Calculate pairwise distances efficiently
-        # We use squared L2 distance (p=2, squared=True)
-        distances = torch.cdist(proj_flat, self.lookup_embeddings.weight, p=2).pow(2)  # [B*S, V]
+        for i in range(0, num_tokens, batch_size_tokens):
+            end_idx = min(i + batch_size_tokens, num_tokens)
+            current_batch = proj_flat[i:end_idx]  # [batch, E]
 
-        # Convert distances to similarities (negative distances)
-        similarity = -distances
+            # Reshape for broadcasting
+            h = current_batch.unsqueeze(1)  # [batch, 1, E]
+            e = self.lookup_embeddings.weight.unsqueeze(0)  # [1, V, E]
 
+            # Element-wise multiplication
+            products = h * e  # [batch, V, E]
+
+            # Compute L2 norm along the embedding dimension
+            norms = torch.norm(products, p=2, dim=2)  # [batch, V]
+
+            # Store negative norms as similarities (smaller norm = higher similarity)
+            all_similarities[i:end_idx] = -norms
+
+        # Handle top-k selection
         if top_k == 1:
             # For top_k=1, just return the argmax directly
-            indices_flat = similarity.argmax(dim=-1)  # [B*S]
+            indices_flat = all_similarities.argmax(dim=-1)  # [B*S]
             return indices_flat.view(batch_size, seq_len)
 
         # For top_k > 1, get top-k values and indices
-        topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)  # [B*S, top_k]
+        topk_values, topk_indices = all_similarities.topk(k=top_k, dim=-1)  # [B*S, top_k]
 
         # Apply temperature scaling and softmax
         probs = F.softmax(topk_values / temperature, dim=-1)  # [B*S, top_k]
