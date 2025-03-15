@@ -717,7 +717,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.00015, 0.0004, 0.001],
+        "lr": [0.0008],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -726,12 +726,12 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [bs * 1024, bs * 1024, bs * 1024 * 20],
+        "grad_accum_size": [bs * 1024],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.01, 0.05, 0.1],
+        "warmup_pct": [0.01],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.6],
+        "early_end_pct": [0.5],
         "total_compare_tokens": [12 * 1024],
     }
 
