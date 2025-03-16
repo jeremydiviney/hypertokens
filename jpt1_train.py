@@ -792,7 +792,7 @@ if __name__ == "__main__":
     experiments: list[dict] = {
         "seq_len": [1024],
         "token_space_dim": [768],
-        "epochs": [2],
+        "epochs": [1],
         "batch_size": [bs],
         "lr": [0.001],
         "num_head": [12],
@@ -808,7 +808,7 @@ if __name__ == "__main__":
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.4],
+        "early_end_pct": [0.55],
         "total_compare_tokens": [12 * 1024],
         "beta2": [0.99, 0.975, 0.95, 0.925, 0.9],
         "num_negatives": [None],
