@@ -458,7 +458,7 @@ def train_model(
         model.parameters(),
         lr=config["lr"],
         fused=True,
-        betas=(0.9, 0.95),
+        betas=(0.9, config["beta2"]),
     )
 
     seq_len = config["seq_len"]
@@ -792,25 +792,26 @@ if __name__ == "__main__":
     experiments: list[dict] = {
         "seq_len": [1024],
         "token_space_dim": [768],
-        "epochs": [1],
+        "epochs": [2],
         "batch_size": [bs],
-        "lr": [0.0005],
+        "lr": [0.001],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.L2_SIM,
+            JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [bs * 1024],
+        "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.01],
+        "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.1],
+        "early_end_pct": [0.4],
         "total_compare_tokens": [12 * 1024],
-        "num_negatives": [1, 4, 10, 32],
+        "beta2": [0.99, 0.975, 0.95, 0.925, 0.9],
+        "num_negatives": [None],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
