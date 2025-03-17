@@ -489,12 +489,6 @@ def train_model(
         final_div_factor=1,
     )
 
-    # scheduler = EmpiricalLRScheduler(
-    #     optimizer,
-    #     alpha=0.025,
-    #     n=9,
-    # )
-
     dataset = train_dataloader.dataset
 
     current_lr = config["lr"]
@@ -535,7 +529,7 @@ def train_model(
                 # loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
             loss = loss / grad_accum_step_count
-            loss_accum += loss.detach()
+            loss_accum += loss.detach().item()
             loss.backward()
 
             if tokens_since_grad_accum >= current_grad_accum_size:
@@ -601,7 +595,8 @@ def train_model(
                         )
 
                     completion_percentage = log_step_count / logging_steps
-                    scheduler.step()
+
+                scheduler.step(current_loss)
 
                 # Grad accum size is a function of the completion percentage we reach 100% at grad_accum_max_at completion
                 current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
@@ -794,7 +789,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.001],
+        "lr": [0.0001],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -808,9 +803,9 @@ if __name__ == "__main__":
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.55],
+        "early_end_pct": [0.2],
         "total_compare_tokens": [12 * 1024],
-        "beta2": [0.99, 0.975, 0.95, 0.925, 0.9],
+        "beta2": [0.975],
         "num_negatives": [None],
     }
 

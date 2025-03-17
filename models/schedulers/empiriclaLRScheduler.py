@@ -10,10 +10,11 @@ class EmpiricalLRScheduler:
     Track average loss in each chunk, pick the best LR for the next cycle.
     """
 
-    def __init__(self, optimizer, alpha=0.1, n=30):
+    def __init__(self, optimizer, alpha=0.1, n=30, min_lr=0.0):
         self.optimizer = optimizer
         self.alpha = alpha
         self.n = n
+        self.min_lr = min_lr
         self.chunk_size = n // 3
         self.last_loss = None
 
@@ -52,12 +53,16 @@ class EmpiricalLRScheduler:
         self.step_count += 1
         self.last_loss = loss
 
-        # If we've finished all 3 chunks in this cycle, pick the best and reset
+        # If we've finished all n chunks in this cycle, pick the best and reset
         if self.step_count == self.n:
             avg_losses = [self.chunk_losses[i] / self.chunk_size for i in range(3)]
             best_idx = min(range(3), key=lambda i: avg_losses[i])
             # Update base_lr to best performing chunk
             self.base_lr = self.candidate_lrs[best_idx]
+
+            if self.base_lr < self.min_lr:
+                self.base_lr = self.min_lr
+
             self._set_lr(self.base_lr)
             self.step_count = 0
             self.chunk_losses = [0.0, 0.0, 0.0]
