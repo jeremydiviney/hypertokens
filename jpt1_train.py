@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import datetime
 import time
 import sys
+import inspect
 import random
 import math
 
@@ -441,6 +442,29 @@ def get_grad_accum_size(completion_percentage: float, batch_tokens: int, grad_ac
     return max(batch_tokens, min(grad_accum_size, max_facter * completion_percentage * grad_accum_size))
 
 
+def create_optimizer(model, lr, beta2, weight_decay=0.01):
+
+    # Separate parameters that should have weight decay applied from those that shouldn't
+    decay_params = []
+    no_decay_params = []
+
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optimizer_groups = [{"params": decay_params, "weight_decay": weight_decay}, {"params": nodecay_params, "weight_decay": 0.0}]
+
+    device_type = decay_params[0].device.type
+
+    # Create AdamW optimizer and use the fused version if it is available
+    fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and device_type == "cuda"
+
+    # Create optimizer with parameter groups
+    return optim.AdamW(optimizer_groups, lr=lr, betas=(0.9, beta2), fused=use_fused)
+
+
 def train_model(
     wandb,
     model,
@@ -453,13 +477,7 @@ def train_model(
 
     count_parameters(model)
 
-    # Create optimizer for both JPT1 and decoder model parameters
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config["lr"],
-        fused=True,
-        betas=(0.9, config["beta2"]),
-    )
+    optimizer = create_optimizer(model, config["lr"], config["beta2"], config["weight_decay"])
 
     seq_len = config["seq_len"]
     batch_size = config["batch_size"]
@@ -595,8 +613,7 @@ def train_model(
                         )
 
                     completion_percentage = log_step_count / logging_steps
-
-                scheduler.step(current_loss)
+                    scheduler.step(current_loss)
 
                 # Grad accum size is a function of the completion percentage we reach 100% at grad_accum_max_at completion
                 current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
@@ -782,14 +799,14 @@ def generate_text(
 
 if __name__ == "__main__":
 
-    bs = 24
+    bs = 12
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.0001],
+        "lr": [0.001],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -798,8 +815,8 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [bs * 1024 * 20],
-        "log_step_size": [bs * 1024 * 20 * 2],
+        "grad_accum_size": [2 * bs * 1024 * 20],
+        "log_step_size": [2 * bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
@@ -807,6 +824,7 @@ if __name__ == "__main__":
         "total_compare_tokens": [12 * 1024],
         "beta2": [0.975],
         "num_negatives": [None],
+        "weight_decay": [0.01, 0.1],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
