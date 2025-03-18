@@ -472,6 +472,8 @@ def train_model(
     tokens_since_step = 0
     tokens_since_grad_accum = 0
 
+    raw_model = model.module if distributed else model
+
     for epoch in range(config["epochs"]):
         batch_count = 0
 
@@ -498,7 +500,7 @@ def train_model(
             batch_count += 1
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
+                jpt_output, loss = inference_and_loss_step(dataset, raw_model, x, y, loss_fn)
 
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach().item()
@@ -947,6 +949,8 @@ if __name__ == "__main__":
                 val_dataloader,
                 experiment,
                 loss_fn,
+                distributed,
+                local_rank,
             )
             return model
 
