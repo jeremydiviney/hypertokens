@@ -11,11 +11,15 @@
             "internalConsoleOptions": "openOnSessionStart"
         },
         {
-            "name": "JPT1 Train Main",
+            "name": "Torchrun Debug Distributed",
             "type": "debugpy",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "program": "jpt1_train.py",
+            "module": "torch.distributed.run",
+            "args": [
+                "--nproc_per_node=1",
+                "jpt1_train.py"
+            ],
             "console": "internalConsole",
             "internalConsoleOptions": "openOnSessionStart"
         },

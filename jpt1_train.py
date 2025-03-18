@@ -12,7 +12,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.amp import autocast
 import torch.nn.functional as F
 from torch.utils.data.dataset import Dataset
@@ -28,6 +30,16 @@ from helpers.training import (
     save_model,
     enable_torch_optimizations,
     setup_flash_attention,
+)
+
+# Import distributed utilities
+from helpers.distributed_utils import (
+    setup_distributed,
+    cleanup_distributed,
+    get_model_for_training,
+    is_main_process,
+    get_world_size,
+    reduce_value,
 )
 
 
@@ -49,6 +61,7 @@ def evaluate_model(
     dataloader: DataLoader,
     device: str,
     loss_fn: torch.nn.Module,
+    distributed: bool = False,
 ) -> dict:
 
     model.eval()
@@ -59,8 +72,9 @@ def evaluate_model(
     batch_count = 0
 
     token_matches_total = 0
-
     token_total = 0
+
+    raw_model = model.module if distributed else model
 
     for x, y in dataloader:
 
@@ -73,34 +87,40 @@ def evaluate_model(
             total_loss += loss.item()
             batch_count += 1
 
-            if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = model.get_nearest_token_indices_cossim(jpt_output)
-            elif model.model_type == JPT1QuantModelType.L2_SIM:
-                pred_token_indices = model.get_nearest_token_indices_l2sim(jpt_output)
+            if raw_model.model_type == JPT1QuantModelType.COS_SIM:
+                pred_token_indices = raw_model.get_nearest_token_indices_cossim(jpt_output)
+            elif raw_model.model_type == JPT1QuantModelType.L2_SIM:
+                pred_token_indices = raw_model.get_nearest_token_indices_l2sim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
             pred_token_indices = pred_token_indices.detach().cpu().numpy()
 
-        pred_tokens = model.get_text_token_from_indices(pred_token_indices)
+        # Access the base model for token generation functions
 
-        target_tokens = model.get_text_token_from_indices(y.detach().cpu().numpy())
+        pred_tokens = raw_model.get_text_token_from_indices(pred_token_indices)
+        target_tokens = raw_model.get_text_token_from_indices(y.detach().cpu().numpy())
 
         accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.token_list["[PAD]"])
 
         token_matches_total += accuracy_metrics["token_matches"]
         token_total += accuracy_metrics["token_count"]
 
-        # print(f"Time taken to do evaluation step: {end_time - start_time:.4f} seconds")
-
         print(f"\nSample {batch_count}:")
-        # print(f"Target: {target_texts[0]}")
-        # print(f"Pred:   {pred_texts[0]}")
         print(f"Current token accuracy: {token_matches_total/token_total:.2%}")
 
+    # If distributed, reduce metrics across processes
+    if distributed:
+        total_loss = reduce_value(total_loss).item()
+        batch_count = reduce_value(batch_count).item()
+        token_matches_total = reduce_value(token_matches_total).item()
+        token_total = reduce_value(token_total).item()
+
     print("Generating text...")
+    # Generate text only on main process
+
     for _ in range(20):
-        generate_text(model, "Hello, I'm a language model,", 50, dataloader.dataset)
+        generate_text(raw_model, "Hello, I'm a language model,", 50, dataloader.dataset)
 
     result = {
         "val_loss": total_loss / batch_count,
@@ -330,90 +350,6 @@ class CustomLossL2Sim(torch.nn.Module):
 
         return loss
 
-    # def forward(self, model, hidden_states, target_indices):
-    #     batch_size, seq_length, hidden_dim = hidden_states.shape
-    #     vocab_size = model.lookup_embeddings.weight.size(0)
-
-    #     # Flatten tensors
-    #     flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
-    #     flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
-
-    #     # Ignore padding tokens
-    #     ignore_mask = flat_targets == self.ignore_index
-    #     flat_hidden = flat_hidden[~ignore_mask]
-    #     flat_targets = flat_targets[~ignore_mask]
-
-    #     # Get unique targets from the batch
-    #     unique_targets = torch.unique(flat_targets)
-
-    #     # Sample additional negative indices
-    #     num_batch_uniques = unique_targets.shape[0]
-    #     num_extra_samples = max(0, self.total_compare_tokens - num_batch_uniques)
-
-    #     # Sample from non-batch tokens
-    #     sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
-    #     sampling_mask[unique_targets] = False
-    #     valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
-
-    #     # Get extra negative indices
-    #     if num_extra_samples > 0 and len(valid_indices) > 0:
-    #         perm = torch.randperm(len(valid_indices), device=valid_indices.device)
-    #         num_to_sample = min(num_extra_samples, len(valid_indices))
-    #         extra_neg_indices = valid_indices[perm[:num_to_sample]]
-    #     else:
-    #         extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
-
-    #     # Combine all indices for comparisons
-    #     all_indices = torch.cat([unique_targets, extra_neg_indices])
-
-    #     # Get embeddings for all indices
-    #     all_embeddings = model.lookup_embeddings.weight
-    #     comparison_embeddings = all_embeddings[all_indices]  # [num_comparisons, hidden_dim]
-
-    #     # Compute L2 distances - we need to compute pairwise distances efficiently
-    #     # Using the formula ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
-
-    #     # Compute squared norms
-    #     hidden_norm_squared = torch.sum(flat_hidden**2, dim=1, keepdim=True)  # [batch*seq, 1]
-    #     embed_norm_squared = torch.sum(comparison_embeddings**2, dim=1, keepdim=True).t()  # [1, num_comparisons]
-
-    #     # Compute dot products
-    #     dot_products = torch.matmul(flat_hidden, comparison_embeddings.t())  # [batch*seq, num_comparisons]
-
-    #     # Compute squared L2 distances
-    #     l2_squared = hidden_norm_squared + embed_norm_squared - 2 * dot_products  # [batch*seq, num_comparisons]
-
-    #     # Convert distances to similarities (negative distances scaled by temperature)
-    #     # Lower distance = higher similarity
-    #     all_similarities = -l2_squared / model.temperature  # [batch*seq, num_comparisons]
-
-    #     # Create targets tensor - map each flat_target to its position in all_indices
-    #     indices_map = torch.zeros(vocab_size, dtype=torch.long, device=flat_hidden.device)
-    #     indices_map[all_indices] = torch.arange(len(all_indices), device=flat_hidden.device)
-
-    #     # Use the mapping to get the target positions
-    #     targets = indices_map[flat_targets]
-
-    #     # Apply cross entropy loss
-    #     loss = F.cross_entropy(all_similarities, targets)
-
-    #     return loss
-
-
-def compute_gate_loss(model: nn.Module, gate_weights: torch.Tensor, alpha: float = 2) -> torch.Tensor:
-
-    num_experts = gate_weights.shape[-1]
-
-    expert_usage = gate_weights.sum(dim=(0, 1))  # shape [num_experts]
-    total = expert_usage.sum()  # total "token mass"
-    usage_dist = expert_usage / total  # shape [num_experts]
-
-    alpha = num_experts / 3
-
-    uniform_dist = torch.full_like(usage_dist, 1.0 / num_experts)
-    balancing_loss = alpha * F.mse_loss(usage_dist, uniform_dist)
-    return balancing_loss
-
 
 def inference_and_loss_step(dataset, model, x, y, loss_fn):
 
@@ -472,8 +408,16 @@ def train_model(
     val_dataloader,
     config: dict,
     loss_fn: torch.nn.Module,
+    distributed: bool = False,
+    local_rank: int = 0,
 ):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+
+    # Prepare model for distributed training if needed
+    if distributed:
+        model = get_model_for_training(model, device, distributed, local_rank)
+    else:
+        model = model.to(device)
 
     count_parameters(model)
 
@@ -482,6 +426,9 @@ def train_model(
     seq_len = config["seq_len"]
     batch_size = config["batch_size"]
 
+    # Adjust batch tokens for distributed training
+    world_size = get_world_size(distributed)
+    effective_batch_size = batch_size * world_size
     batch_tokens = batch_size * seq_len
 
     log_step_count = 0
@@ -494,7 +441,13 @@ def train_model(
 
     grad_accum_max_at = config["grad_accum_max_at"]
 
-    logging_steps = 1 + (config["epochs"] * train_dataloader.dataset.token_count) // log_step_size
+    # Adjust logging steps based on world size
+    total_tokens = train_dataloader.dataset.token_count
+    if distributed:
+        # Scale by world size since each process sees only a portion of data
+        total_tokens = total_tokens * world_size
+
+    logging_steps = 1 + (config["epochs"] * total_tokens) // log_step_size
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -526,12 +479,15 @@ def train_model(
 
         train_step_start = time.time()
 
+        # Reset sampler for distributed training
+        if distributed:
+            train_dataloader.sampler.set_epoch(epoch)
+
         # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
         current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
         grad_accum_step_count = math.ceil(current_grad_accum_size / batch_tokens)
 
         for x, y in train_dataloader:
-            # start_time = time.time()
             x = x.to(device)
             y = y.to(device)
 
@@ -543,8 +499,6 @@ def train_model(
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
-                # logits = model(x, y)
-                # loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach().item()
@@ -566,51 +520,63 @@ def train_model(
                 # loss and timing stuff
                 current_loss = loss_accum
                 loss_accum = 0
+
+                # Reduce loss across all processes if distributed
+                if distributed:
+                    current_loss = reduce_value(current_loss, average=True).item()
+
                 loss_history.append(current_loss)
                 if len(loss_history) > 50:
                     loss_history.pop(0)
                 current_mean_loss = sum(loss_history) / len(loss_history)
-                tokens_per_second = tokens_since_grad_accum / (time.time() - train_step_start)
+
+                # Calculate tokens per second (accounting for all processes)
+                local_tokens_per_second = tokens_since_grad_accum / (time.time() - train_step_start)
+                tokens_per_second = local_tokens_per_second
+                if distributed:
+                    tokens_per_second = reduce_value(local_tokens_per_second, average=False).item()
 
                 tokens_since_grad_accum = 0
 
                 if current_mean_loss < low_loss:
                     low_loss = current_mean_loss
-                    print(
-                        f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f},Grad Norm: {norm:.2f}, Tokens per second: {tokens_per_second:.2f}"
-                    )
+                    if is_main_process(distributed, local_rank):
+                        print(
+                            f"\nNew low loss: {low_loss:.7f}, Batch Time: {time.time() - train_step_start:.2f},Grad Norm: {norm:.2f}, Tokens per second: {tokens_per_second:.2f}"
+                        )
 
                 if tokens_since_step >= log_step_size:
                     tokens_since_step = 0
                     log_step_count += 1
 
-                    wandb.log(
-                        {
-                            "loss": current_mean_loss,
-                            "learning_rate": optimizer.param_groups[0]["lr"],
-                            "epoch": epoch,
-                            "tokens_per_second": tokens_per_second,
-                            "current_grad_accum_size": current_grad_accum_size,
-                            "grad_norm": norm,
-                        }
-                    )
-
-                    if log_step_count % 200 == 0:
-                        eval_results = evaluate_model(model, val_dataloader, device, loss_fn)
-                        val_loss = eval_results["val_loss"]
-                        val_token_accuracy = eval_results["val_token_accuracy"]
+                    if is_main_process(distributed, local_rank):
                         wandb.log(
                             {
-                                "val_loss": val_loss,
-                                "val_token_accuracy": eval_results["val_token_accuracy"],
+                                "loss": current_mean_loss,
+                                "learning_rate": optimizer.param_groups[0]["lr"],
                                 "epoch": epoch,
+                                "tokens_per_second": tokens_per_second,
+                                "current_grad_accum_size": current_grad_accum_size,
+                                "grad_norm": norm,
                             }
                         )
-                        print(
-                            f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
-                            f"val_token_accuracy: {val_token_accuracy:.2%}"
-                            f"tokens_per_second: {tokens_per_second:.2f}"
-                        )
+
+                        if log_step_count % 200 == 0:
+                            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, distributed)
+                            val_loss = eval_results["val_loss"]
+                            val_token_accuracy = eval_results["val_token_accuracy"]
+                            wandb.log(
+                                {
+                                    "val_loss": val_loss,
+                                    "val_token_accuracy": eval_results["val_token_accuracy"],
+                                    "epoch": epoch,
+                                }
+                            )
+                            print(
+                                f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
+                                f"val_token_accuracy: {val_token_accuracy:.2%}"
+                                f"tokens_per_second: {tokens_per_second:.2f}"
+                            )
 
                     completion_percentage = log_step_count / logging_steps
                     scheduler.step(current_loss)
@@ -625,35 +591,30 @@ def train_model(
                 if early_end_pct is not None and completion_percentage > early_end_pct:
                     break
 
-            # print(
-            #     f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
-            #     f"val_token_accuracy: {val_token_accuracy:.2%}"
-            # )
-        # Final Evaluation
-        eval_results = evaluate_model(
-            model,
-            val_dataloader,
-            device,
-            loss_fn,
-        )
+        # Final Evaluation - only on main process
+        if is_main_process(distributed, local_rank):
+            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, distributed)
 
-        wandb.log(
-            {
-                "val_loss": eval_results["val_loss"],
-                "val_token_accuracy": eval_results["val_token_accuracy"],
-                "epoch": epoch,
-            }
-        )
+            wandb.log(
+                {
+                    "val_loss": eval_results["val_loss"],
+                    "val_token_accuracy": eval_results["val_token_accuracy"],
+                    "epoch": epoch,
+                }
+            )
+
+    if is_main_process(distributed, local_rank):
         train_time_end = time.time()
+        print(f"Training time: {train_time_end - train_time_start:.4f} seconds")
 
-    print(f"Training time: {train_time_end - train_time_start:.4f} seconds")
+        # Save both models
+        save_dir = "saved_models"
+        timestamp = datetime.now().isoformat()
+        model_name = f"jpt1_{timestamp}"
 
-    # Save both models
-    save_dir = "saved_models"
-    timestamp = datetime.now().isoformat()
-    model_name = f"jpt1_{timestamp}"
-
-    save_model(model, save_dir, f"{model_name}_jpt1")
+        # Get model without DDP wrapper for saving
+        model_to_save = model.module if distributed else model
+        save_model(model_to_save, save_dir, f"{model_name}_jpt1")
 
     return model
 
@@ -797,7 +758,27 @@ def generate_text(
     return final_text
 
 
+# Update the main function to support torchrun
 if __name__ == "__main__":
+    # Initialize distributed environment if run with torchrun
+    distributed = False
+    local_rank = 0
+    world_size = 1
+    rank = 0
+    # Check if we're running under torchrun by looking for environment variables
+    if "LOCAL_RANK" in os.environ:
+        distributed = True
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+
+        # Initialize distributed process group
+        setup_distributed(local_rank, world_size)
+
+        # Set device for this process
+        torch.cuda.set_device(local_rank)
+
+        print(f"Initialized process {local_rank}/{world_size}")
 
     bs = 12
     # Define experiments
@@ -832,8 +813,6 @@ if __name__ == "__main__":
     enable_torch_optimizations()
     setup_flash_attention()
 
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
     is_debugging = sys.gettrace() is not None
 
     for experiment in experiments:
@@ -851,14 +830,23 @@ if __name__ == "__main__":
         dset_ratio = experiment["dset_ratio"]
         total_compare_tokens = experiment["total_compare_tokens"]
         num_negatives = experiment["num_negatives"]
-        # load this just to get the vocab size
 
         dataset_name = "fineweb-10BT-edu"
 
         hf_dataset = load_hf_dataset(dataset_name)
 
-        text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
-        tokenizer = get_or_train_tokenizer(text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
+        # Only load/train tokenizer on main process to avoid conflicts
+        if is_main_process(distributed, local_rank):
+            text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
+            tokenizer = get_or_train_tokenizer(
+                text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json"
+            )
+
+        if distributed:
+            torch.distributed.barrier()
+
+        # Other processes wait for main process to finish tokenizer
+        tokenizer = Tokenizer.from_file(f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
 
         loss_fn = None
         if output_type == JPT1QuantModelType.COS_SIM:
@@ -882,34 +870,6 @@ if __name__ == "__main__":
 
         vocab_size = len(tokenizer.get_vocab())
 
-        gpt_model = JPT1Quantized(
-            token_space_dim=token_space_dim,
-            seq_len=seq_len,
-            embed_dim=jpt_embed_dim,
-            num_head=num_head,
-            num_layers=n_layers,
-            dropout=dropout,
-            tokenizer=tokenizer,
-            model_type=output_type,
-        ).to(DEVICE)
-
-        # only if not debugging
-        if sys.gettrace() is None:  # No debugger attached
-            print("Compiling models...")
-            gpt_model = torch.compile(gpt_model)
-            loss_fn = torch.compile(loss_fn)
-
-            print("Models compiled!")
-
-        dataloader = DataLoader(
-            dataset_train,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=8,
-            pin_memory=True,
-            prefetch_factor=8,
-        )
-
         val_dataset = Fineweb10BDataset(
             seq_len=seq_len,
             type="validation",
@@ -919,36 +879,81 @@ if __name__ == "__main__":
             dataset_name=dataset_name,
         )
 
+        # Create model
+        gpt_model = JPT1Quantized(
+            token_space_dim=token_space_dim,
+            seq_len=seq_len,
+            embed_dim=jpt_embed_dim,
+            num_head=num_head,
+            num_layers=n_layers,
+            dropout=dropout,
+            tokenizer=tokenizer,
+            model_type=output_type,
+        )
+
+        # Only compile model if not debugging and not distributed
+        # (compiled models can cause issues with distributed training)
+        should_compile = sys.gettrace() is None
+        if should_compile:
+            print("Compiling models...")
+            gpt_model = torch.compile(gpt_model)
+            loss_fn = torch.compile(loss_fn)
+            print("Models compiled!")
+
+        project_name = "jpt1"
+        exp_name = f"{project_name}-sl:{experiment['seq_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['num_head']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"
+
+        # Create distributed samplers if running distributed
+
+        train_sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=local_rank, shuffle=True)
+
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+
+        train_dataloader = DataLoader(
+            dataset_train,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=4,  # Reduced for distributed setting
+            pin_memory=True,
+            prefetch_factor=4,  # Reduced for distributed setting
+        )
+
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            num_workers=8,
+            sampler=val_sampler,
+            num_workers=4,
             pin_memory=True,
-            prefetch_factor=8,
+            prefetch_factor=4,
         )
 
-        verify_model_params(experiment)
+        # Initialize wandb only on main process
+        wandb_run = None
+        if is_main_process(distributed, local_rank):
+            import wandb
 
-        # create wrapper function for train_model
+            wandb_run = wandb.init(project=project_name, name=exp_name, config=experiment)
+
+        # Finish wandb run on main process
+        if is_main_process(distributed, local_rank) and wandb_run is not None:
+            wandb_run.finish()
+
+        # Create wrapper function for train_model
         def train_model_lambda(wandb):
             model = train_model(
                 wandb,
                 gpt_model,
-                dataloader,
+                train_dataloader,
                 val_dataloader,
                 experiment,
                 loss_fn,
             )
             return model
 
-        project_name = "jpt1"
-        exp_name = f"{project_name}-sl:{experiment['seq_len']}-e:{experiment['epochs']}-bs:{experiment['batch_size']}-lr:{experiment['lr']}-hs:{experiment['num_head']}-nl:{experiment['n_layers']}-ed:{experiment['jpt_embed_dim']}-ts:{experiment['token_space_dim']}"
-
         run_experiment(project_name, train_model_lambda, exp_name, experiment)
 
-        # generate_text(
-        #     gptModel, h_decoder_model, "Hello, world!", 100, hypertoken_seq_len, dataset
-        # )
-
+    # Clean up distributed resources
+    if distributed:
+        cleanup_distributed()
 
 print("Training Complete")

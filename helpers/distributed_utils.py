@@ -8,11 +8,12 @@ def setup_distributed(rank, world_size):
     """
     Setup distributed training environment
     """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    # os.environ["MASTER_ADDR"] = "localhost"
+    # os.environ["MASTER_PORT"] = "12355"
 
     # Initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    print(f"Initialized process group with rank {rank} and world size {world_size}")
 
 
 def cleanup_distributed():
