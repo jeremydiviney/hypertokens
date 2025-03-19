@@ -6,6 +6,7 @@ from torch import nn
 import torch
 
 import wandb
+from helpers.distributed_utils import is_main_process
 
 
 def get_gpu_memory_gb() -> float:
@@ -73,46 +74,50 @@ def save_project_files_as_artifact(wandb_run):
     wandb_run.log_artifact(artifact)
 
 
-def run_experiment(projectName, train_model, exp_name, config: dict) -> None:
+def run_experiment(projectName, train_model, exp_name, distributed, local_rank, config: dict) -> None:
 
-    # Initialize wandb
-    wandb.login(key="2a4c6ae7fe4efb074b06e1bb9eca12afba05e310")
+    if is_main_process(distributed, local_rank):
 
-    wandb.init(
-        project=projectName,
-        config=config,
-        name=exp_name,
-    )
+        # Initialize wandb
+        wandb.login(key="2a4c6ae7fe4efb074b06e1bb9eca12afba05e310")
 
-    # Track time and memory
-    start_time = time.time()
+        wandb.init(
+            project=projectName,
+            config=config,
+            name=exp_name,
+        )
 
-    # Save source code at start of run
-    save_project_files_as_artifact(wandb.run)
+        # Track time and memory
+        start_time = time.time()
+
+        # Save source code at start of run
+        save_project_files_as_artifact(wandb.run)
 
     # Train model and get parameters count
     train_model = train_model(wandb)
 
     total_params, params_by_layer = count_parameters(train_model)
 
-    # Log parameters count
-    wandb.log({"total_parameters": total_params, "run_id": wandb.run.id})
+    if is_main_process(distributed, local_rank):
 
-    gpu_memory_usage = get_gpu_memory_gb()
+        # Log parameters count
+        wandb.log({"total_parameters": total_params, "run_id": wandb.run.id})
 
-    # Log time and memory metrics
-    end_time = time.time()
-    duration = end_time - start_time
+        gpu_memory_usage = get_gpu_memory_gb()
 
-    wandb.log(
-        {
-            "duration_seconds": duration,
-            "duration_per_epoch_seconds": duration / config["epochs"],
-            "gpu_memory_usage_gb": gpu_memory_usage,
-        }
-    )
+        # Log time and memory metrics
+        end_time = time.time()
+        duration = end_time - start_time
 
-    wandb.finish()
+        wandb.log(
+            {
+                "duration_seconds": duration,
+                "duration_per_epoch_seconds": duration / config["epochs"],
+                "gpu_memory_usage_gb": gpu_memory_usage,
+            }
+        )
+
+        wandb.finish()
 
 
 def create_experiments(mode="cartesian", **param_lists):

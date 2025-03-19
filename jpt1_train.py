@@ -443,9 +443,6 @@ def train_model(
 
     # Adjust logging steps based on world size
     total_tokens = train_dataloader.dataset.token_count
-    if distributed:
-        # Scale by world size since each process sees only a portion of data
-        total_tokens = total_tokens * world_size
 
     logging_steps = 1 + (config["epochs"] * total_tokens) // log_step_size
 
@@ -510,8 +507,8 @@ def train_model(
 
                 # Add gradient clipping
                 norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    4.0 if model.model_type == JPT1QuantModelType.COS_SIM or model.model_type == JPT1QuantModelType.L2_SIM else 1,
+                    raw_model.parameters(),
+                    4.0 if raw_model.model_type == JPT1QuantModelType.COS_SIM or raw_model.model_type == JPT1QuantModelType.L2_SIM else 1,
                 )
 
                 optimizer.step()
@@ -929,17 +926,6 @@ if __name__ == "__main__":
             prefetch_factor=4,
         )
 
-        # Initialize wandb only on main process
-        wandb_run = None
-        if is_main_process(distributed, local_rank):
-            import wandb
-
-            wandb_run = wandb.init(project=project_name, name=exp_name, config=experiment)
-
-        # Finish wandb run on main process
-        if is_main_process(distributed, local_rank) and wandb_run is not None:
-            wandb_run.finish()
-
         # Create wrapper function for train_model
         def train_model_lambda(wandb):
             model = train_model(
@@ -954,7 +940,7 @@ if __name__ == "__main__":
             )
             return model
 
-        run_experiment(project_name, train_model_lambda, exp_name, experiment)
+        run_experiment(project_name, train_model_lambda, exp_name, distributed, local_rank, experiment)
 
     # Clean up distributed resources
     if distributed:
