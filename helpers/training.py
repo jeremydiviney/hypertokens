@@ -61,14 +61,16 @@ def enable_torch_optimizations():
 def setup_flash_attention():
     # Enable Flash Attention if available
     if torch.cuda.is_available():
-        flash_available = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
-        print(f"Flash Attention available and enabled: {flash_available}")
+        # flash_available = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
+        # flash_available = torch.nn.attention.sdpa_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
+
+        print(f"Flash Attention available and enabled")
         # Enable Flash Attention
         torch.backends.cuda.enable_flash_sdp(True)
         # Enable Math Flash Attention (more efficient math operations)
         torch.backends.cuda.enable_math_sdp(True)
         # Enable Memory Efficient Attention
         torch.backends.cuda.enable_mem_efficient_sdp(True)
-        return flash_available
+        # return flash_available
     print("CUDA not available, Flash Attention disabled")
     return False

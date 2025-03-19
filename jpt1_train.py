@@ -428,7 +428,7 @@ def train_model(
 
     # Adjust batch tokens for distributed training
     world_size = get_world_size(distributed)
-    effective_batch_size = batch_size * world_size
+
     batch_tokens = batch_size * seq_len
 
     log_step_count = 0
@@ -443,6 +443,9 @@ def train_model(
 
     # Adjust logging steps based on world size
     total_tokens = train_dataloader.dataset.token_count
+
+    assert log_step_size % (grad_accum_size * world_size) == 0, "log_step_size must be divisible by grad_accum_size * world_size"
+    assert log_step_size >= (grad_accum_size * world_size), "log_step_size must be greater than or equal to grad_accum_size * world_size"
 
     logging_steps = 1 + (config["epochs"] * total_tokens) // log_step_size
 
@@ -484,7 +487,7 @@ def train_model(
 
         # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
         current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
-        grad_accum_step_count = math.ceil(current_grad_accum_size / batch_tokens)
+        grad_accum_step_count = math.ceil(current_grad_accum_size / (batch_tokens * world_size))
 
         for x, y in train_dataloader:
             x = x.to(device)
@@ -500,40 +503,34 @@ def train_model(
                 jpt_output, loss = inference_and_loss_step(dataset, raw_model, x, y, loss_fn)
 
             loss = loss / grad_accum_step_count
-            loss_accum += loss.detach().item()
+            loss_accum += loss.detach()
             loss.backward()
 
             if tokens_since_grad_accum >= current_grad_accum_size:
 
                 # Add gradient clipping
-                norm = torch.nn.utils.clip_grad_norm_(
-                    raw_model.parameters(),
-                    4.0 if raw_model.model_type == JPT1QuantModelType.COS_SIM or raw_model.model_type == JPT1QuantModelType.L2_SIM else 1,
-                )
+                norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1)
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 torch.cuda.synchronize()
 
-                # loss and timing stuff
                 current_loss = loss_accum
-                loss_accum = 0
 
                 # Reduce loss across all processes if distributed
                 if distributed:
-                    current_loss = reduce_value(current_loss, average=True).item()
+                    current_loss = reduce_value(loss_accum, average=True).item()
 
                 loss_history.append(current_loss)
                 if len(loss_history) > 50:
                     loss_history.pop(0)
                 current_mean_loss = sum(loss_history) / len(loss_history)
 
+                loss_accum = 0
+
                 # Calculate tokens per second (accounting for all processes)
-                local_tokens_per_second = tokens_since_grad_accum / (time.time() - train_step_start)
-                tokens_per_second = local_tokens_per_second
-                if distributed:
-                    tokens_per_second = reduce_value(local_tokens_per_second, average=False).item()
+                tokens_per_second = world_size * tokens_since_grad_accum / (time.time() - train_step_start)
 
                 tokens_since_grad_accum = 0
 
@@ -810,7 +807,7 @@ if __name__ == "__main__":
     experiments = create_experiments(mode="paired", **experiments)
 
     enable_torch_optimizations()
-    setup_flash_attention()
+    # setup_flash_attention()
 
     is_debugging = sys.gettrace() is not None
 
