@@ -72,5 +72,6 @@ def setup_flash_attention():
         # Enable Memory Efficient Attention
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         # return flash_available
+        return True
     print("CUDA not available, Flash Attention disabled")
     return False

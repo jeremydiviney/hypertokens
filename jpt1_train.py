@@ -444,8 +444,9 @@ def train_model(
     # Adjust logging steps based on world size
     total_tokens = train_dataloader.dataset.token_count
 
-    assert log_step_size % (grad_accum_size * world_size) == 0, "log_step_size must be divisible by grad_accum_size * world_size"
-    assert log_step_size >= (grad_accum_size * world_size), "log_step_size must be greater than or equal to grad_accum_size * world_size"
+    assert log_step_size % (grad_accum_size) == 0, "log_step_size must be divisible by grad_accum_size"
+    assert log_step_size >= (grad_accum_size), "log_step_size must be greater than or equal to grad_accum_size * world_size"
+    assert grad_accum_size % (batch_tokens * world_size) == 0, "grad_accum_size must be divisible by batch_size * world_size"
 
     logging_steps = 1 + (config["epochs"] * total_tokens) // log_step_size
 
@@ -493,7 +494,7 @@ def train_model(
             x = x.to(device)
             y = y.to(device)
 
-            tokens_processed = x.shape[0] * x.shape[1]
+            tokens_processed = x.shape[0] * x.shape[1] * world_size
             tokens_since_step += tokens_processed
             tokens_since_grad_accum += tokens_processed
 
@@ -530,7 +531,7 @@ def train_model(
                 loss_accum = 0
 
                 # Calculate tokens per second (accounting for all processes)
-                tokens_per_second = world_size * tokens_since_grad_accum / (time.time() - train_step_start)
+                tokens_per_second = tokens_since_grad_accum / (time.time() - train_step_start)
 
                 tokens_since_grad_accum = 0
 
@@ -776,7 +777,7 @@ if __name__ == "__main__":
 
         print(f"Initialized process {local_rank}/{world_size}")
 
-    bs = 12
+    bs = 24
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
@@ -792,8 +793,8 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.COS_SIM,
         ],
-        "grad_accum_size": [2 * bs * 1024 * 20],
-        "log_step_size": [2 * bs * 1024 * 20 * 2],
+        "grad_accum_size": [bs * 1024 * 7],
+        "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
@@ -807,7 +808,7 @@ if __name__ == "__main__":
     experiments = create_experiments(mode="paired", **experiments)
 
     enable_torch_optimizations()
-    # setup_flash_attention()
+    setup_flash_attention()
 
     is_debugging = sys.gettrace() is not None
 
