@@ -752,7 +752,7 @@ if __name__ == "__main__":
 
         print(f"Initialized process {local_rank}/{world_size}")
 
-    bs = 12
+    bs = 24
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
@@ -766,17 +766,17 @@ if __name__ == "__main__":
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.STANDARD_SAMPLED,
+            JPT1QuantModelType.STANDARD,
         ],
         "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.15],
+        "early_end_pct": [0.4],
         "total_compare_tokens": [50304],
         "beta2": [0.975],
-        "weight_decay": [0.01, 0.1],
+        "weight_decay": [0.01, 0.05, 0.1, 0.2],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
