@@ -61,8 +61,10 @@ def evaluate_model(
     dataloader: DataLoader,
     device: str,
     loss_fn: torch.nn.Module,
-    distributed: bool = False,
+    local_rank: int,
 ) -> dict:
+
+    assert local_rank == 0, "Evaluation must be done on main process"
 
     model.eval()
 
@@ -74,23 +76,19 @@ def evaluate_model(
     token_matches_total = 0
     token_total = 0
 
-    raw_model = model.module if distributed else model
-
     for x, y in dataloader:
 
         x = x.to(device)
         y = y.to(device)
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            jpt_output, loss = inference_and_loss_step(dataset, model, x, y, loss_fn)
+            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, False)
 
             total_loss += loss.item()
             batch_count += 1
 
-            if raw_model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = raw_model.get_nearest_token_indices_cossim(jpt_output)
-            elif raw_model.model_type == JPT1QuantModelType.L2_SIM:
-                pred_token_indices = raw_model.get_nearest_token_indices_l2sim(jpt_output)
+            if model.model_type == JPT1QuantModelType.COS_SIM:
+                pred_token_indices = model.get_nearest_token_indices_cossim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
@@ -98,8 +96,8 @@ def evaluate_model(
 
         # Access the base model for token generation functions
 
-        pred_tokens = raw_model.get_text_token_from_indices(pred_token_indices)
-        target_tokens = raw_model.get_text_token_from_indices(y.detach().cpu().numpy())
+        pred_tokens = model.get_text_token_from_indices(pred_token_indices)
+        target_tokens = model.get_text_token_from_indices(y.detach().cpu().numpy())
 
         accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.token_list["[PAD]"])
 
@@ -109,18 +107,13 @@ def evaluate_model(
         print(f"\nSample {batch_count}:")
         print(f"Current token accuracy: {token_matches_total/token_total:.2%}")
 
-    # If distributed, reduce metrics across processes
-    if distributed:
-        total_loss = reduce_value(total_loss).item()
-        batch_count = reduce_value(batch_count).item()
-        token_matches_total = reduce_value(token_matches_total).item()
-        token_total = reduce_value(token_total).item()
-
     print("Generating text...")
     # Generate text only on main process
 
     for _ in range(20):
-        generate_text(raw_model, "Hello, I'm a language model,", 50, dataloader.dataset)
+        generate_text(model, "Hello, I'm a language model,", 50, dataloader.dataset, 0.5, local_rank)
+
+    # sync all distributed processes
 
     result = {
         "val_loss": total_loss / batch_count,
@@ -131,10 +124,10 @@ def evaluate_model(
     return result
 
 
-def inference_step(model, x):
+def inference_step(model, x, inference_only: bool):
 
-    model_output = model(x)
-    return model_output
+    model_output, pre_output = model(x, inference_only)
+    return model_output, pre_output
 
 
 def analyze_embedding_clustering(model):
@@ -198,6 +191,71 @@ def compute_logits_with_extras(model, hidden_states, target_indices):
     new_targets = mapping[target_flat]
 
     return logits, new_targets
+
+
+class CustomSampledLoss(torch.nn.Module):
+    def __init__(self, ignore_index: int, total_compare_tokens: int):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.total_compare_tokens = total_compare_tokens
+
+    def forward(self, model, hidden_states, target_indices):
+        batch_size, seq_length, hidden_dim = hidden_states.shape
+        vocab_size = model.lookup_embeddings.weight.size(0)
+
+        # Flatten tensors
+        flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
+        flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
+
+        # Ignore padding tokens
+        ignore_mask = flat_targets == self.ignore_index
+        flat_hidden = flat_hidden[~ignore_mask]
+        flat_targets = flat_targets[~ignore_mask]
+
+        all_embeddings = model.lookup_embeddings.weight
+
+        # Get unique targets from the batch
+        unique_targets = torch.unique(flat_targets)
+
+        # Sample additional negative indices
+        # Target number of negative samples
+        num_batch_uniques = unique_targets.shape[0]
+        num_extra_samples = max(0, self.total_compare_tokens - num_batch_uniques)
+
+        # Sample from non-batch tokens
+        sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
+        sampling_mask[unique_targets] = False
+        valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
+
+        # Get extra negative indices
+        if num_extra_samples > 0 and len(valid_indices) > 0:
+            perm = torch.randperm(len(valid_indices), device=valid_indices.device)
+            num_to_sample = min(num_extra_samples, len(valid_indices))
+            extra_neg_indices = valid_indices[perm[:num_to_sample]]
+        else:
+            extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
+
+        # Combine all indices for comparisons - positives first, then uniques, then extras
+        all_indices = torch.cat([unique_targets, extra_neg_indices])  # Include all unique targets (which includes all positives)
+
+        # Get embeddings for all indices
+        comparison_embeddings = all_embeddings[all_indices]  # [num_comparisons, hidden_dim]
+
+        # Compute all similarities at once
+        all_similarities = torch.matmul(flat_hidden, comparison_embeddings.t())
+
+        # Create targets tensor - map each flat_target to its position in all_indices
+        # First create a mapping from token IDs to their positions in all_indices
+        indices_map = torch.zeros(vocab_size, dtype=torch.long, device=flat_hidden.device)
+        indices_map[all_indices] = torch.arange(len(all_indices), device=flat_hidden.device)
+
+        # Use the mapping to get the target positions
+        targets = indices_map[flat_targets]
+
+        # Apply cross entropy loss
+        loss = F.cross_entropy(all_similarities, targets)
+
+        return loss
 
 
 class CustomLossCosSim(torch.nn.Module):
@@ -267,100 +325,19 @@ class CustomLossCosSim(torch.nn.Module):
         return loss
 
 
-class CustomLossL2Sim(torch.nn.Module):
-    def __init__(self, ignore_index: int, total_compare_tokens: int, num_negatives: int):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.total_compare_tokens = total_compare_tokens
-        self.num_negatives = num_negatives
-
-    def forward(self, model, hidden_states, target_indices):
-        batch_size, seq_length, hidden_dim = hidden_states.shape
-
-        num_negatives = self.num_negatives
-
-        # Flatten tensors
-        flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
-        flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
-
-        # Ignore padding tokens
-        ignore_mask = flat_targets == self.ignore_index
-        flat_hidden = flat_hidden[~ignore_mask]
-        flat_targets = flat_targets[~ignore_mask]
-
-        # Get embeddings
-        embeddings = model.lookup_embeddings.weight  # [vocab_size, hidden_dim]
-        num_tokens = flat_hidden.size(0)
-        vocab_size = embeddings.size(0)
-
-        # Get target embeddings for each token
-        target_embeddings = embeddings[flat_targets]  # [num_tokens, hidden_dim]
-
-        # Calculate positive products and norms
-        pos_product = flat_hidden * target_embeddings  # [num_tokens, hidden_dim]
-        pos_norms = torch.norm(pos_product, p=2, dim=1)  # [num_tokens]
-
-        # Sample random negative indices for each token
-        # Generate a matrix of shape [num_tokens, num_negatives]
-        neg_indices = torch.randint(0, vocab_size, (num_tokens, num_negatives), device=flat_hidden.device)
-
-        # Create a mask to identify where negative indices match targets
-        # Expand targets to compare with each negative: [num_tokens, 1] vs [num_tokens, num_negatives]
-        targets_expanded = flat_targets.unsqueeze(1).expand(-1, num_negatives)
-        match_mask = neg_indices == targets_expanded
-
-        # Replace matching indices with (target + 1) % vocab_size
-        if match_mask.any():
-            # Where there's a match, get the corresponding target value
-            replacement_values = (targets_expanded[match_mask] + 1) % vocab_size
-            # Use scatter to replace only the matched positions
-            neg_indices = neg_indices.clone()  # Create a copy to modify
-            neg_indices[match_mask] = replacement_values
-
-        # Reshape indices for gathering: [num_tokens * num_negatives]
-        neg_indices_flat = neg_indices.reshape(-1)
-
-        # Get all negative embeddings at once
-        neg_embeddings_flat = embeddings[neg_indices_flat]  # [num_tokens * num_negatives, hidden_dim]
-
-        # Reshape back to [num_tokens, num_negatives, hidden_dim]
-        neg_embeddings = neg_embeddings_flat.reshape(num_tokens, num_negatives, hidden_dim)
-
-        # Expand hidden states for broadcasting with negative embeddings
-        hidden_expanded = flat_hidden.unsqueeze(1).expand(-1, num_negatives, -1)  # [num_tokens, num_negatives, hidden_dim]
-
-        # Element-wise multiply hidden states with negative embeddings
-        neg_products = hidden_expanded * neg_embeddings  # [num_tokens, num_negatives, hidden_dim]
-
-        # Calculate norms for all negative products
-        neg_norms = torch.norm(neg_products, p=2, dim=2)  # [num_tokens, num_negatives]
-
-        # Combine positive and negative logits
-        # First, reshape to match expected format
-        pos_logits = (-pos_norms / model.temperature).unsqueeze(1)  # [num_tokens, 1]
-        neg_logits = -neg_norms / model.temperature  # [num_tokens, num_negatives]
-
-        all_logits = torch.cat([pos_logits, neg_logits], dim=1)  # [num_tokens, 1+num_negatives]
-
-        # Target is always index 0 (positive example)
-        targets = torch.zeros(num_tokens, dtype=torch.long, device=flat_hidden.device)
-
-        # Calculate loss
-        loss = F.cross_entropy(all_logits, targets)
-
-        return loss
-
-
-def inference_and_loss_step(dataset, model, x, y, loss_fn):
+def inference_and_loss_step(model, x, y, loss_fn, training: bool):
 
     # Forward pass to get output embeddings
     # start_time = time.time()
-    model_output = inference_step(model, x)  # [batch_size, seq_len, embed_dim]
+    model_output, pre_output = inference_step(model, x, training)  # [batch_size, seq_len, embed_dim]
     # end_time = time.time()
     # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
-    if model.model_type == JPT1QuantModelType.COS_SIM or model.model_type == JPT1QuantModelType.L2_SIM:
+    if model.model_type == JPT1QuantModelType.COS_SIM:
         loss = loss_fn(model, model_output, y)
+        return model_output, loss
+    elif model.model_type == JPT1QuantModelType.STANDARD_SAMPLED:
+        loss = loss_fn(model, pre_output, y)  # get model output logits in this case
         return model_output, loss
     else:
         # For standard model types, compute logits normally and apply cross entropy over the vocab.
@@ -501,7 +478,7 @@ def train_model(
             batch_count += 1
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(dataset, raw_model, x, y, loss_fn)
+                jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
 
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
@@ -558,8 +535,8 @@ def train_model(
                             }
                         )
 
-                        if log_step_count % 200 == 0:
-                            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, distributed)
+                        if log_step_count % 100 == 0:
+                            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank)
                             val_loss = eval_results["val_loss"]
                             val_token_accuracy = eval_results["val_token_accuracy"]
                             wandb.log(
@@ -576,7 +553,7 @@ def train_model(
                             )
 
                     completion_percentage = log_step_count / logging_steps
-                    scheduler.step(current_loss)
+                    scheduler.step()
 
                 # Grad accum size is a function of the completion percentage we reach 100% at grad_accum_max_at completion
                 current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
@@ -590,7 +567,7 @@ def train_model(
 
         # Final Evaluation - only on main process
         if is_main_process(distributed, local_rank):
-            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, distributed)
+            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank)
 
             wandb.log(
                 {
@@ -687,10 +664,13 @@ def generate_text(
     max_new_tokens: int,
     dataset: Fineweb10BDataset,
     temperature: float = 0.5,
+    local_rank: int = 0,
     device: str = "cuda",
 ) -> str:
     # Set models to eval mode
     model.eval()
+
+    assert local_rank == 0, "Text generation must be done on main process"
 
     print(f"\n\nPrompt: {prompt}", end="", flush=True)
 
@@ -711,10 +691,7 @@ def generate_text(
         x = torch.tensor(model.get_token_indices(tokens)).to(device)
         x = x.unsqueeze(0)
 
-        jpt_output = inference_step(model, x)
-
-        cur_batch_size = jpt_output.shape[0]
-        cur_seq_len = jpt_output.shape[1]
+        jpt_output, pre_output = inference_step(model, x, False)  # do final projection
 
         # Print the generated character
 
@@ -723,8 +700,6 @@ def generate_text(
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             if model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=50, temperature=temperature)
-            elif model.model_type == JPT1QuantModelType.L2_SIM:
-                pred_token_indices = model.get_nearest_token_indices_l2sim(last_token, top_k=50, temperature=temperature)
             else:
                 # Apply temperature and sample using top-k
                 logits = last_token.squeeze() / temperature
@@ -777,7 +752,7 @@ if __name__ == "__main__":
 
         print(f"Initialized process {local_rank}/{world_size}")
 
-    bs = 24
+    bs = 12
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
@@ -791,17 +766,16 @@ if __name__ == "__main__":
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.COS_SIM,
+            JPT1QuantModelType.STANDARD_SAMPLED,
         ],
-        "grad_accum_size": [bs * 1024 * 7],
+        "grad_accum_size": [bs * 1024 * 20],
         "log_step_size": [bs * 1024 * 20 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
-        "early_end_pct": [0.2],
-        "total_compare_tokens": [12 * 1024],
+        "early_end_pct": [0.15],
+        "total_compare_tokens": [50304],
         "beta2": [0.975],
-        "num_negatives": [None],
         "weight_decay": [0.01, 0.1],
     }
 
@@ -826,14 +800,12 @@ if __name__ == "__main__":
         log_step_size = experiment["log_step_size"]
         dset_ratio = experiment["dset_ratio"]
         total_compare_tokens = experiment["total_compare_tokens"]
-        num_negatives = experiment["num_negatives"]
 
         dataset_name = "fineweb-10BT-edu"
 
-        hf_dataset = load_hf_dataset(dataset_name)
-
         # Only load/train tokenizer on main process to avoid conflicts
         if is_main_process(distributed, local_rank):
+            hf_dataset = load_hf_dataset(dataset_name)
             text_corpus_iterator = (item["text"] for item in hf_dataset["train"])
             tokenizer = get_or_train_tokenizer(
                 text_corpus_iterator, vocab_size, f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json"
@@ -842,16 +814,15 @@ if __name__ == "__main__":
         if distributed:
             torch.distributed.barrier()
 
+        hf_dataset = load_hf_dataset(dataset_name)
         # Other processes wait for main process to finish tokenizer
         tokenizer = Tokenizer.from_file(f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
 
         loss_fn = None
         if output_type == JPT1QuantModelType.COS_SIM:
             loss_fn = CustomLossCosSim(ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens)
-        elif output_type == JPT1QuantModelType.L2_SIM:
-            loss_fn = CustomLossL2Sim(
-                ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens, num_negatives=num_negatives
-            )
+        if output_type == JPT1QuantModelType.STANDARD_SAMPLED:
+            loss_fn = CustomSampledLoss(ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens)
         else:
             loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
 

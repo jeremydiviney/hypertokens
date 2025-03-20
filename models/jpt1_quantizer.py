@@ -13,8 +13,8 @@ from tokenizers import Tokenizer
 
 class JPT1QuantModelType(Enum):
     COS_SIM = "cossim"
-    L2_SIM = "l2sim"
     STANDARD = "standard"
+    STANDARD_SAMPLED = "standard_sampled"
 
 
 class CausalSelfAttention(nn.Module):
@@ -149,8 +149,6 @@ class JPT1Quantized(nn.Module):
 
         if model_type == JPT1QuantModelType.COS_SIM:
             self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
-        elif model_type == JPT1QuantModelType.L2_SIM:
-            self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
         else:
             self.fc_out = nn.Linear(embed_dim, self.vocab_size)
             # Tie weights - share the embedding matrix with the output projection
@@ -185,7 +183,7 @@ class JPT1Quantized(nn.Module):
             # RMSNorm only has weight parameter (no bias)
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
         batch_size, seq_len = x.shape
         embedded = self.embeddings(x)
 
@@ -196,8 +194,13 @@ class JPT1Quantized(nn.Module):
         x = self.transformer(embedded)  # [B, S, embed_dim]
 
         x = self.fc_ln(x)
-        output = self.fc_out(x)
-        return output  # , gate_weights
+
+        if self.model_type == JPT1QuantModelType.STANDARD_SAMPLED and training:
+            output = x  # if sample based training, don't do final projection yet
+        else:
+            output = self.fc_out(x)
+
+        return output, x
 
     def get_nearest_token_indices_cossim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
         """
@@ -240,126 +243,6 @@ class JPT1Quantized(nn.Module):
 
         return final_indices
 
-    # def get_nearest_token_indices_l2sim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
-    #     """
-    #     Return the nearest token indices based on L2 distance similarity.
-    #     Memory-optimized version without loops.
-
-    #     Args:
-    #         projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
-    #         top_k (int): Number of candidates to sample from. If 1, returns argmin.
-    #         temperature (float): Temperature for sampling from the top_k candidates.
-
-    #     Returns:
-    #         torch.Tensor: [B, S] tensor of token indices.
-    #     """
-    #     batch_size, seq_len = projections.shape[:2]
-
-    #     # Compute L2 distances more efficiently
-    #     # Instead of explicitly calculating squared norms and dot products separately,
-    #     # we can use torch's cdist function which is optimized for this purpose
-
-    #     # Reshape projections to 2D for cdist
-    #     proj_flat = projections.reshape(-1, projections.size(-1))  # [B*S, E]
-
-    #     # Calculate pairwise distances efficiently
-    #     # We use squared L2 distance (p=2, squared=True)
-    #     distances = torch.cdist(proj_flat, self.lookup_embeddings.weight, p=2).pow(2)  # [B*S, V]
-
-    #     # Convert distances to similarities (negative distances)
-    #     similarity = -distances
-
-    #     if top_k == 1:
-    #         # For top_k=1, just return the argmax directly
-    #         indices_flat = similarity.argmax(dim=-1)  # [B*S]
-    #         return indices_flat.view(batch_size, seq_len)
-
-    #     # For top_k > 1, get top-k values and indices
-    #     topk_values, topk_indices = similarity.topk(k=top_k, dim=-1)  # [B*S, top_k]
-
-    #     # Apply temperature scaling and softmax
-    #     probs = F.softmax(topk_values / temperature, dim=-1)  # [B*S, top_k]
-
-    #     # Sample one index per position
-    #     chosen = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B*S]
-
-    #     # Map back to original indices and reshape
-    #     final_indices = torch.gather(topk_indices, dim=1, index=chosen.unsqueeze(-1)).squeeze(-1)  # [B*S]
-
-    #     return final_indices.view(batch_size, seq_len)
-
-    def get_nearest_token_indices_l2sim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
-        """
-        Return the nearest token indices based on L2 norm of element-wise products.
-        Extremely memory-efficient implementation that processes by dimension.
-
-        Args:
-            projections (torch.Tensor): [B, S, E] tensor of projected embeddings.
-            top_k (int): Number of candidates to sample from. If 1, returns argmax.
-            temperature (float): Temperature for sampling from the top_k candidates.
-
-        Returns:
-            torch.Tensor: [B, S] tensor of token indices.
-        """
-        batch_size, seq_len, hidden_dim = projections.shape
-        vocab_size = self.lookup_embeddings.weight.size(0)
-
-        # Reshape projections to 2D
-        proj_flat = projections.reshape(-1, hidden_dim)  # [B*S, E]
-        num_tokens = proj_flat.size(0)
-
-        # Process in batches to save memory
-        batch_size_tokens = num_tokens
-
-        # Initialize tensor to store results
-        all_similarities = torch.zeros(num_tokens, vocab_size, device=proj_flat.device)
-
-        for i in range(0, num_tokens, batch_size_tokens):
-            end_idx = min(i + batch_size_tokens, num_tokens)
-            current_batch = proj_flat[i:end_idx]  # [batch, E]
-            current_batch_size = end_idx - i
-
-            # Initialize squared norms accumulator for this batch
-            squared_norms = torch.zeros(current_batch_size, vocab_size, device=current_batch.device)
-
-            # Process dimension-by-dimension to avoid materializing the full tensor
-            for d in range(hidden_dim):
-                # Get the d-th dimension for batch of projections and all embeddings
-                h_d = current_batch[:, d].unsqueeze(1)  # [batch, 1]
-                e_d = self.lookup_embeddings.weight[:, d].unsqueeze(0)  # [1, V]
-
-                # Element-wise product for this dimension
-                product_d = h_d * e_d  # [batch, V]
-
-                # Add squared contribution to accumulated squared norms
-                squared_norms += product_d**2
-
-            # Take sqrt for L2 norm
-            norms = torch.sqrt(squared_norms + 1e-10)  # [batch, V]
-
-            # Store negative norms as similarities (smaller norm = higher similarity)
-            all_similarities[i:end_idx] = -norms
-
-        # Handle top-k selection
-        if top_k == 1:
-            # For top_k=1, just return the argmax directly
-            indices_flat = all_similarities.argmax(dim=-1)  # [B*S]
-            return indices_flat.view(batch_size, seq_len)
-
-        # For top_k > 1, get top-k values and indices
-        topk_values, topk_indices = all_similarities.topk(k=top_k, dim=-1)  # [B*S, top_k]
-
-        # Apply temperature scaling and softmax
-        probs = F.softmax(topk_values / temperature, dim=-1)  # [B*S, top_k]
-
-        # Sample one index per position
-        chosen = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B*S]
-
-        # Map back to original indices and reshape
-        final_indices = torch.gather(topk_indices, dim=1, index=chosen.unsqueeze(-1)).squeeze(-1)  # [B*S]
-
-        return final_indices.view(batch_size, seq_len)
-
     def get_token_indices(self, text_tokens: list[str]) -> list[int]:
         """
         Convert a list of text tokens to their corresponding indices.
@@ -373,62 +256,3 @@ class JPT1Quantized(nn.Module):
         decoded_tokens = self.tokenizer.decode_batch(indices)
         decoded_tokens = np.array(decoded_tokens)
         return decoded_tokens.reshape(shape)
-
-
-def grouped_batch_infoNCE_loss(model, hidden_states, target_indices, group_size=8):
-    """
-    InfoNCE loss computed by grouping batches into sets of batches per iteration.
-    Uses in-batch tokens for comparison with unique targets calculated per group.
-
-    Args:
-        model: Model
-        hidden_states: Hidden states tensor of shape [batch_size, seq_length, hidden_dim]
-        target_indices: Target token indices of shape [batch_size, seq_length]
-        group_size: Number of batches to process together in each iteration
-
-    Returns:
-        Average InfoNCE loss
-    """
-    batch_size = hidden_states.shape[0]
-    seq_length = hidden_states.shape[1]
-    total_loss = 0
-    num_groups = (batch_size + group_size - 1) // group_size  # Ceiling division
-
-    # Normalize all hidden states at once
-    hidden_states_norm = F.normalize(hidden_states, p=2, dim=2)
-
-    # Process batches in groups
-    for group_idx in range(num_groups):
-        # Determine the start and end indices for this group
-        group_start = group_idx * group_size
-        group_end = min(group_start + group_size, batch_size)
-        current_group_size = group_end - group_start
-
-        # Get all hidden states and targets for this group
-        group_hidden_norm = hidden_states_norm[group_start:group_end]  # [current_group_size, seq_length, hidden_dim]
-        group_targets = target_indices[group_start:group_end]  # [current_group_size, seq_length]
-
-        # Reshape to combine all sequences in the group
-        # From [current_group_size, seq_length, hidden_dim] to [current_group_size*seq_length, hidden_dim]
-        group_hidden_flat = group_hidden_norm.reshape(-1, group_hidden_norm.size(-1))
-        group_targets_flat = group_targets.reshape(-1)  # [current_group_size*seq_length]
-
-        # Find unique targets in this group
-        group_unique_targets, group_inverse = torch.unique(group_targets_flat, return_inverse=True)
-
-        # Get embeddings for unique targets and normalize
-        group_unique_embeds = model.lookup_embeddings(group_unique_targets)
-        group_unique_embeds_norm = F.normalize(group_unique_embeds, p=2, dim=1)
-
-        # Compute similarities for all tokens in the group against the group's unique embeddings
-        similarities = torch.matmul(group_hidden_flat, group_unique_embeds_norm.t()) / model.temperature
-
-        # Compute loss for the entire group
-        group_loss = F.cross_entropy(similarities, group_inverse)
-
-        # Weight the group loss by the number of batches in this group
-        # (to maintain proper averaging when not all groups have the same size)
-        total_loss += group_loss * current_group_size
-
-    # Return average loss
-    return total_loss / batch_size
