@@ -806,7 +806,7 @@ if __name__ == "__main__":
         "log_step_size": [bs * 1024 * 6 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.01],
-        "grad_accum_max_at": [0.00],
+        "grad_accum_max_at": [0.001],
         "early_end_pct": [0.35],
         "total_compare_tokens": [50304],
         "beta2": [0.95],
