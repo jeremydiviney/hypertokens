@@ -384,8 +384,8 @@ def create_optimizer(model, lr, beta2, weight_decay=0.01):
 
 
 @contextmanager
-def maybe_no_sync(model, condition):
-    if condition:
+def maybe_no_sync(model, distributed, condition):
+    if condition and distributed:
         with model.no_sync():
             yield
     else:
@@ -499,7 +499,7 @@ def train_model(
 
             sync_grads = distributed and current_grad_accum_step_count == (grad_accum_step_count - 1)
 
-            with maybe_no_sync(model, sync_grads):
+            with maybe_no_sync(model, distributed, sync_grads):
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
