@@ -590,10 +590,6 @@ def train_model(
                     if distributed:
                         torch.distributed.barrier()
 
-                # Grad accum size is a function of the completion percentage we reach 100% at grad_accum_max_at completion
-                current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
-                grad_accum_step_count = math.ceil(current_grad_accum_size / batch_tokens)
-
                 torch.cuda.synchronize()
                 train_step_start = time.time()
 
@@ -794,7 +790,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.0008],
+        "lr": [0.0008, 0.0004],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -803,15 +799,18 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [bs * 1024 * 7],
-        "log_step_size": [bs * 1024 * 7 * 3 * 2],
+        "grad_accum_size": [
+            bs * 1024 * 6 * 3,
+            bs * 1024 * 6,
+        ],
+        "log_step_size": [bs * 1024 * 6 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.01],
-        "grad_accum_max_at": [0.01],
+        "grad_accum_max_at": [0.00],
         "early_end_pct": [0.35],
         "total_compare_tokens": [50304],
         "beta2": [0.95],
-        "weight_decay": [0.01, 0.05, 0.1, 0.2],
+        "weight_decay": [0.01],  # [0.01, 0.05, 0.1, 0.2],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
