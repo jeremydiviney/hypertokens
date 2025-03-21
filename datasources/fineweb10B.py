@@ -205,7 +205,7 @@ class Fineweb10BDataset(Dataset):
 
         data_row_idx = int(self.selection_table_indices[pre_data_row_idx])  # lookup the master data index for the row
 
-        print(f"get_data_chunk: {idx}, self.selection_table: {len(self.selection_table)}, data_row_idx: {len(data_row_idx)}")
+        print(f"get_data_chunk: {idx}, self.selection_table: {len(self.selection_table)}, data_row_idx: {data_row_idx}")
 
         # Get the full text from the dataset
         full_text = self.hf_dataset["train"][data_row_idx]["text"]
