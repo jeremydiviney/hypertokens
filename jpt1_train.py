@@ -7,6 +7,8 @@ import inspect
 import random
 import math
 
+from contextlib import contextmanager
+
 import numpy as np
 
 import torch
@@ -381,6 +383,15 @@ def create_optimizer(model, lr, beta2, weight_decay=0.01):
     return optim.AdamW(optimizer_groups, lr=lr, betas=(0.9, beta2), fused=use_fused)
 
 
+@contextmanager
+def maybe_no_sync(model, condition):
+    if condition:
+        with model.no_sync():
+            yield
+    else:
+        yield
+
+
 def train_model(
     wandb,
     model,
@@ -466,6 +477,8 @@ def train_model(
         if distributed:
             train_dataloader.sampler.set_epoch(epoch)
 
+        current_grad_accum_step_count = 0
+
         for x, y in train_dataloader:
             x = x.to(device)
             y = y.to(device)
@@ -484,20 +497,28 @@ def train_model(
 
             batch_count += 1
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
+            sync_grads = distributed and current_grad_accum_step_count == (grad_accum_step_count - 1)
 
-            loss = loss / grad_accum_step_count
-            loss_accum += loss.detach()
-            loss.backward()
+            with maybe_no_sync(model, sync_grads):
+
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
+
+                loss = loss / grad_accum_step_count
+                loss_accum += loss.detach()
+
+                loss.backward()
+
+            current_grad_accum_step_count += 1
 
             if tokens_since_grad_accum >= current_grad_accum_size:
 
+                current_grad_accum_step_count = 0
                 # Add gradient clipping
                 norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1)
 
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
 
                 torch.cuda.synchronize()
 
@@ -510,6 +531,7 @@ def train_model(
                 loss_history.append(current_loss)
                 if len(loss_history) > 50:
                     loss_history.pop(0)
+
                 current_mean_loss = sum(loss_history) / len(loss_history)
 
                 loss_accum = 0
@@ -561,6 +583,9 @@ def train_model(
 
                     completion_percentage = log_step_count / logging_steps
                     scheduler.step()
+
+                    if distributed:
+                        torch.distributed.barrier()
 
                 # Grad accum size is a function of the completion percentage we reach 100% at grad_accum_max_at completion
                 current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
