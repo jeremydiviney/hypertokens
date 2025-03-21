@@ -803,8 +803,8 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [bs * 1024 * 7 * 3],
-        "log_step_size": [bs * 1024 * 7 * 3],
+        "grad_accum_size": [bs * 1024 * 7],
+        "log_step_size": [bs * 1024 * 7 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.01],
         "grad_accum_max_at": [0.01],
