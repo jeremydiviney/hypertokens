@@ -62,11 +62,14 @@ def evaluate_model(
     device: str,
     loss_fn: torch.nn.Module,
     local_rank: int,
+    distributed: bool,
 ) -> dict:
 
     assert local_rank == 0, "Evaluation must be done on main process"
 
     model.eval()
+
+    raw_model = model.module if distributed else model
 
     dataset = dataloader.dataset
 
@@ -82,13 +85,13 @@ def evaluate_model(
         y = y.to(device)
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, False)
+            jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, False)
 
             total_loss += loss.item()
             batch_count += 1
 
-            if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = model.get_nearest_token_indices_cossim(jpt_output)
+            if raw_model.model_type == JPT1QuantModelType.COS_SIM:
+                pred_token_indices = raw_model.get_nearest_token_indices_cossim(jpt_output)
             else:
                 pred_token_indices = jpt_output.argmax(dim=-1)
 
@@ -96,8 +99,8 @@ def evaluate_model(
 
         # Access the base model for token generation functions
 
-        pred_tokens = model.get_text_token_from_indices(pred_token_indices)
-        target_tokens = model.get_text_token_from_indices(y.detach().cpu().numpy())
+        pred_tokens = raw_model.get_text_token_from_indices(pred_token_indices)
+        target_tokens = raw_model.get_text_token_from_indices(y.detach().cpu().numpy())
 
         accuracy_metrics = calculate_token_accuracy(pred_tokens, target_tokens, dataset.token_list["[PAD]"])
 
@@ -111,7 +114,7 @@ def evaluate_model(
     # Generate text only on main process
 
     for _ in range(20):
-        generate_text(model, "Hello, I'm a language model,", 50, dataloader.dataset, 0.5, local_rank)
+        generate_text(raw_model, "Hello, I'm a language model,", 50, dataloader.dataset, 0.5, local_rank)
 
     # sync all distributed processes
 
@@ -463,10 +466,6 @@ def train_model(
         if distributed:
             train_dataloader.sampler.set_epoch(epoch)
 
-        # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
-        current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
-        grad_accum_step_count = math.ceil(current_grad_accum_size / (batch_tokens * world_size))
-
         for x, y in train_dataloader:
             x = x.to(device)
             y = y.to(device)
@@ -474,6 +473,14 @@ def train_model(
             tokens_processed = x.shape[0] * x.shape[1] * world_size
             tokens_since_step += tokens_processed
             tokens_since_grad_accum += tokens_processed
+
+            # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
+            current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
+            grad_accum_step_count = math.ceil(current_grad_accum_size / (batch_tokens * world_size))
+
+            if is_main_process(distributed, local_rank):
+                print(f"Current grad accum size: {current_grad_accum_size}")
+                print(f"Grad accum step count: {grad_accum_step_count}")
 
             batch_count += 1
 
@@ -536,7 +543,7 @@ def train_model(
                         )
 
                         if log_step_count % 100 == 0:
-                            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank)
+                            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
                             val_loss = eval_results["val_loss"]
                             val_token_accuracy = eval_results["val_token_accuracy"]
                             wandb.log(
@@ -567,7 +574,7 @@ def train_model(
 
         # Final Evaluation - only on main process
         if is_main_process(distributed, local_rank):
-            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank)
+            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
 
             wandb.log(
                 {
