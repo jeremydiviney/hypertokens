@@ -380,7 +380,8 @@ def create_optimizer(model, lr, beta2, weight_decay=0.01):
     use_fused = fused_available and device_type == "cuda"
 
     # Create optimizer with parameter groups
-    return optim.AdamW(optimizer_groups, lr=lr, betas=(0.9, beta2), fused=use_fused)
+    # return optim.AdamW(optimizer_groups, lr=lr, betas=(0.9, beta2), fused=use_fused)
+    return optim.AdamW(model.parameters(), lr=lr, betas=(0.9, beta2), fused=use_fused)
 
 
 @contextmanager
@@ -515,7 +516,7 @@ def train_model(
 
                 current_grad_accum_step_count = 0
                 # Add gradient clipping
-                norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1)
+                norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
 
                 optimizer.step()
                 optimizer.zero_grad()
@@ -791,7 +792,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.001],
+        "lr": [0.0008],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -807,7 +808,7 @@ if __name__ == "__main__":
         "grad_accum_max_at": [0.1],
         "early_end_pct": [0.35],
         "total_compare_tokens": [50304],
-        "beta2": [0.975],
+        "beta2": [0.95],
         "weight_decay": [0.01, 0.05, 0.1, 0.2],
     }
 
