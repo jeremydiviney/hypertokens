@@ -542,7 +542,7 @@ def train_model(
                             }
                         )
 
-                        if log_step_count % 100 == 0:
+                        if log_step_count % 200 == 0:
                             eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
                             val_loss = eval_results["val_loss"]
                             val_token_accuracy = eval_results["val_token_accuracy"]
@@ -882,7 +882,7 @@ if __name__ == "__main__":
 
         train_sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=local_rank, shuffle=True)
 
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+        # val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
 
         train_dataloader = DataLoader(
             dataset_train,
@@ -896,7 +896,7 @@ if __name__ == "__main__":
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            sampler=val_sampler,
+            # sampler=val_sampler,
             num_workers=4,
             pin_memory=True,
             prefetch_factor=4,
