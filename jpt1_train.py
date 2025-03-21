@@ -916,9 +916,9 @@ if __name__ == "__main__":
             dataset_train,
             batch_size=batch_size,
             sampler=train_sampler,
-            num_workers=4,  # Reduced for distributed setting
+            num_workers=1,  # Reduced for distributed setting
             pin_memory=True,
-            prefetch_factor=4,  # Reduced for distributed setting
+            prefetch_factor=1,  # Reduced for distributed setting
         )
 
         val_dataloader = DataLoader(
