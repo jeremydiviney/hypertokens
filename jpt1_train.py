@@ -790,7 +790,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.0008, 0.0004],
+        "lr": [0.0008, 0.0005],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
@@ -800,14 +800,14 @@ if __name__ == "__main__":
             JPT1QuantModelType.STANDARD,
         ],
         "grad_accum_size": [
-            bs * 1024 * 6 * 3,
-            bs * 1024 * 6,
+            bs * 1024 * 7 * 3,
+            bs * 1024 * 7,
         ],
         "log_step_size": [bs * 1024 * 6 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.01],
         "grad_accum_max_at": [0.001],
-        "early_end_pct": [0.35],
+        "early_end_pct": [0.2],
         "total_compare_tokens": [50304],
         "beta2": [0.95],
         "weight_decay": [0.01],  # [0.01, 0.05, 0.1, 0.2],
@@ -915,9 +915,9 @@ if __name__ == "__main__":
             dataset_train,
             batch_size=batch_size,
             sampler=train_sampler,
-            num_workers=1,  # Reduced for distributed setting
+            num_workers=4,  # Reduced for distributed setting
             pin_memory=True,
-            prefetch_factor=1,  # Reduced for distributed setting
+            prefetch_factor=4,  # Reduced for distributed setting
         )
 
         val_dataloader = DataLoader(
