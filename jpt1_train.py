@@ -411,9 +411,11 @@ def train_model(
     else:
         model = model.to(device)
 
-    count_parameters(model)
+    raw_model = model.module if distributed else model
 
-    optimizer = create_optimizer(model, config["lr"], config["beta2"], config["weight_decay"])
+    count_parameters(raw_model)
+
+    optimizer = create_optimizer(raw_model, config["lr"], config["beta2"], config["weight_decay"])
 
     seq_len = config["seq_len"]
     batch_size = config["batch_size"]
@@ -465,8 +467,6 @@ def train_model(
     tokens_since_step = 0
     tokens_since_grad_accum = 0
 
-    raw_model = model.module if distributed else model
-
     for epoch in range(config["epochs"]):
         batch_count = 0
 
@@ -498,7 +498,7 @@ def train_model(
 
             batch_count += 1
 
-            sync_grads = distributed and current_grad_accum_step_count == (grad_accum_step_count - 1)
+            # sync_grads = distributed and current_grad_accum_step_count == (grad_accum_step_count - 1)
 
             # with maybe_no_sync(model, distributed, sync_grads):
 
