@@ -491,7 +491,7 @@ def train_model(
             current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
             grad_accum_step_count = math.ceil(current_grad_accum_size / (batch_tokens * world_size))
 
-            if is_main_process(distributed, local_rank) and math.random() < 0.025:
+            if is_main_process(distributed, local_rank) and batch_count % 100 == 0:
                 print(f"Current grad accum size: {current_grad_accum_size}")
                 print(f"Grad accum step count: {grad_accum_step_count}")
 
