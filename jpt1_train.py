@@ -759,7 +759,7 @@ if __name__ == "__main__":
 
         print(f"Initialized process {local_rank}/{world_size}")
 
-    bs = 24
+    bs = 12
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
@@ -775,8 +775,8 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [bs * 1024 * 7 * 3],
-        "log_step_size": [bs * 1024 * 7 * 3 * 2],
+        "grad_accum_size": [2 * bs * 1024 * 7 * 3],
+        "log_step_size": [2 * bs * 1024 * 7 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
