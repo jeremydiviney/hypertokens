@@ -803,7 +803,7 @@ if __name__ == "__main__":
             bs * 1024 * 7 * 3,
             bs * 1024 * 7,
         ],
-        "log_step_size": [bs * 1024 * 6 * 3 * 2],
+        "log_step_size": [bs * 1024 * 7 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.01],
         "grad_accum_max_at": [0.001],
