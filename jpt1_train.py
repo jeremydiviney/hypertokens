@@ -491,7 +491,7 @@ def train_model(
             current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
             grad_accum_step_count = math.ceil(current_grad_accum_size / (batch_tokens * world_size))
 
-            if is_main_process(distributed, local_rank):
+            if is_main_process(distributed, local_rank) and math.random() < 0.025:
                 print(f"Current grad accum size: {current_grad_accum_size}")
                 print(f"Grad accum step count: {grad_accum_step_count}")
 
@@ -784,7 +784,7 @@ if __name__ == "__main__":
 
         print(f"Initialized process {local_rank}/{world_size}")
 
-    bs = 12
+    bs = 24
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
@@ -800,8 +800,8 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.STANDARD,
         ],
-        "grad_accum_size": [2 * bs * 1024 * 7 * 3],
-        "log_step_size": [2 * bs * 1024 * 7 * 3 * 2],
+        "grad_accum_size": [bs * 1024 * 7 * 3],
+        "log_step_size": [bs * 1024 * 7 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.1],
         "grad_accum_max_at": [0.1],
