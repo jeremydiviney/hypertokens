@@ -330,7 +330,7 @@ class CustomLossCosSim(torch.nn.Module):
         return loss
 
 
-def inference_and_loss_step(model, x, y, loss_fn, training: bool):
+def inference_and_loss_step(model, x, y, loss_fn, training: bool, distributed: bool):
 
     # Forward pass to get output embeddings
     # start_time = time.time()
@@ -338,10 +338,14 @@ def inference_and_loss_step(model, x, y, loss_fn, training: bool):
     # end_time = time.time()
     # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
-    if model.model_type == JPT1QuantModelType.COS_SIM:
+    raw_model = model.module if distributed else model
+
+    model_type = raw_model.model_type
+
+    if model_type == JPT1QuantModelType.COS_SIM:
         loss = loss_fn(model, model_output, y)
         return model_output, loss
-    elif model.model_type == JPT1QuantModelType.STANDARD_SAMPLED:
+    elif model_type == JPT1QuantModelType.STANDARD_SAMPLED:
         loss = loss_fn(model, pre_output, y)  # get model output logits in this case
         return model_output, loss
     else:
@@ -628,6 +632,9 @@ def train_model(
                     "epoch": epoch,
                 }
             )
+
+        if distributed:
+            torch.distributed.barrier()
 
     if is_main_process(distributed, local_rank):
         train_time_end = time.time()
