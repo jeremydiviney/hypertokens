@@ -389,8 +389,8 @@ def create_optimizer(model, lr, beta2, weight_decay=0.01):
 
 
 @contextmanager
-def maybe_no_sync(model, distributed, condition):
-    if condition and distributed:
+def maybe_no_sync(model, distributed, sync_grads: bool):
+    if not sync_grads and distributed:
         with model.no_sync():
             yield
     else:
