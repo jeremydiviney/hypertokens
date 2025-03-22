@@ -823,7 +823,7 @@ if __name__ == "__main__":
         "early_end_pct": [0.4],
         "total_compare_tokens": [50304],
         "beta2": [0.975],
-        "weight_decay": [0.01, 0.05, 0.1, 0.2],
+        "weight_decay": [0.2, 0.1, 0.4],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
