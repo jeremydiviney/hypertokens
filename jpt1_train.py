@@ -512,9 +512,9 @@ def train_model(
             if distributed:
                 model.require_backward_grad_sync = current_grad_accum_step_count == (grad_accum_step_count - 1)
 
-            if is_main_process(distributed, local_rank) and batch_count % 25 == 0:
-                print(f"Batch count: {batch_count}, model.require_backward_grad_sync: {model.require_backward_grad_sync}")
-                print(f"Current grad accum step count: {current_grad_accum_step_count}, grad accum step count: {grad_accum_step_count}")
+            # if is_main_process(distributed, local_rank) and batch_count % 25 == 0:
+            #     print(f"Batch count: {batch_count}, model.require_backward_grad_sync: {model.require_backward_grad_sync}")
+            #     print(f"Current grad accum step count: {current_grad_accum_step_count}, grad accum step count: {grad_accum_step_count}")
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True, distributed)
@@ -522,10 +522,10 @@ def train_model(
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
 
-            if model.require_backward_grad_sync:
-                print(
-                    f"Rank: {local_rank},batch_count: {batch_count}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count},tokens_since_grad_accum: {tokens_since_grad_accum},current_grad_accum_size: {current_grad_accum_size}"
-                )
+            # if model.require_backward_grad_sync:
+            #     print(
+            #         f"Rank: {local_rank},batch_count: {batch_count}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count},tokens_since_grad_accum: {tokens_since_grad_accum},current_grad_accum_size: {current_grad_accum_size}"
+            #     )
 
             loss.backward()
 
@@ -533,7 +533,7 @@ def train_model(
 
             if tokens_since_grad_accum >= current_grad_accum_size:
 
-                print(f"Rank: {local_rank},batch_count: {batch_count}, accum step complete")
+                # print(f"Rank: {local_rank},batch_count: {batch_count}, accum step complete")
 
                 current_grad_accum_step_count = 0
                 # Add gradient clipping
