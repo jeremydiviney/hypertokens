@@ -87,7 +87,7 @@ def evaluate_model(
         y = y.to(device)
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, False)
+            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, False)
 
             total_loss += loss.item()
             batch_count += 1
@@ -415,7 +415,7 @@ def train_model(
 
     count_parameters(raw_model)
 
-    optimizer = create_optimizer(raw_model, config["lr"], config["beta2"], config["weight_decay"])
+    optimizer = create_optimizer(model, config["lr"], config["beta2"], config["weight_decay"])
 
     seq_len = config["seq_len"]
     batch_size = config["batch_size"]
@@ -513,7 +513,7 @@ def train_model(
                 print(f"Current grad accum step count: {current_grad_accum_step_count}, grad accum step count: {grad_accum_step_count}")
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
+                jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True)
 
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
@@ -533,7 +533,7 @@ def train_model(
 
                 current_grad_accum_step_count = 0
                 # Add gradient clipping
-                norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 optimizer.step()
                 optimizer.zero_grad()
