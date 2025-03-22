@@ -527,6 +527,9 @@ def train_model(
                 print(
                     f"Rank: {local_rank}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count}"
                 )
+                print(
+                    f"Rank: {local_rank}, tokens_since_grad_accum: {tokens_since_grad_accum},current_grad_accum_size: {current_grad_accum_size}"
+                )
 
                 current_grad_accum_step_count = 0
                 # Add gradient clipping
@@ -608,11 +611,11 @@ def train_model(
                 if early_end_pct is not None and completion_percentage > early_end_pct:
                     break
 
-                if is_main_process(distributed, local_rank):
-                    time.sleep(10)
+                # if is_main_process(distributed, local_rank):
+                time.sleep(2)
 
-                if distributed:
-                    torch.distributed.barrier()
+                # if distributed:
+                #     torch.distributed.barrier()
 
         # Final Evaluation - only on main process
         if is_main_process(distributed, local_rank):
