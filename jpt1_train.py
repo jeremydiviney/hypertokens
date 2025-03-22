@@ -505,29 +505,16 @@ def train_model(
 
             batch_count += 1
 
-            # sync_grads = distributed and current_grad_accum_step_count == (grad_accum_step_count - 1)
+            sync_grads = distributed and current_grad_accum_step_count == (grad_accum_step_count - 1)
 
-            # with maybe_no_sync(model, distributed, sync_grads):
+            with maybe_no_sync(model, distributed, sync_grads):
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True, distributed)
 
-            if distributed:
-                model.require_backward_grad_sync = current_grad_accum_step_count == (grad_accum_step_count - 1)
+                loss = loss / grad_accum_step_count
+                loss_accum += loss.detach()
 
-            # if is_main_process(distributed, local_rank) and batch_count % 25 == 0:
-            #     print(f"Batch count: {batch_count}, model.require_backward_grad_sync: {model.require_backward_grad_sync}")
-            #     print(f"Current grad accum step count: {current_grad_accum_step_count}, grad accum step count: {grad_accum_step_count}")
-
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True, distributed)
-
-            loss = loss / grad_accum_step_count
-            loss_accum += loss.detach()
-
-            # if model.require_backward_grad_sync:
-            #     print(
-            #         f"Rank: {local_rank},batch_count: {batch_count}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count},tokens_since_grad_accum: {tokens_since_grad_accum},current_grad_accum_size: {current_grad_accum_size}"
-            #     )
-
-            loss.backward()
+                loss.backward()
 
             current_grad_accum_step_count += 1
 
@@ -834,10 +821,10 @@ if __name__ == "__main__":
         "dset_ratio": [1],
         "warmup_pct": [0.01],
         "grad_accum_max_at": [0.001],
-        "early_end_pct": [0.2],
+        "early_end_pct": [0.4],
         "total_compare_tokens": [50304],
-        "beta2": [0.95],
-        "weight_decay": [0.01],  # [0.01, 0.05, 0.1, 0.2],
+        "beta2": [0.975],
+        "weight_decay": [0.01, 0.05, 0.1, 0.2],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
