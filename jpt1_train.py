@@ -518,18 +518,18 @@ def train_model(
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
 
+            if model.require_backward_grad_sync:
+                print(
+                    f"Rank: {local_rank},batch_count: {batch_count}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count},tokens_since_grad_accum: {tokens_since_grad_accum},current_grad_accum_size: {current_grad_accum_size}"
+                )
+
             loss.backward()
 
             current_grad_accum_step_count += 1
 
             if tokens_since_grad_accum >= current_grad_accum_size:
 
-                print(
-                    f"Rank: {local_rank}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count}"
-                )
-                print(
-                    f"Rank: {local_rank}, tokens_since_grad_accum: {tokens_since_grad_accum},current_grad_accum_size: {current_grad_accum_size}"
-                )
+                print(f"Rank: {local_rank},batch_count: {batch_count}, accum step complete")
 
                 current_grad_accum_step_count = 0
                 # Add gradient clipping
@@ -612,7 +612,7 @@ def train_model(
                     break
 
                 # if is_main_process(distributed, local_rank):
-                time.sleep(2)
+                # time.sleep(2)
 
                 # if distributed:
                 #     torch.distributed.barrier()
