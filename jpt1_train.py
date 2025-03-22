@@ -502,14 +502,15 @@ def train_model(
 
             # with maybe_no_sync(model, distributed, sync_grads):
 
+            if distributed:
+                model.require_backward_grad_sync = current_grad_accum_step_count == (grad_accum_step_count - 1)
+
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
 
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
 
-            if distributed:
-                model.require_backward_grad_sync = current_grad_accum_step_count == (grad_accum_step_count - 1)
             loss.backward()
 
             current_grad_accum_step_count += 1
@@ -801,7 +802,6 @@ if __name__ == "__main__":
         ],
         "grad_accum_size": [
             bs * 1024 * 7 * 3,
-            bs * 1024 * 7,
         ],
         "log_step_size": [bs * 1024 * 7 * 3 * 2],
         "dset_ratio": [1],
