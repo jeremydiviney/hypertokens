@@ -524,6 +524,10 @@ def train_model(
 
             if tokens_since_grad_accum >= current_grad_accum_size:
 
+                print(
+                    f"Rank: {local_rank}, Current grad accum step count: {current_grad_accum_step_count-1}, grad accum step count: {grad_accum_step_count}"
+                )
+
                 current_grad_accum_step_count = 0
                 # Add gradient clipping
                 norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
@@ -603,6 +607,12 @@ def train_model(
 
                 if early_end_pct is not None and completion_percentage > early_end_pct:
                     break
+
+                if is_main_process(distributed, local_rank):
+                    time.sleep(10)
+
+                if distributed:
+                    torch.distributed.barrier()
 
         # Final Evaluation - only on main process
         if is_main_process(distributed, local_rank):
@@ -798,7 +808,7 @@ if __name__ == "__main__":
         "token_space_dim": [768],
         "epochs": [1],
         "batch_size": [bs],
-        "lr": [0.0008, 0.0005],
+        "lr": [0.0008],
         "num_head": [12],
         "n_layers": [12],
         "jpt_embed_dim": [768],
