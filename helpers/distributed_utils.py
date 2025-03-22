@@ -43,7 +43,7 @@ def get_model_for_training(model, device, distributed=False, local_rank=None):
         # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
         # Wrap model with DDP
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     return model
 
