@@ -87,7 +87,7 @@ def evaluate_model(
         y = y.to(device)
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, False)
+            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, False, distributed)
 
             total_loss += loss.item()
             batch_count += 1
@@ -517,7 +517,7 @@ def train_model(
                 print(f"Current grad accum step count: {current_grad_accum_step_count}, grad accum step count: {grad_accum_step_count}")
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True)
+                jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True, distributed)
 
             loss = loss / grad_accum_step_count
             loss_accum += loss.detach()
