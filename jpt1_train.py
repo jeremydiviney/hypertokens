@@ -489,7 +489,10 @@ def train_model(
             tokens_since_grad_accum += tokens_processed
 
             # Grad accum size is a function of the completion percentage we reach 100% at 50% completion
-            current_grad_accum_size = get_grad_accum_size(completion_percentage, batch_tokens, grad_accum_size, grad_accum_max_at)
+            current_grad_accum_size = get_grad_accum_size(
+                completion_percentage, batch_tokens * world_size, grad_accum_size, grad_accum_max_at
+            )
+
             grad_accum_step_count = math.ceil(current_grad_accum_size / (batch_tokens * world_size))
 
             if is_main_process(distributed, local_rank) and batch_count % 100 == 0:
@@ -504,6 +507,10 @@ def train_model(
 
             if distributed:
                 model.require_backward_grad_sync = current_grad_accum_step_count == (grad_accum_step_count - 1)
+
+            if is_main_process(distributed, local_rank) and batch_count % 25 == 0:
+                print(f"Batch count: {batch_count}, model.require_backward_grad_sync: {model.require_backward_grad_sync}")
+                print(f"Current grad accum step count: {current_grad_accum_step_count}, grad accum step count: {grad_accum_step_count}")
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 jpt_output, loss = inference_and_loss_step(raw_model, x, y, loss_fn, True)
