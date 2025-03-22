@@ -374,8 +374,8 @@ def create_optimizer(model, lr, beta2, weight_decay=0.01):
     param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optimizer_groups = [{"params": decay_params, "weight_decay": weight_decay}, {"params": nodecay_params, "weight_decay": 0.0}]
+    no_decay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optimizer_groups = [{"params": decay_params, "weight_decay": weight_decay}, {"params": no_decay_params, "weight_decay": 0.0}]
 
     device_type = decay_params[0].device.type
 
@@ -384,8 +384,7 @@ def create_optimizer(model, lr, beta2, weight_decay=0.01):
     use_fused = fused_available and device_type == "cuda"
 
     # Create optimizer with parameter groups
-    # return optim.AdamW(optimizer_groups, lr=lr, betas=(0.9, beta2), fused=use_fused)
-    return optim.AdamW(model.parameters(), lr=lr, betas=(0.9, beta2), fused=use_fused)
+    return optim.AdamW(optimizer_groups, lr=lr, betas=(0.9, beta2), fused=use_fused)
 
 
 @contextmanager
