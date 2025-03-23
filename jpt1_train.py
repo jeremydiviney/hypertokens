@@ -824,7 +824,7 @@ if __name__ == "__main__":
         "log_step_size": [bs * 1024 * 6 * 3 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.025],
-        "grad_accum_max_at": [0.01],
+        "grad_accum_max_at": [0.025],
         "early_end_pct": [None, 0.3, 0.3, 0.3, 0.3, 0.3],
         "total_compare_tokens": [50304, 0, 8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
         "beta2": [0.975],
