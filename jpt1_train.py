@@ -812,18 +812,23 @@ if __name__ == "__main__":
         "vocab_size": [50304],
         "output_type": [
             JPT1QuantModelType.STANDARD,
+            JPT1QuantModelType.STANDARD_SAMPLED,
+            JPT1QuantModelType.STANDARD_SAMPLED,
+            JPT1QuantModelType.STANDARD_SAMPLED,
+            JPT1QuantModelType.STANDARD_SAMPLED,
+            JPT1QuantModelType.STANDARD_SAMPLED,
         ],
         "grad_accum_size": [
             bs * 1024 * 6 * 3,
         ],
         "log_step_size": [bs * 1024 * 6 * 3 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.01],
-        "grad_accum_max_at": [0.001],
-        "early_end_pct": [0.4],
-        "total_compare_tokens": [50304],
+        "warmup_pct": [0.025],
+        "grad_accum_max_at": [0.01],
+        "early_end_pct": [None, 0.3, 0.3, 0.3, 0.3, 0.3],
+        "total_compare_tokens": [50304, 0, 8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
         "beta2": [0.975],
-        "weight_decay": [0.2, 0.4, 0.1],
+        "weight_decay": [0.1],
     }
 
     experiments = create_experiments(mode="paired", **experiments)
