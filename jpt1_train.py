@@ -135,69 +135,6 @@ def inference_step(model, x, inference_only: bool):
     return model_output, pre_output
 
 
-def analyze_embedding_clustering(model):
-    with torch.no_grad():
-        embeddings = model.lookup_embeddings.weight
-        normalized_emb = F.normalize(embeddings, p=2, dim=1)
-
-        # Get pairwise similarities
-        sim_matrix = torch.matmul(normalized_emb, normalized_emb.t())
-
-        # For each embedding, count how many others are "close"
-        similarity_thresholds = [0.5, 0.7, 0.9]
-        for thresh in similarity_thresholds:
-            close_count = (sim_matrix > thresh).sum(dim=1)
-            print(f"\nTokens with similarity > {thresh}:")
-            print(f"Mean neighbors: {close_count.float().mean():.2f}")
-            print(f"Max neighbors: {close_count.max().item()}")
-
-            # Find most clustered embeddings
-            most_clustered = torch.topk(close_count, 5)
-            print(f"Most clustered token indices: {most_clustered.indices.tolist()}")
-
-
-def compute_logits_with_extras(model, hidden_states, target_indices):
-
-    target_flat = target_indices.reshape(-1)
-    unique_targets = target_flat.unique()
-    lookup_embeddings = model.lookup_embeddings
-
-    # Calculate number of extra negatives needed
-    total_tokens = target_flat.size(0)  # original number of tokens (seq_len * batch_size)
-    num_unique_targets = unique_targets.size(0)
-    extra_negatives = max(0, total_tokens - num_unique_targets)  # ensure we don't go negative
-
-    if extra_negatives > 0:
-        vocab_size = lookup_embeddings.weight.size(0)
-        # Create a mask to exclude unique targets.
-        mask = torch.ones(vocab_size, dtype=torch.bool, device=hidden_states.device)
-        mask[unique_targets] = False
-        non_target_tokens = mask.nonzero(as_tuple=True)[0]
-        perm = torch.randperm(non_target_tokens.size(0), device=hidden_states.device)
-        extra_candidates = non_target_tokens[perm[:extra_negatives]]
-        candidate_set = torch.sort(torch.cat([unique_targets, extra_candidates]))[0]
-    else:
-        candidate_set = unique_targets
-
-    # Retrieve and normalize candidate embeddings.
-    candidate_embeds = lookup_embeddings(candidate_set)
-    candidate_embeds = F.normalize(candidate_embeds, p=2, dim=1)
-
-    # Flatten and normalize hidden states.
-    N, D = target_flat.shape[0], hidden_states.shape[-1]
-    hidden_norm = F.normalize(hidden_states.view(N, D), p=2, dim=1)
-
-    # Compute logits as cosine similarities scaled by temperature.
-    logits = torch.mm(hidden_norm, candidate_embeds.t()) / model.temperature
-
-    # Remap each original target to its position in candidate_set using a mapping tensor.
-    mapping = torch.full((lookup_embeddings.weight.size(0),), -1, dtype=torch.long, device=candidate_set.device)
-    mapping[candidate_set] = torch.arange(candidate_set.size(0), device=candidate_set.device)
-    new_targets = mapping[target_flat]
-
-    return logits, new_targets
-
-
 class CustomSampledLoss(torch.nn.Module):
     def __init__(self, ignore_index: int, total_compare_tokens: int):
         super().__init__()
@@ -343,10 +280,10 @@ def inference_and_loss_step(model, x, y, loss_fn, training: bool, distributed: b
     model_type = raw_model.model_type
 
     if model_type == JPT1QuantModelType.COS_SIM:
-        loss = loss_fn(model, model_output, y)
+        loss = loss_fn(raw_model, model_output, y)
         return model_output, loss
     elif model_type == JPT1QuantModelType.STANDARD_SAMPLED:
-        loss = loss_fn(model, pre_output, y)  # get model output logits in this case
+        loss = loss_fn(raw_model, pre_output, y)  # get model output logits in this case
         return model_output, loss
     else:
         # For standard model types, compute logits normally and apply cross entropy over the vocab.
@@ -811,7 +748,6 @@ if __name__ == "__main__":
         "dropout": [0.0],
         "vocab_size": [50304],
         "output_type": [
-            JPT1QuantModelType.STANDARD,
             JPT1QuantModelType.STANDARD_SAMPLED,
             JPT1QuantModelType.STANDARD_SAMPLED,
             JPT1QuantModelType.STANDARD_SAMPLED,
@@ -825,8 +761,8 @@ if __name__ == "__main__":
         "dset_ratio": [1],
         "warmup_pct": [0.025],
         "grad_accum_max_at": [0.025],
-        "early_end_pct": [None, 0.3, 0.3, 0.3, 0.3, 0.3],
-        "total_compare_tokens": [50304, 0, 8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
+        "early_end_pct": [0.3, 0.3, 0.3, 0.3, 0.3],
+        "total_compare_tokens": [0, 8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
         "beta2": [0.975],
         "weight_decay": [0.1],
     }
