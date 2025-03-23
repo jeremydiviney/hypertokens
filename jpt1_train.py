@@ -752,7 +752,6 @@ if __name__ == "__main__":
             JPT1QuantModelType.STANDARD_SAMPLED,
             JPT1QuantModelType.STANDARD_SAMPLED,
             JPT1QuantModelType.STANDARD_SAMPLED,
-            JPT1QuantModelType.STANDARD_SAMPLED,
         ],
         "grad_accum_size": [
             bs * 1024 * 6 * 3,
@@ -761,8 +760,8 @@ if __name__ == "__main__":
         "dset_ratio": [1],
         "warmup_pct": [0.025],
         "grad_accum_max_at": [0.025],
-        "early_end_pct": [0.3, 0.3, 0.3, 0.3, 0.3],
-        "total_compare_tokens": [0, 8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
+        "early_end_pct": [0.3, 0.3, 0.3, 0.3],
+        "total_compare_tokens": [8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
         "beta2": [0.975],
         "weight_decay": [0.1],
     }
