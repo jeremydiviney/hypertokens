@@ -519,7 +519,7 @@ def train_model(
                             }
                         )
 
-                        if log_step_count % 1 == 0:
+                        if log_step_count % 200 == 0:
                             eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
                             val_loss = eval_results["val_loss"]
                             val_loss_norm = eval_results["val_loss_norm"]
