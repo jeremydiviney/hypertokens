@@ -76,6 +76,7 @@ def evaluate_model(
     dataset = dataloader.dataset
 
     total_loss = 0
+    total_loss_norm = 0
     batch_count = 0
 
     token_matches_total = 0
