@@ -183,7 +183,7 @@ class JPT1Quantized(nn.Module):
             # RMSNorm only has weight parameter (no bias)
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, do_final_projection: bool) -> torch.Tensor:
         batch_size, seq_len = x.shape
         embedded = self.embeddings(x)
 
@@ -195,10 +195,10 @@ class JPT1Quantized(nn.Module):
 
         x = self.fc_ln(x)
 
-        if self.model_type == JPT1QuantModelType.STANDARD_SAMPLED and training:
-            output = x  # if sample based training, don't do final projection yet
-        else:
+        if do_final_projection:
             output = self.fc_out(x)
+        else:
+            output = x  # if sample based training, don't do final projection yet
 
         return output, x
 

@@ -81,21 +81,27 @@ def evaluate_model(
     token_matches_total = 0
     token_total = 0
 
+    do_final_projection = model.model_type != JPT1QuantModelType.STANDARD_SAMPLED
+
     for x, y in dataloader:
 
         x = x.to(device)
         y = y.to(device)
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, False, distributed)
+            jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, do_final_projection, distributed)
+
+            jpt_output_norm, loss_norm = inference_and_loss_step(model, x, y, loss_fn, do_final_projection, distributed)
 
             total_loss += loss.item()
+            total_loss_norm += loss_norm.item()
+
             batch_count += 1
 
             if raw_model.model_type == JPT1QuantModelType.COS_SIM:
                 pred_token_indices = raw_model.get_nearest_token_indices_cossim(jpt_output)
             else:
-                pred_token_indices = jpt_output.argmax(dim=-1)
+                pred_token_indices = jpt_output_norm.argmax(dim=-1)
 
             pred_token_indices = pred_token_indices.detach().cpu().numpy()
 
@@ -122,6 +128,7 @@ def evaluate_model(
 
     result = {
         "val_loss": total_loss / batch_count,
+        "val_loss_norm": total_loss_norm / batch_count,
         "val_token_accuracy": token_matches_total / token_total,
     }
 
@@ -129,9 +136,9 @@ def evaluate_model(
     return result
 
 
-def inference_step(model, x, inference_only: bool):
+def inference_step(model, x, do_final_projection: bool):
 
-    model_output, pre_output = model(x, inference_only)
+    model_output, pre_output = model(x, do_final_projection)
     return model_output, pre_output
 
 
@@ -267,11 +274,11 @@ class CustomLossCosSim(torch.nn.Module):
         return loss
 
 
-def inference_and_loss_step(model, x, y, loss_fn, training: bool, distributed: bool):
+def inference_and_loss_step(model, x, y, loss_fn, do_final_projection: bool, distributed: bool):
 
     # Forward pass to get output embeddings
     # start_time = time.time()
-    model_output, pre_output = inference_step(model, x, training)  # [batch_size, seq_len, embed_dim]
+    model_output, pre_output = inference_step(model, x, do_final_projection)  # [batch_size, seq_len, embed_dim]
     # end_time = time.time()
     # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
@@ -283,7 +290,7 @@ def inference_and_loss_step(model, x, y, loss_fn, training: bool, distributed: b
         loss = loss_fn(raw_model, model_output, y)
         return model_output, loss
     elif model_type == JPT1QuantModelType.STANDARD_SAMPLED:
-        loss = loss_fn(raw_model, pre_output, y)  # get model output logits in this case
+        loss = loss_fn(raw_model, model_output, y)  # get model output logits in this case
         return model_output, loss
     else:
         # For standard model types, compute logits normally and apply cross entropy over the vocab.
@@ -407,6 +414,8 @@ def train_model(
     tokens_since_step = 0
     tokens_since_grad_accum = 0
 
+    do_final_projection = raw_model.model_type != JPT1QuantModelType.STANDARD_SAMPLED
+
     for epoch in range(config["epochs"]):
         batch_count = 0
 
@@ -445,7 +454,7 @@ def train_model(
 
             with maybe_no_sync(model, distributed, sync_grads):
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, True, distributed)
+                    jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, do_final_projection, distributed)
 
                 loss = loss / grad_accum_step_count
                 loss_accum += loss.detach()
@@ -673,7 +682,7 @@ def generate_text(
         x = torch.tensor(model.get_token_indices(tokens)).to(device)
         x = x.unsqueeze(0)
 
-        jpt_output, pre_output = inference_step(model, x, False)  # do final projection
+        jpt_output, pre_output = inference_step(model, x, True)  # do final projection
 
         # Print the generated character
 
