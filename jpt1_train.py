@@ -518,19 +518,21 @@ def train_model(
                             }
                         )
 
-                        if log_step_count % 200 == 0:
+                        if log_step_count % 1 == 0:
                             eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
                             val_loss = eval_results["val_loss"]
+                            val_loss_norm = eval_results["val_loss_norm"]
                             val_token_accuracy = eval_results["val_token_accuracy"]
                             wandb.log(
                                 {
                                     "val_loss": val_loss,
-                                    "val_token_accuracy": eval_results["val_token_accuracy"],
+                                    "val_loss_norm": val_loss_norm,
+                                    "val_token_accuracy": val_token_accuracy,
                                     "epoch": epoch,
                                 }
                             )
                             print(
-                                f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, "
+                                f"\nEpoch {epoch} train_loss: {current_mean_loss:.4f}, val_loss: {val_loss:.4f}, val_loss_norm: {val_loss_norm:.4f}, "
                                 f"val_token_accuracy: {val_token_accuracy:.2%}"
                                 f"tokens_per_second: {tokens_per_second:.2f}"
                             )
@@ -560,6 +562,7 @@ def train_model(
             wandb.log(
                 {
                     "val_loss": eval_results["val_loss"],
+                    "val_loss_norm": eval_results["val_loss_norm"],
                     "val_token_accuracy": eval_results["val_token_accuracy"],
                     "epoch": epoch,
                 }
@@ -758,19 +761,16 @@ if __name__ == "__main__":
         "vocab_size": [50304],
         "output_type": [
             JPT1QuantModelType.STANDARD_SAMPLED,
-            JPT1QuantModelType.STANDARD_SAMPLED,
-            JPT1QuantModelType.STANDARD_SAMPLED,
-            JPT1QuantModelType.STANDARD_SAMPLED,
         ],
         "grad_accum_size": [
             bs * 1024 * 6 * 3,
         ],
         "log_step_size": [bs * 1024 * 6 * 3 * 2],
         "dset_ratio": [1],
-        "warmup_pct": [0.025],
-        "grad_accum_max_at": [0.025],
-        "early_end_pct": [0.3, 0.3, 0.3, 0.3],
-        "total_compare_tokens": [8 * 1024, 12 * 1024, 16 * 1024, 24 * 1024],
+        "warmup_pct": [0.03],
+        "grad_accum_max_at": [0.03],
+        "early_end_pct": [None],
+        "total_compare_tokens": [8 * 1024, 12 * 1024, 16 * 1024],
         "beta2": [0.975],
         "weight_decay": [0.1],
     }
