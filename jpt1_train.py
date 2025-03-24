@@ -82,7 +82,7 @@ def evaluate_model(
     token_matches_total = 0
     token_total = 0
 
-    do_final_projection = model.model_type != JPT1QuantModelType.STANDARD_SAMPLED
+    do_final_projection = raw_model.model_type != JPT1QuantModelType.STANDARD_SAMPLED
 
     for x, y in dataloader:
 
