@@ -888,7 +888,7 @@ if __name__ == "__main__":
             sampler=train_sampler,
             num_workers=6,  # Reduced for distributed setting
             pin_memory=True,
-            prefetch_factor=6,  # Reduced for distributed setting
+            prefetch_factor=12,  # Reduced for distributed setting
         )
 
         val_dataloader = DataLoader(
