@@ -74,6 +74,7 @@ def evaluate_model(
     raw_model = model.module if distributed else model
 
     dataset = dataloader.dataset
+    tokenizer = dataset.tokenizer
 
     total_loss = 0
     total_loss_norm = 0
@@ -81,6 +82,8 @@ def evaluate_model(
 
     token_matches_total = 0
     token_total = 0
+
+    norm_loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
 
     do_final_projection = raw_model.model_type != JPT1QuantModelType.STANDARD_SAMPLED
 
@@ -92,7 +95,7 @@ def evaluate_model(
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
             jpt_output, loss = inference_and_loss_step(model, x, y, loss_fn, do_final_projection, distributed)
 
-            jpt_output_norm, loss_norm = inference_and_loss_step(model, x, y, loss_fn, do_final_projection, distributed)
+            jpt_output_norm, loss_norm = inference_and_loss_step(model, x, y, norm_loss_fn, True, distributed)
 
             total_loss += loss.item()
             total_loss_norm += loss_norm.item()
@@ -287,19 +290,24 @@ def inference_and_loss_step(model, x, y, loss_fn, do_final_projection: bool, dis
 
     model_type = raw_model.model_type
 
+    logits = model_output
+
     if model_type == JPT1QuantModelType.COS_SIM:
-        loss = loss_fn(raw_model, model_output, y)
-        return model_output, loss
+        loss = loss_fn(raw_model, logits, y)
+
     elif model_type == JPT1QuantModelType.STANDARD_SAMPLED:
-        loss = loss_fn(raw_model, model_output, y)  # get model output logits in this case
-        return model_output, loss
+        if do_final_projection:
+            loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))  # get model output logits in this case
+        else:
+            loss = loss_fn(raw_model, pre_output, y)  # get model output logits in this case
+
     else:
         # For standard model types, compute logits normally and apply cross entropy over the vocab.
-        logits = model_output
+
         # logits shape is assumed to be [batch, seq_len, vocab_size]
-        ce_loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-        loss = ce_loss
-        return model_output, loss
+        loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+
+    return logits, loss
 
 
 def get_grad_accum_size(completion_percentage: float, batch_tokens: int, grad_accum_size: int, hit_max_at: float) -> int:
@@ -519,7 +527,7 @@ def train_model(
                             }
                         )
 
-                        if log_step_count % 200 == 0:
+                        if log_step_count % 100 == 0:
                             eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
                             val_loss = eval_results["val_loss"]
                             val_loss_norm = eval_results["val_loss_norm"]
@@ -747,7 +755,7 @@ if __name__ == "__main__":
 
         print(f"Initialized process {local_rank}/{world_size}")
 
-    bs = 28
+    bs = 16
     # Define experiments
     experiments: list[dict] = {
         "seq_len": [1024],
