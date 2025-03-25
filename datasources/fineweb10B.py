@@ -147,7 +147,7 @@ class Fineweb10BDataset(Dataset):
         dataset_name: str,
         dset_ratio: float = 1.0,  # control the ratio of the dataset to use
         type: str = "train",
-        cache_size: int = 25000,
+        cache_size: int = 5000,
     ):
         # Load TinyShakespeare from Hugging Face
         self.hf_dataset = hf_dataset

@@ -886,7 +886,7 @@ if __name__ == "__main__":
             dataset_train,
             batch_size=batch_size,
             sampler=train_sampler,
-            num_workers=6,  # Reduced for distributed setting
+            num_workers=4,  # Reduced for distributed setting
             pin_memory=True,
             prefetch_factor=12,  # Reduced for distributed setting
         )
@@ -895,7 +895,7 @@ if __name__ == "__main__":
             val_dataset,
             batch_size=batch_size,
             # sampler=val_sampler,
-            num_workers=6,
+            num_workers=4,
             pin_memory=True,
             prefetch_factor=6,
         )
