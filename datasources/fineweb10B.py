@@ -5,6 +5,7 @@ import os
 import json
 import pickle
 from bisect import bisect_left
+from heapq import heappush, heappop
 
 from multiprocessing import Pool
 
@@ -146,6 +147,7 @@ class Fineweb10BDataset(Dataset):
         dataset_name: str,
         dset_ratio: float = 1.0,  # control the ratio of the dataset to use
         type: str = "train",
+        cache_size: int = 10000,
     ):
         # Load TinyShakespeare from Hugging Face
         self.hf_dataset = hf_dataset
@@ -155,6 +157,9 @@ class Fineweb10BDataset(Dataset):
         self.train_ratio = 4000
         self.dset_ratio = dset_ratio
         self.type = type
+        self.cache_size = cache_size
+        self.cache = {}  # Dictionary to store cached tokens
+        self.cache_priority = []  # Min-heap to track priorities for eviction
 
         self.pad_token_id = self.tokenizer.token_to_id("[PAD]")
 
@@ -207,10 +212,27 @@ class Fineweb10BDataset(Dataset):
 
         # print(f"get_data_chunk: {idx}, self.selection_table: {len(self.selection_table)}, data_row_idx: {data_row_idx}")
 
-        # Get the full text from the dataset
-        full_text = self.hf_dataset["train"][data_row_idx]["text"]
+        # Check if the current index is in the cache
+        if data_row_idx in self.cache:
+            full_idx_tokens = self.cache[data_row_idx]
+        else:
+            # Get the full text from the dataset
+            full_text = self.hf_dataset["train"][data_row_idx]["text"]
+            full_idx_tokens = self.tokenizer.encode_batch_fast([full_text])[0].ids
 
-        full_idx_tokens = self.tokenizer.encode_batch_fast([full_text])[0].ids
+            # Cache management
+            token_length = len(full_idx_tokens)
+
+            if len(self.cache) < self.cache_size:
+                # Add to cache if not full
+                self.cache[data_row_idx] = full_idx_tokens
+                heappush(self.cache_priority, (token_length, data_row_idx))
+            elif token_length > self.cache_priority[0][0]:
+                # Replace smallest item if current is larger
+                smallest_length, smallest_idx = heappop(self.cache_priority)
+                del self.cache[smallest_idx]
+                self.cache[data_row_idx] = full_idx_tokens
+                heappush(self.cache_priority, (token_length, data_row_idx))
 
         data_row_chunks = (len(full_idx_tokens) // self.data_stride) + 1
         data_row_remainder = len(full_idx_tokens) % self.data_stride
