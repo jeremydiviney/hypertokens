@@ -580,9 +580,6 @@ def train_model(
             }
         )
 
-        if distributed:
-            torch.distributed.barrier()
-
         train_time_end = time.time()
         print(f"Training time: {train_time_end - train_time_start:.4f} seconds")
 
@@ -594,6 +591,9 @@ def train_model(
         # Get model without DDP wrapper for saving
         model_to_save = model.module if distributed else model
         save_model(model_to_save, save_dir, f"{model_name}_jpt1")
+
+    if distributed:
+        torch.distributed.barrier()
 
     return model
 
