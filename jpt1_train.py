@@ -564,23 +564,25 @@ def train_model(
                 # if distributed:
                 #     torch.distributed.barrier()
 
-        # Final Evaluation - only on main process
-        if is_main_process(distributed, local_rank):
-            eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
+    print("Training Complete completed!")
+    # Final Evaluation - only on main process
 
-            wandb.log(
-                {
-                    "val_loss": eval_results["val_loss"],
-                    "val_loss_norm": eval_results["val_loss_norm"],
-                    "val_token_accuracy": eval_results["val_token_accuracy"],
-                    "epoch": epoch,
-                }
-            )
+    if is_main_process(distributed, local_rank):
+
+        eval_results = evaluate_model(model, val_dataloader, device, loss_fn, local_rank, distributed)
+
+        wandb.log(
+            {
+                "val_loss": eval_results["val_loss"],
+                "val_loss_norm": eval_results["val_loss_norm"],
+                "val_token_accuracy": eval_results["val_token_accuracy"],
+                "epoch": epoch,
+            }
+        )
 
         if distributed:
             torch.distributed.barrier()
 
-    if is_main_process(distributed, local_rank):
         train_time_end = time.time()
         print(f"Training time: {train_time_end - train_time_start:.4f} seconds")
 
@@ -760,7 +762,7 @@ if __name__ == "__main__":
     experiments: list[dict] = {
         "seq_len": [1024],
         "token_space_dim": [768],
-        "epochs": [4],
+        "epochs": [5],
         "batch_size": [bs],
         "lr": [0.0008],
         "num_head": [12],
@@ -773,7 +775,7 @@ if __name__ == "__main__":
         ],
         "grad_accum_size": [bs * 1024 * 4 * 5],
         "log_step_size": [bs * 1024 * 4 * 5 * 2],
-        "dset_ratio": [0.05],
+        "dset_ratio": [0.01],
         "warmup_pct": [0.03],
         "grad_accum_max_at": [0.03],
         "early_end_pct": [None],
