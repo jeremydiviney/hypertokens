@@ -762,7 +762,7 @@ if __name__ == "__main__":
     experiments: list[dict] = {
         "seq_len": [1024],
         "token_space_dim": [768],
-        "epochs": [5],
+        "epochs": [2],
         "batch_size": [bs],
         "lr": [0.0008],
         "num_head": [12],
@@ -779,7 +779,7 @@ if __name__ == "__main__":
         "warmup_pct": [0.03],
         "grad_accum_max_at": [0.03],
         "early_end_pct": [None],
-        "total_compare_tokens": [16 * 1024],
+        "total_compare_tokens": [12 * 1024, 16 * 1024],
         "beta2": [0.975],
         "weight_decay": [0.1],
     }
