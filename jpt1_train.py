@@ -771,7 +771,7 @@ if __name__ == "__main__":
         "output_type": [
             JPT1QuantModelType.STANDARD_SAMPLED,
         ],
-        "grad_accum_size": [bs * 1024 * 5 * 4],
+        "grad_accum_size": [bs * 1024 * 4 * 5],
         "log_step_size": [bs * 1024 * 4 * 5 * 2],
         "dset_ratio": [1],
         "warmup_pct": [0.03],
@@ -893,9 +893,9 @@ if __name__ == "__main__":
             val_dataset,
             batch_size=batch_size,
             # sampler=val_sampler,
-            num_workers=,
+            num_workers=4,
             pin_memory=True,
-            prefetch_factor=6,
+            prefetch_factor=12,
         )
 
         # Create wrapper function for train_model
