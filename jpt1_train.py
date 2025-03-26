@@ -775,7 +775,7 @@ if __name__ == "__main__":
         ],
         "grad_accum_size": [bs * 1024 * 4 * 5],
         "log_step_size": [bs * 1024 * 4 * 5 * 2],
-        "dset_ratio": [0.01],
+        "dset_ratio": [1],
         "warmup_pct": [0.03],
         "grad_accum_max_at": [0.03],
         "early_end_pct": [None],
