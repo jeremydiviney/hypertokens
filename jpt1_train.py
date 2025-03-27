@@ -564,8 +564,11 @@ def train_model(
                 # if distributed:
                 #     torch.distributed.barrier()
 
-    print("Training Complete completed!")
+    print("Training completed!")
     # Final Evaluation - only on main process
+
+    if distributed:
+        torch.distributed.barrier()
 
     if is_main_process(distributed, local_rank):
 
