@@ -779,7 +779,7 @@ if __name__ == "__main__":
         "warmup_pct": [0.03],
         "grad_accum_max_at": [0.03],
         "early_end_pct": [None],
-        "total_compare_tokens": [12 * 1024, 16 * 1024],
+        "total_compare_tokens": [16 * 1024],
         "beta2": [0.975],
         "weight_decay": [0.1],
     }
