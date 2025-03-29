@@ -4,7 +4,7 @@ from datetime import datetime
 import time
 import sys
 import inspect
-import random
+
 import math
 
 from contextlib import contextmanager
@@ -102,10 +102,7 @@ def evaluate_model(
 
             batch_count += 1
 
-            if raw_model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = raw_model.get_nearest_token_indices_cossim(jpt_output)
-            else:
-                pred_token_indices = jpt_output_norm.argmax(dim=-1)
+            pred_token_indices = jpt_output_norm.argmax(dim=-1)
 
             pred_token_indices = pred_token_indices.detach().cpu().numpy()
 
@@ -211,80 +208,9 @@ class CustomSampledLoss(torch.nn.Module):
         return loss
 
 
-class CustomLossCosSim(torch.nn.Module):
-    def __init__(self, ignore_index: int, total_compare_tokens: int):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.total_compare_tokens = total_compare_tokens
-
-    def forward(self, model, hidden_states, target_indices):
-        batch_size, seq_length, hidden_dim = hidden_states.shape
-        vocab_size = model.lookup_embeddings.weight.size(0)
-
-        # Flatten tensors
-        flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch_size*seq_length, hidden_dim]
-        flat_targets = target_indices.reshape(-1)  # [batch_size*seq_length]
-
-        # Ignore padding tokens
-        ignore_mask = flat_targets == self.ignore_index
-        flat_hidden = flat_hidden[~ignore_mask]
-        flat_targets = flat_targets[~ignore_mask]
-
-        # Normalize embeddings and hidden states
-        flat_hidden = F.normalize(flat_hidden, p=2, dim=1)
-        all_embeddings = F.normalize(model.lookup_embeddings.weight, p=2, dim=1)
-
-        # Get unique targets from the batch
-        unique_targets = torch.unique(flat_targets)
-
-        # Sample additional negative indices
-        # Target number of negative samples
-        num_batch_uniques = unique_targets.shape[0]
-        num_extra_samples = max(0, self.total_compare_tokens - num_batch_uniques)
-
-        # Sample from non-batch tokens
-        sampling_mask = torch.ones(vocab_size, device=flat_hidden.device, dtype=torch.bool)
-        sampling_mask[unique_targets] = False
-        valid_indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
-
-        # Get extra negative indices
-        if num_extra_samples > 0 and len(valid_indices) > 0:
-            perm = torch.randperm(len(valid_indices), device=valid_indices.device)
-            num_to_sample = min(num_extra_samples, len(valid_indices))
-            extra_neg_indices = valid_indices[perm[:num_to_sample]]
-        else:
-            extra_neg_indices = torch.tensor([], device=flat_hidden.device, dtype=torch.long)
-
-        # Combine all indices for comparisons - positives first, then uniques, then extras
-        all_indices = torch.cat([unique_targets, extra_neg_indices])  # Include all unique targets (which includes all positives)
-
-        # Get embeddings for all indices
-        comparison_embeddings = all_embeddings[all_indices]  # [num_comparisons, hidden_dim]
-
-        # Compute all similarities at once
-        all_similarities = torch.matmul(flat_hidden, comparison_embeddings.t()) / model.temperature  # [batch*seq, num_comparisons]
-
-        # Create targets tensor - map each flat_target to its position in all_indices
-        # First create a mapping from token IDs to their positions in all_indices
-        indices_map = torch.zeros(vocab_size, dtype=torch.long, device=flat_hidden.device)
-        indices_map[all_indices] = torch.arange(len(all_indices), device=flat_hidden.device)
-
-        # Use the mapping to get the target positions
-        targets = indices_map[flat_targets]
-
-        # Apply cross entropy loss
-        loss = F.cross_entropy(all_similarities, targets)
-
-        return loss
-
-
 def inference_and_loss_step(model, x, y, loss_fn, do_final_projection: bool, distributed: bool):
 
-    # Forward pass to get output embeddings
-    # start_time = time.time()
     model_output, pre_output = inference_step(model, x, do_final_projection)  # [batch_size, seq_len, embed_dim]
-    # end_time = time.time()
-    # print(f"Inference step time: {end_time - start_time:.4f} seconds")
 
     raw_model = model.module if distributed else model
 
@@ -292,10 +218,7 @@ def inference_and_loss_step(model, x, y, loss_fn, do_final_projection: bool, dis
 
     logits = model_output
 
-    if model_type == JPT1QuantModelType.COS_SIM:
-        loss = loss_fn(raw_model, logits, y)
-
-    elif model_type == JPT1QuantModelType.STANDARD_SAMPLED:
+    if model_type == JPT1QuantModelType.STANDARD_SAMPLED:
         if do_final_projection:
             loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))  # get model output logits in this case
         else:
@@ -706,20 +629,18 @@ def generate_text(
         last_token = jpt_output[0:1, -1:, :]
 
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16):
-            if model.model_type == JPT1QuantModelType.COS_SIM:
-                pred_token_indices = model.get_nearest_token_indices_cossim(last_token, top_k=50, temperature=temperature)
-            else:
-                # Apply temperature and sample using top-k
-                logits = last_token.squeeze() / temperature
 
-                probs = torch.softmax(logits, dim=-1)
-                top_k_probs, top_k_indices = torch.topk(probs, 50)
+            # Apply temperature and sample using top-k
+            logits = last_token.squeeze() / temperature
 
-                # Sample from the filtered distribution
-                pred_token_indices = torch.multinomial(top_k_probs, num_samples=1).unsqueeze(0)
+            probs = torch.softmax(logits, dim=-1)
+            top_k_probs, top_k_indices = torch.topk(probs, 50)
 
-                # Map back to original indices
-                pred_token_indices = top_k_indices[pred_token_indices]
+            # Sample from the filtered distribution
+            pred_token_indices = torch.multinomial(top_k_probs, num_samples=1).unsqueeze(0)
+
+            # Map back to original indices
+            pred_token_indices = top_k_indices[pred_token_indices]
 
         next_token = model.get_text_token_from_indices(pred_token_indices.cpu().numpy())
         next_token = next_token.item()
@@ -827,8 +748,7 @@ if __name__ == "__main__":
         tokenizer = Tokenizer.from_file(f"tokenizer_cache/{dataset_name}_tokenizer_{vocab_size}.json")
 
         loss_fn = None
-        if output_type == JPT1QuantModelType.COS_SIM:
-            loss_fn = CustomLossCosSim(ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens)
+
         if output_type == JPT1QuantModelType.STANDARD_SAMPLED:
             loss_fn = CustomSampledLoss(ignore_index=tokenizer.token_to_id("[PAD]"), total_compare_tokens=total_compare_tokens)
         else:

@@ -11,8 +11,7 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from tokenizers import Tokenizer
 
 
-class JPT1QuantModelType(Enum):
-    COS_SIM = "cossim"
+class JPT1ModelType(Enum):
     STANDARD = "standard"
     STANDARD_SAMPLED = "standard_sampled"
 
@@ -110,13 +109,13 @@ class JPT1Quantized(nn.Module):
         num_layers: int,
         dropout: float,
         tokenizer: Tokenizer,
-        model_type: JPT1QuantModelType,
+        model_type: JPT1ModelType,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         self.num_layers = num_layers
-        # Use nn.Embedding for learnable positional encodings
+
         self.position_embedding = nn.Embedding(seq_len, embed_dim)
         self.model_type = model_type
         self.tokenizer = tokenizer
@@ -142,17 +141,11 @@ class JPT1Quantized(nn.Module):
             seq_len=seq_len,
         )
 
-        # self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        # self.transformer = nn.TransformerDecoder(encoder_layer, num_layers=num_layers)
-
         self.fc_ln = LlamaRMSNorm(embed_dim, eps=1e-6)
 
-        if model_type == JPT1QuantModelType.COS_SIM:
-            self.fc_out = nn.Linear(embed_dim, self.token_space_dim)
-        else:
-            self.fc_out = nn.Linear(embed_dim, self.vocab_size)
-            # Tie weights - share the embedding matrix with the output projection
-            self.embeddings.weight = self.fc_out.weight
+        self.fc_out = nn.Linear(embed_dim, self.vocab_size)
+        # Tie weights - share the embedding matrix with the output projection
+        self.embeddings.weight = self.fc_out.weight
 
         self.temperature = nn.Parameter(torch.tensor(0.07))
 
@@ -202,7 +195,6 @@ class JPT1Quantized(nn.Module):
 
         return output, x
 
-    def get_nearest_token_indices_cossim(self, projections: torch.Tensor, top_k: int = 1, temperature: float = 1.0) -> torch.Tensor:
         """
         Return the nearest token indices based on cosine similarity.
 
